@@ -109,6 +109,13 @@ tinygrad's CUDA compile path); without them `test_reloc` stops the suite unless 
 The card is operated through one protocol, and the scripts enforce it: **read-only preflight → lock → one step as its own process →
 release, leaving the card idle warm** (firmware resident, nothing submitted). Two processes on the card at once wedge it.
 
+**Card-free is not host-free.** On 2026-09-16 the Thunderbolt tunnel dropped and re-enumerated twice with the card idle, both times
+under a full Metal prefill (the Mac's own GPU flat out with a 50 GB model mapped) while the laptop was powered by the enclosure's USB-C
+power delivery over the same cable; on Apple's own charger the same prefills did not drop it. So: power the laptop from its own adapter,
+never from the enclosure, and treat any job that maps or allocates more than ~20 GB of host or Apple-GPU memory as a card-affecting
+action while anyone holds the card - it needs the scheduler's word like a slot. Check a staged script with `sh -n` only; never source
+or run it to see what it prints (that is how one of those prefills was started without a word).
+
 ```sh
 sh tools/preflight.sh                                   # VERDICT: OK to proceed — reads PCI/dext/server/lock state, touches nothing
 sh tools/nv_shim_step.sh A opverify                     # value-checked test-backend-ops on the card: expect 450/450
