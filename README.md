@@ -153,6 +153,25 @@ for anything speculative, the depth-4 greedy output byte-identical to plain gree
 `tools/ab_pair.sh OLD NEW` interleaves two builds within the same minutes, which is the only honest way to compare decode numbers on a
 loaded host.
 
+## Disaggregated inference: prefill on the card, decode on the Mac
+
+A model that fits the Mac's unified memory but not the card's 32 GB can still use the card for what it is best at. The card
+server keeps every expert tensor mmapped on the host (`--n-cpu-moe 48 --no-host --no-repack`) and ggml's scheduler streams
+each layer's experts across the link once per batch, so the card prefills a long prompt at its own speed; the slot's state
+(KV cache plus the linear-attention recurrent state, 24 KB/token for Qwen3-Coder-Next) is saved through `--slot-save-path`,
+restored into a Metal `llama-server` holding the same file, and Metal decodes. `tools/disagg-router.py` makes that one
+endpoint: it reproduces Metal's tokenization, sends cold prompts over a threshold to the card, hands the state over, and
+streams from Metal; `tools/disagg-serve.sh` runs the trio as one tenant under the card protocol.
+
+Measured 2026-09-16, Qwen3-Coder-Next 80B-A3B (49.6 GB), a 23,692-token prompt, this M4 Max: card prefill **15.2 s (1558
+tok/s)** against 35.7 s (664 tok/s) on Metal alone; the 662 MB state saved in 0.7 s and restored in 0.1 s; Metal then
+evaluated one token and decoded at 54 tok/s. Three things are load-bearing and documented in `tools/disagg-prefill.sh`:
+the placement flags (without them llama.cpp puts CPU-placed weights in a buffer type that is either not mmappable or not
+offloadable), the 24576 ubatch (ggml-cuda's MoE id helper caps a ubatch at 25,088 tokens on sm_120, so longer prompts stream
+the experts once per ubatch), and saving the state one token early (the recurrent state cannot be rewound). Greedy text
+from the split diverges from Metal-only text on near-ties, since the card's expert matmuls quantize activations and Metal's
+do not; it is numerics, not a wrong cache. The Metal half maps the whole model and is a host-rule job (see §Run).
+
 ## Layout
 
 ```
