@@ -1697,6 +1697,14 @@ int tinynv_exec_graph_end(tinynv_exec_t *ex, tinynv_graph_rec_t **out) {
 // Waiting for everything means everything, including launches that are built and not yet handed over: those have
 // timeline values nothing has been told to release, so waiting without flushing first waits out the whole timeout.
 int tinynv_exec_idle(tinynv_exec_t *ex) {
+  // A never-initialised exec has no gpu behind it, and every path below reaches through one - tinynv_exec_wait calls
+  // tinynv_submit_ring(ex->g) first thing, which dereferences it. This used to be somebody else's problem to avoid,
+  // and on 2026-09-15 the teardown did not avoid it: a refused boot called this on a zeroed struct, faulted inside a
+  // signal handler that re-entered the same call, and spun at 98% CPU until SIGKILL - which left the card bus
+  // mastering long enough to latch a DART fault, which costs a physical replug. The caller is fixed too. This is here
+  // because a function that faults when it could refuse makes its caller's mistake unreadable, and the whole cost of
+  // that afternoon was in the unreadability rather than in the mistake.
+  if (!ex || !ex->g) return -1;
   if (tinynv_exec_flush(ex)) return -1;
   if (tinynv_exec_wait(ex, ex->timeline, 30.0)) return -1;
   ex->needs_wait = 0;

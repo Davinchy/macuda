@@ -40,6 +40,14 @@ struct tinynv_device {
   // cudart shim unregisters its fat binaries from its own atexit handler, and the order two atexit handlers run in is
   // not something either of them chooses. So freeing after teardown does the host-side half and stops.
   int torn_down;
+  // Set once tinynv_exec_init has succeeded, and it is NOT the same thing as `booted`.
+  //
+  // `booted` goes up the moment the card is live, because from that instant it must be put down even if a later stage
+  // fails - that is deliberate and stays. But the teardown read it as "there is a ring to idle", and a boot that fails
+  // between them has no ring: on 2026-09-15 a deliberately-refused boot reached the atexit handler, waited on a ring
+  // that did not exist, faulted inside its own signal handler and spun until SIGKILL - which left the card bus
+  // mastering and latched a DART fault, i.e. a cable. The two states have to be distinguishable.
+  int exec_ready;
   // A caller's kernel for serving downloads from the compute engine, and how to size its grid. See
   // tinynv_set_download_kernel.
   tinynv_kernel_t download_kernel;
@@ -104,18 +112,27 @@ static void announce(tinynv_device_t d) {
 // so the teardown registers itself the moment there is a card to put down.
 static void put_the_card_down(void) {
   if (!g_dev.booted) return;
+  // BEFORE ANYTHING THAT CAN FAIL, and the ordering is the fix rather than a tidy-up. This function is reachable from
+  // atexit AND from the signal handler, so a fault raised inside it re-enters it - and on 2026-09-15 that is exactly
+  // what happened: a refused boot waited on a ring that did not exist, faulted, re-entered, and spun at 98% until
+  // SIGKILL. Clearing the flag first makes the second entry a no-op and turns an unkillable spin into one fault.
+  g_dev.booted = 0;
+  g_dev.torn_down = 1;
   // Said on the way out whether or not anyone was watching for it. This is the one condition where memory the driver
   // owns was deliberately not given back, and a run that hit it should not have to be told by a test.
   if (g_dev.gpu.mm.leaked_n)
     fprintf(stderr, "libtinynv: %llu bytes in %llu mappings were leaked rather than reused, because the mmu never "
                     "acknowledged their invalidate. The card was not asked for memory again after that.\n",
             (unsigned long long)g_dev.gpu.mm.leaked_bytes, (unsigned long long)g_dev.gpu.mm.leaked_n);
-  tinynv_exec_idle(&g_dev.exec);   // let what was submitted finish before the mappings under it go away
-  g_dev.exec.torn_down = 1;
-  g_dev.booted = 0;
-  g_dev.torn_down = 1;
-  tinynv_exec_fini(&g_dev.exec);
-  tinynv_gpu_close(&g_dev.gpu);
+  // Only when there IS something submitted. A boot that failed before tinynv_exec_init has no ring, no timeline and
+  // no `ex->g`, and idling it walks into a null dereference by way of tinynv_submit_ring.
+  if (g_dev.exec_ready) {
+    tinynv_exec_idle(&g_dev.exec);   // let what was submitted finish before the mappings under it go away
+    g_dev.exec.torn_down = 1;
+    tinynv_exec_fini(&g_dev.exec);
+    g_dev.exec_ready = 0;
+  }
+  tinynv_gpu_close(&g_dev.gpu);      // the one that matters: this clears bus mastering
 }
 
 // The same teardown, for the ways out that are not an exit.
@@ -211,6 +228,15 @@ void tinynv_dump_host_writes(int sig) {
 }
 
 static void quiesce_and_continue(int sig) {
+  // THE ONE THING THAT MUST HAPPEN, FIRST AND UNCONDITIONALLY. A card left bus mastering into memory this process is
+  // about to lose is what latches a DART fault, and a latched DART fault costs a physical replug - one person and one
+  // cable. Everything else in this handler is a tidy-up that can itself fail; this cannot be allowed to be behind it.
+  // tinynv_dev_quiesce is documented safe to call at any time, including twice, which is what makes it safe here.
+  //
+  // It used to be reached only through put_the_card_down, at the END of a teardown that begins by waiting on a ring.
+  // On 2026-09-15 a refused boot made that wait fault, so the quiesce never ran, the process was SIGKILLed with the
+  // card still mastering, and the card came back with a new DART error. The order was the bug, not the wait.
+  if (g_dev.booted) tinynv_dev_quiesce(&g_dev.gpu.dev);
   if (sig == SIGSEGV || sig == SIGBUS || sig == SIGABRT) tinynv_dump_host_writes(sig);
   put_the_card_down();
   for (size_t i = 0; i < sizeof(g_caught) / sizeof(*g_caught); i++)
@@ -268,6 +294,7 @@ static int device_boot(tinynv_device_t d) {
     }
   }
   if (tinynv_exec_init(&d->gpu, &d->exec)) return -1;
+  d->exec_ready = 1; // from here, and not before, there is a ring for the teardown to idle
 
   // Sensors, unless refused. Arming costs one 464-byte host buffer, one object and two controls, all once; after that
   // the firmware refreshes the block on its own timer and reading it is a load. Nothing here touches the submission

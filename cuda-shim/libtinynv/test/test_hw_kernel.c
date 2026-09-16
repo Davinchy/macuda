@@ -23,6 +23,8 @@ static int fails;
 #define N 256
 
 int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0); // the runner redirects stdout to a file and a card step can die mid-run;
+                                   // on 2026-09-15 a refusal this was meant to report never reached the log
   const char *cubin_path = argc > 1 ? argv[1] : "../spike/vecadd.sm120.cubin";
   const char *kernel = argc > 2 ? argv[2] : "vecadd";
   // The block size, and therefore how many blocks: a run that is right for one block and wrong past it cannot say

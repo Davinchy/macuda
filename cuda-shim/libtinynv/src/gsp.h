@@ -52,6 +52,28 @@ typedef struct { uint32_t client, parent, handle, cls, alloc_flags; uint64_t siz
 // safe reading of an unknown permission is the same as an unknown size: refuse.
 int tinynv_rm_obj_writable(const tinynv_rm_obj_t *o);
 
+// Is this channel's binding to an address space well formed? Decided here because it is decidable here, and because
+// the answer is the opposite of what the rest of this file teaches about zero.
+//
+// A channel names its space through the CONTEXT SHARE - `kernel_channel.c:1022` reads
+// `pKernelChannel->hVASpace = pKernelChannel->pKernelCtxShareApi->hVASpace` unconditionally - and
+// `kernel_channel.c:314` refuses a request that sets BOTH with NV_ERR_INVALID_ARGUMENT: "Both context share and
+// vaspace handles can't be valid at the same time". So exactly one of the two is set, and for this driver it is
+// always the context share.
+//
+// THE ZERO-HANDLE RULE STOPS HERE, AND SAYING SO IS THE POINT OF THIS FUNCTION. A zero hVASpace in a MAPPING means
+// the device default, which is the driver's own space, which is why tinynv_rm_map_check and tinynv_rm_vaspace_check
+// refuse it by name. A zero hVASpace in a CHANNEL means "take it from the context share" and is required. Same field
+// name, one struct apart, opposite readings - and a reader applying the mapping rule mechanically would set it
+// explicitly and break every channel this driver creates. See design doc 4h.
+typedef enum {
+  TINYNV_RM_BIND_OK = 0,
+  TINYNV_RM_BIND_BOTH,     // context share AND vaspace: the firmware refuses this outright
+  TINYNV_RM_BIND_NEITHER,  // neither: the channel would land in whatever the device's default space is
+} tinynv_rm_bind_check_t;
+tinynv_rm_bind_check_t tinynv_rm_bind_check(uint32_t hContextShare, uint32_t hVASpace);
+const char *tinynv_rm_bind_why(tinynv_rm_bind_check_t c);
+
 // A live mapping, so that a free can find what it has to tear down first.
 //
 // Guarantee 5 of docs/driver/libtinynv-design.md §4g, and the one that matters most: our free CASCADES over children

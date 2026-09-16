@@ -26,6 +26,8 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 #define CROSSINGS 500
 
 int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0); // the runner redirects stdout to a file and a card step can die mid-run;
+                                   // on 2026-09-15 a refusal this was meant to report never reached the log
   const char *path = argc > 1 ? argv[1] : "../spike/vecadd.sm120.cubin";
   if (!getenv("TINYNV_HW") || !getenv("TINYNV_SOCKET")) {
     printf("usage: TINYNV_HW=1 TINYNV_SOCKET=<socket> %s [cubin]\n", argv[0]);

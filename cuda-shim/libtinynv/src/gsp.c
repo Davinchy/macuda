@@ -1595,6 +1595,25 @@ int tinynv_rm_obj_writable(const tinynv_rm_obj_t *o) {
   return !(o->alloc_flags & (TINYNV_ALLOC_FLAGS_USER_READ_ONLY | TINYNV_ALLOC_FLAGS_DEVICE_READ_ONLY));
 }
 
+// See gsp.h. Pure, two fields, and it exists to make one sentence of NVIDIA's source executable rather than
+// remembered - the sentence that says zero means something different here than it does one struct away.
+tinynv_rm_bind_check_t tinynv_rm_bind_check(uint32_t hContextShare, uint32_t hVASpace) {
+  if (hContextShare && hVASpace) return TINYNV_RM_BIND_BOTH;
+  if (!hContextShare && !hVASpace) return TINYNV_RM_BIND_NEITHER;
+  return TINYNV_RM_BIND_OK;
+}
+
+const char *tinynv_rm_bind_why(tinynv_rm_bind_check_t c) {
+  switch (c) {
+    case TINYNV_RM_BIND_OK: return "allowed";
+    case TINYNV_RM_BIND_BOTH: return "a channel may name a context share or an address space, never both - the "
+                                     "firmware refuses that outright";
+    case TINYNV_RM_BIND_NEITHER: return "a channel that names neither lands in the device's default address space, "
+                                        "which is the driver's own";
+  }
+  return "refused";
+}
+
 // --- the C4b mapping decision -------------------------------------------------------------------------------------
 //
 // Every guarantee in docs/driver/libtinynv-design.md §4g that can be decided from the records is decided here, and

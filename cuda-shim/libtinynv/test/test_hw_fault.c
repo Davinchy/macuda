@@ -59,6 +59,8 @@ static void *read_file(const char *path, size_t *len_out) {
 }
 
 int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0); // the runner redirects stdout to a file and a card step can die mid-run;
+                                   // on 2026-09-15 a refusal this was meant to report never reached the log
   const char *mode = argc > 1 ? argv[1] : "";
   // How far past the end of a real allocation to aim. A knob rather than a constant because the one thing that can make
   // mode a report nothing is this address landing inside something else that happens to be mapped, and finding that out

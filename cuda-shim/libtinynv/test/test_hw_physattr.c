@@ -33,6 +33,8 @@
 #include <stdlib.h>
 
 int main(int argc, char **argv) {
+  setvbuf(stdout, NULL, _IONBF, 0); // the runner redirects stdout to a file and a card step can die mid-run;
+                                   // on 2026-09-15 a refusal this was meant to report never reached the log
   if (!getenv("TINYNV_HW") || !getenv("TINYNV_SOCKET")) {
     printf("usage: TINYNV_HW=1 TINYNV_SOCKET=<socket> %s\n", argv[0]);
     return 2;

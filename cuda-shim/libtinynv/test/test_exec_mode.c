@@ -290,6 +290,25 @@ int main(void) {
          "%zu depths and %zu delivery cases resolved\n", tinynv_exec_chain_depth(NULL),
          sizeof(depths) / sizeof(*depths), sizeof(dma) / sizeof(*dma));
 
+  // --- an exec nobody initialised ---------------------------------------------------------------------------------
+  //
+  // THE CASE THAT COST A CABLE. A boot that fails after the card is live but before tinynv_exec_init leaves a zeroed
+  // exec, and the teardown called tinynv_exec_idle on it: tinynv_exec_wait reaches through ex->g to submit the ring,
+  // ex->g is NULL, and the fault landed inside the signal handler that re-enters the same teardown - 98% CPU until
+  // SIGKILL, with the card still bus mastering, which latched a DART fault. Both ends are fixed; this is the end that
+  // can be checked with no card.
+  //
+  // WITHOUT THE GUARD THIS DOES NOT PRINT "FAIL", IT EXITS 139. That is a discriminating control - make test stops on
+  // the status either way - but ONLY if the control is read by exit status, which is the lesson two of this suite's
+  // controls taught on 2026-09-15 by exiting 139 while `grep -c FAIL` reported zero, same as a clean pass.
+  {
+    tinynv_exec_t empty;
+    memset(&empty, 0, sizeof(empty));
+    CHECK(tinynv_exec_idle(&empty) != 0, "idling an exec that was never initialised was reported as success");
+    CHECK(tinynv_exec_idle(NULL) != 0, "idling a NULL exec was reported as success");
+  }
+  printf("  an exec that was never initialised refuses to idle instead of faulting inside the teardown\n");
+
   // Last statement in main, for the reason spelled out at the end of test_rm_free.c: that file's guard sat
   // partway through main, the file grew past it, and two hundred lines of checks stopped counting without
   // any sign. This one was still correct when that was found - it is written this way so it stays correct
