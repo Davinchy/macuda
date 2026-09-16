@@ -1,0 +1,18 @@
+# Fetched or built by setup.sh — never committed. cuda-shim/.gitignore covers the shim's own build outputs, the CUDA headers
+# (cuda-shim/cuda-13) and the NVIDIA firmware + open-gpu-kernel-modules tree (cuda-shim/libtinynv/third_party).
+llama.cpp/
+stable-diffusion.cpp/
+cuda-shim-f/
+tinygrad/
+venv/
+traces/
+logs/
+images/
+models/*
+!models/README.md
+.gpu-lock
+.dart-stale
+.cache/
+__pycache__/
+*.pyc
+.DS_Store

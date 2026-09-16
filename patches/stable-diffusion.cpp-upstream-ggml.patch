@@ -1,0 +1,58 @@
+diff --git a/src/core/ggml_extend.cpp b/src/core/ggml_extend.cpp
+index 79e3ea9..1750418 100644
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -257,10 +257,11 @@ ggml_tensor* ggml_ext_linear_i8_tensorwise(ggml_context* ctx,
+         int64_t ne2 = x->ne[2];
+         int64_t ne3 = x->ne[3];
+         x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
+-        x           = ggml_mul_mat_i8_tensorwise(ctx, w, x, weight_scale, fused_bias, convrot_group_size);
+-        x           = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
++        (void)ne2; (void)ne3; (void)fused_bias; (void)convrot_group_size; (void)weight_scale;
++        GGML_ABORT("int8 tensorwise linear needs ggml_mul_mat_i8_tensorwise, which exists only in leejet's ggml fork; this build uses upstream ggml (EGPU shim)");
+     } else {
+-        x = ggml_mul_mat_i8_tensorwise(ctx, w, x, weight_scale, fused_bias, convrot_group_size);
++        (void)fused_bias; (void)convrot_group_size; (void)weight_scale;
++        GGML_ABORT("int8 tensorwise linear needs ggml_mul_mat_i8_tensorwise, which exists only in leejet's ggml fork; this build uses upstream ggml (EGPU shim)");
+     }
+ 
+     if (scale != 1.f) {
+diff --git a/src/model/common/ggml_block.hpp b/src/model/common/ggml_block.hpp
+index 2aca72f..815648a 100644
+--- a/src/model/common/ggml_block.hpp
++++ b/src/model/common/ggml_block.hpp
+@@ -208,7 +208,7 @@ public:
+         ggml_tensor* w            = params["weight"];
+         const float scale         = ctx->linear_scale > 0.f ? ctx->linear_scale : this->scale;
+         ggml_tensor* weight_scale = has_weight_scale ? params["weight_scale"] : nullptr;
+-        if (w->type == GGML_TYPE_F8_E4M3 || w->type == GGML_TYPE_F8_E5M2) {
++        if (false) {  // fp8 weight types exist only in leejet's ggml fork (EGPU shim build uses upstream ggml)
+             bool supports_fp8_matmul = false;
+             if (ctx->backend != nullptr) {
+                 ggml_tensor* fp8_matmul = ggml_mul_mat(ctx->ggml_ctx, w, x);
+@@ -242,7 +242,7 @@ public:
+                 const auto cache_key = std::make_pair(x, int8_convrot_group_size);
+                 auto cached          = ctx->int8_convrot_cache.find(cache_key);
+                 if (cached == ctx->int8_convrot_cache.end()) {
+-                    x = ggml_quantize_i8_convrot(ctx->ggml_ctx, x, int8_convrot_group_size);
++                    GGML_ABORT("int8 convrot quantisation needs ggml_quantize_i8_convrot, which exists only in leejet's ggml fork (EGPU shim build uses upstream ggml)");
+                     ctx->int8_convrot_cache.emplace(cache_key, x);
+                 } else {
+                     x = cached->second;
+diff --git a/src/model_io/safetensors_io.cpp b/src/model_io/safetensors_io.cpp
+index d8b8dc5..7924827 100644
+--- a/src/model_io/safetensors_io.cpp
++++ b/src/model_io/safetensors_io.cpp
+@@ -86,10 +86,8 @@ static ggml_type safetensors_dtype_to_ggml_type(const std::string& dtype) {
+         ttype = GGML_TYPE_F32;
+     } else if (dtype == "F64") {
+         ttype = GGML_TYPE_F32;
+-    } else if (dtype == "F8_E4M3") {
+-        ttype = GGML_TYPE_F8_E4M3;
+-    } else if (dtype == "F8_E5M2") {
+-        ttype = GGML_TYPE_F8_E5M2;
++    } else if (dtype == "F8_E4M3" || dtype == "F8_E5M2") {
++        ttype = GGML_TYPE_COUNT;  // fp8 tensors need leejet's ggml fork; upstream ggml (EGPU shim build) has no fp8 type, so the loader refuses them
+     } else if (dtype == "I32") {
+         ttype = GGML_TYPE_I32;
+     } else if (dtype == "I64") {

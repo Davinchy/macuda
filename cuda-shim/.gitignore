@@ -1,0 +1,18 @@
+build/
+*.o
+*.a
+*.dSYM/
+cuda-13
+*.fatbin
+*.cu.cpp
+spike/spike
+spike/spike_real
+libtinynv/third_party
+spike/*.cubin
+__pycache__/
+*.pyc
+# NOTE: the two rules above deliberately have no trailing slash. A worktree needs these paths symlinked in
+# (they are large, fetched, and shared), and a `dir/` rule matches a directory but NOT a symlink standing
+# where that directory would be - so the symlink is committable, and one nearly was, carrying an absolute
+# path to one machine's checkout. Without the slash both the real directory and a symlink are ignored.
+.DS_Store

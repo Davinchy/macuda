@@ -1,0 +1,13 @@
+This repository is MIT-licensed (see LICENSE). It builds on the following:
+
+tinygrad — https://github.com/tinygrad/tinygrad — MIT License
+  Copyright (c) 2024, the tiny corp
+  libtinynv (cuda-shim/libtinynv) is a C port of the userspace NVIDIA driver in tinygrad/runtime/ops_nv.py,
+  and the TinyGPU app and DriverKit extension it runs on are tinygrad's signed release. tinygrad's copyright
+  notice and permission notice apply to those portions.
+
+Not distributed here, fetched by setup.sh into gitignored paths, each under its own licence:
+  NVIDIA open-gpu-kernel-modules headers (MIT/GPL dual-licensed; used under MIT)
+  NVIDIA GSP firmware 570.144 from linux-firmware (NVIDIA's firmware licence, redistributable unmodified)
+  CUDA Toolkit headers (NVIDIA CUDA Toolkit EULA)
+  llama.cpp / ggml (MIT) and stable-diffusion.cpp (MIT), cloned at pinned commits
