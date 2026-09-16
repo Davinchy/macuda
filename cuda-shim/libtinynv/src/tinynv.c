@@ -228,15 +228,23 @@ void tinynv_dump_host_writes(int sig) {
 }
 
 static void quiesce_and_continue(int sig) {
-  // THE ONE THING THAT MUST HAPPEN, FIRST AND UNCONDITIONALLY. A card left bus mastering into memory this process is
-  // about to lose is what latches a DART fault, and a latched DART fault costs a physical replug - one person and one
-  // cable. Everything else in this handler is a tidy-up that can itself fail; this cannot be allowed to be behind it.
-  // tinynv_dev_quiesce is documented safe to call at any time, including twice, which is what makes it safe here.
+  // Clear bus mastering BEFORE the teardown when the teardown cannot be trusted to reach it. A card left mastering
+  // into memory this process is about to lose is what latches a DART fault, and a latched DART fault costs a physical
+  // replug - one person and one cable. It used to be reached only through put_the_card_down, at the END of a teardown
+  // that BEGINS by waiting on a ring; on 2026-09-15 a refused boot made that wait fault, the quiesce never ran, the
+  // process was SIGKILLed with the card still mastering, and the card came back with a new DART error.
   //
-  // It used to be reached only through put_the_card_down, at the END of a teardown that begins by waiting on a ring.
-  // On 2026-09-15 a refused boot made that wait fault, so the quiesce never ran, the process was SIGKILLed with the
-  // card still mastering, and the card came back with a new DART error. The order was the bug, not the wait.
-  if (g_dev.booted) tinynv_dev_quiesce(&g_dev.gpu.dev);
+  // BUT NOT UNCONDITIONALLY, and the first version of this fix was wrong in a way worth keeping written down. The
+  // timeline semaphore is HOST memory the engine writes across the bus (exec.c:1565, in its own words). Clear bus
+  // mastering first on a healthy device and the engine can never report completion, so tinynv_exec_idle waits out its
+  // whole 30-second timeout - every Ctrl-C on a working run turned into a half-minute hang. Trading an unkillable
+  // spin for a thirty-second one is not a fix.
+  //
+  // So: quiesce first when the orderly wait either CANNOT work (no exec - a boot that never finished) or cannot be
+  // TRUSTED (the process is already broken, which is what SEGV, BUS and ABRT mean). On SIGINT and SIGTERM with a live
+  // device, the orderly teardown is still right, and letting submitted work finish is the whole reason it exists.
+  int broken = (sig == SIGSEGV || sig == SIGBUS || sig == SIGABRT);
+  if (g_dev.booted && (broken || !g_dev.exec_ready)) tinynv_dev_quiesce(&g_dev.gpu.dev);
   if (sig == SIGSEGV || sig == SIGBUS || sig == SIGABRT) tinynv_dump_host_writes(sig);
   put_the_card_down();
   for (size_t i = 0; i < sizeof(g_caught) / sizeof(*g_caught); i++)
