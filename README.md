@@ -1,4 +1,4 @@
-# EGPU_MAC_Nvidia — CUDA on an Apple Silicon Mac, over Thunderbolt, with no NVIDIA driver
+# macuda — CUDA on an Apple Silicon Mac, over Thunderbolt, with no NVIDIA driver
 
 Unmodified **llama.cpp (CUDA backend)** and **stable-diffusion.cpp** run on an **RTX 5090 (GB202, sm_120)** in a Thunderbolt
 eGPU enclosure on **macOS**, correct and fast, with no NVIDIA driver on the Mac. Three libraries replace the vendor stack:
