@@ -19,3 +19,9 @@ export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$EGPU_ROOT/.cache}   # tinygrad's downlo
 #   export TINYCC_HOST=user@host        # required by cuda-shim/build/tinycc and build/fetch-cuda-headers.sh
 #   export TINYCC_KEY=~/.ssh/id_ed25519 # optional identity file
 #   export TINYCC_GGML_LINUX=ggml       # where llama.cpp/ggml is synced on that box (relative to $HOME there)
+# ONE CARD, ONE LOCK. If the working tree at /Volumes/512SSD/EGPU exists on this Mac, share its lock and its DART-stale marker:
+# two checkouts each holding their own lock can both believe they own the card, and two processes on the card wedge it.
+if [ -d /Volumes/512SSD/EGPU ] && [ "$EGPU_ROOT" != /Volumes/512SSD/EGPU ]; then
+  export GPU_LOCK=${GPU_LOCK:-/Volumes/512SSD/EGPU/.gpu-lock}
+  export DART_STALE=${DART_STALE:-/Volumes/512SSD/EGPU/.dart-stale}
+fi

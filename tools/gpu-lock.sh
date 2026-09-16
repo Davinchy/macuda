@@ -9,7 +9,7 @@
 # A lock may record the pid it belongs to (the runner passes its own): a lock whose pid is dead is stale and is taken
 # over with a note. A lock written without a pid (a session holding a window by hand across several commands, as C
 # does) is held until it is released, exactly as before. The line still starts "session=X " for everyone who greps it.
-R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; L=$R/.gpu-lock
+R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; L=${GPU_LOCK:-$([ -d /Volumes/512SSD/EGPU ] && echo /Volumes/512SSD/EGPU/.gpu-lock || echo $R/.gpu-lock)}   # one card, one lock: shared with the EGPU tree when it exists
 case "${1:-status}" in
   acquire) if [ -f "$L" ]; then
              hp=$(sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p' "$L" | head -1)

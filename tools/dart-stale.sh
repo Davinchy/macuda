@@ -11,8 +11,8 @@
 #   tools/dart-stale.sh "why this is known stale"      record
 #   tools/dart-stale.sh --clear                        forget it (after a replug)
 ROOT=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
-SNAP=$ROOT/.dart-stale
-[ "${1:-}" = "--clear" ] && { rm -f "$SNAP"; echo "cleared: the next dart error data will abort"; exit 0; }
+SNAP=${DART_STALE:-$([ -d /Volumes/512SSD/EGPU ] && echo /Volumes/512SSD/EGPU/.dart-stale || echo $ROOT/.dart-stale)}
+[ "${1:-}" = "--clear" ] && { rm -f "$SNAP" "$(dirname "$SNAP")/.dext-seen"; echo "cleared: the next dart error data will abort; the dext-instance record is forgotten and re-recorded at the next clean preflight"; exit 0; }
 [ -n "${1:-}" ] || { echo "say why it is stale: tools/dart-stale.sh \"<reason>\""; exit 1; }
 cur=$(ioreg -l -w0 2>/dev/null | grep -o '"pci-dart-error-data" = <[0-9a-f]*>' | head -1)
 [ -n "$cur" ] || { echo "no pci-dart-error-data on the nub: nothing to record"; exit 1; }

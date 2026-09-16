@@ -16,3 +16,11 @@ models/*
 __pycache__/
 *.pyc
 .DS_Store
+
+# never published — see private/README.md
+private/*
+!private/README.md
+# symlinked checkouts (a symlink is a file: the trailing-slash forms above do not match it)
+tinygrad
+tinygrad-stable
+venv
