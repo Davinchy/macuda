@@ -4,7 +4,7 @@
 #
 #   sh tools/disagg-serve.sh start [model.gguf] [router-port]   preflight → TinyGPU server → lock as V1 → card server → Metal server → router
 #   sh tools/disagg-serve.sh test  [prompt-file] [n]     one /completion through the router; prints the router's own lines for it
-#   sh tools/disagg-serve.sh chat  [text]                one /v1/chat/completions through the router
+#   sh tools/disagg-serve.sh chat  [text|file]           one /v1/chat/completions through the router (a file path is read as the message)
 #   sh tools/disagg-serve.sh status                      the three processes, the router's tail, who holds the lock
 #   sh tools/disagg-serve.sh stop                        router, Metal, card server (SIGTERM, then KILL), release the lock, card idle warm
 #
@@ -78,7 +78,7 @@ print("   text: " + d.get("content", "")[:160].replace("\n", " "))
 PY
     [ -f "$ST/router.log.path" ] && tail -4 "$(cat "$ST/router.log.path")" | cut -c1-170 | sed 's/^/   /' ;;
   chat)
-    T=${2:-"In one paragraph, what does this driver do?"}
+    T=${2:-"In one paragraph, what does this driver do?"}; [ -f "$T" ] && T=$(cat "$T")   # a file path is read as the message
     python3 - "$PORT" "$T" <<'PY'
 import sys, json, time, urllib.request
 port, text = sys.argv[1], sys.argv[2]; t0 = time.perf_counter()
