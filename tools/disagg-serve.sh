@@ -19,7 +19,10 @@ set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; cd "$R" || exit 2
 K=/Volumes/512SSD/LocalCode/offline-ai-kit; METAL_BIN=${METAL_BIN:-$K/bin/llama-server}; CARD_BIN=${BIN:-$R/cuda-shim/build/bin/llama-server-null}
 ST=$R/logs/disagg/serve; mkdir -p "$ST"; PIDF=$ST/pids; CTX=${CTX:-40960}; UB=${UB:-24576}; NCPUMOE=${NCPUMOE:-48}
-CARD_PORT=${CARD_PORT:-8092}; METAL_PORT=${METAL_PORT:-8091}; THRESH=${THRESH:-5000}
+CARD_PORT=${CARD_PORT:-8092}; METAL_PORT=${METAL_PORT:-8091}
+# THRESH is the router's CAP: cold tokens at or above it always go to the card (A's window condition was 512, so Metal never
+# prefilled a long prompt). 0 = no cap: the router's cost model routes by predicted seconds (break-even ~5,300 cold tokens).
+THRESH=${THRESH:-0}
 cmd=${1:-status}
 # the router port: the third argument of start, remembered in $ST/router.port for every other subcommand
 if [ "$cmd" = start ]; then PORT=${3:-${PORT:-8095}}; else PORT=${PORT:-$(cat "$ST/router.port" 2>/dev/null || echo 8095)}; fi
@@ -51,7 +54,7 @@ case "$cmd" in
     python3 tools/disagg-router.py --listen "$PORT" --metal "http://127.0.0.1:$METAL_PORT" --card "http://127.0.0.1:$CARD_PORT" --threshold "$THRESH" --state-dir "$ST" > "$RL" 2>&1 & rpid=$!
     echo "router=$rpid" >> "$PIDF"; echo "$RL" > "$ST/router.log.path"; echo "$PORT" > "$ST/router.port"
     wait_health "$PORT" "$rpid" "$RL" || { sh "$0" stop; exit 1; }
-    echo "   UP: http://127.0.0.1:$PORT (router), threshold $THRESH cold tokens; $(sh tools/gpu-lock.sh status)" ;;
+    echo "   UP: http://127.0.0.1:$PORT (router), cap ${THRESH}${THRESH:+ cold tokens}$([ "$THRESH" = 0 ] && echo " (off: cost model routes)"); $(sh tools/gpu-lock.sh status)" ;;
   stop)
     [ -f "$PIDF" ] || { echo "not running (no $PIDF)"; }
     if [ -f "$PIDF" ]; then
