@@ -122,8 +122,14 @@ def ubatches(cold):
 def fit_line(obs):
     """Least squares over (tokens, seconds): seconds = fixed*ubatches(tokens) + tokens/rate, no intercept beyond the
     per-ubatch fixed cost. Returns (fixed_seconds, tokens_per_second), or None when the observations cannot support a
-    fit: fewer than two, spanning under 1000 tokens, a singular design, or a non-positive fixed cost or rate."""
-    if len(obs) < 2 or max(n for n, _ in obs) - min(n for n, _ in obs) < 1000: return None
+    fit: fewer than THREE, spanning under 1000 tokens, a singular design, a non-positive fixed cost or rate, or a fit
+    that misses ANY observation it was fitted on by more than 20%.
+
+    Three, not two, and it was measured: two single-ubatch points fit themselves exactly by construction, and on
+    2026-09-17 the pair (6,974 tok/11.4 s, 23,691 tok/12.6 s) returned 11.0 s + 14,471 tok/s - nearly three times the
+    marginal rate the same window supports - and then predicted 16.2 s for the very prefill that had just taken 12.6 s.
+    A model that misses the data it was fitted on is rejected here rather than shipped into a routing decision."""
+    if len(obs) < 3 or max(n for n, _ in obs) - min(n for n, _ in obs) < 1000: return None
     suu = sun = snn = sut = snt = 0.0
     for n, t in obs:
         u = ubatches(n)
@@ -133,12 +139,17 @@ def fit_line(obs):
     a = (sut * snn - snt * sun) / den      # seconds per ubatch (the expert stream)
     b = (suu * snt - sun * sut) / den      # seconds per token (1/rate)
     if a <= 0 or b <= 0: return None
+    if any(abs((ubatches(n) * a + n * b) - t) > 0.2 * t for n, t in obs): return None
     return a, 1.0 / b
 
 
 def observe_card(tokens, seconds, handoff_seconds):
     """A card prefill happened: refit the fixed cost and rate from the last 8, and the handoff per token."""
     if not ARGS.learn or tokens < 256: return
+    if not STATE["card_obs"]:
+        log(f"first card prefill since start: {tokens} tok in {seconds:.1f} s - a first prefill may pay a cost the later "
+            "ones do not (unresolved: 2026-09-17 window 2's 7K prefills ran 2.08 s and 1.24 s over the model fitted on "
+            "its 24K pair, and those residuals scale with expert bytes streamed)")
     STATE["card_obs"] = (STATE["card_obs"] + [(tokens, seconds)])[-8:]
     fit = fit_line(STATE["card_obs"])
     hp = handoff_seconds / tokens
@@ -199,14 +210,21 @@ def selftest():
         ok &= (want == "card") == (c < m or (ARGS.threshold and cold >= ARGS.threshold))
     ok &= decide(24000, 24001, lambda: False)[0] == "metal"          # a card that is down never wins
     ok &= decide(0, 5000, lambda: True)[0] == "metal"                # nothing cold: nothing to route
-    fit = fit_line([(6974, 8.5), (23691, 15.3)])                      # the two measured points give back the defaults
-    ok &= fit is not None and abs(fit[0] - 5.66) < 0.05 and abs(fit[1] - 2458) < 5
+    known = [(6974, 8.0 + 6974 / 5150), (23691, 8.0 + 23691 / 5150), (64577, 3 * 8.0 + 64577 / 5150)]
+    fit = fit_line(known)                                             # the estimator recovers a line it was given
+    ok &= fit is not None and abs(fit[0] - 8.0) < 0.05 and abs(fit[1] - 5150) < 25
+    obs24 = 12.588                                                    # the control prefill the constants were fitted on
+    ok &= abs((1 * ARGS.card_fixed + 23691 / ARGS.card_rate) - obs24) < 0.3
     ok &= ubatches(24576) == 1 and ubatches(24577) == 2 and ubatches(62031) == 3      # the stream is per ubatch
     m3, c3 = predict(62031)                                           # and a 3-ubatch prompt pays it three times
     ok &= abs(c3 - (3 * ARGS.card_fixed + 62031 / ARGS.card_rate + 62031 * ARGS.handoff_per_token)) < 0.01
-    ok &= fit_line([(6974, 8.5)]) is None and fit_line([(1000, 5.0), (1500, 5.2)]) is None   # too few, too narrow
-    ok &= fit_line([(1000, 9.0), (9000, 5.0)]) is None                # a negative slope is not a rate
-    print(f"fit of the two measured points: fixed {fit[0]:.2f} s, {fit[1]:.0f} tok/s" if fit else "fit: FAILED")
+    ok &= fit_line([(6974, 8.5)]) is None and fit_line([(1000, 5.0), (1500, 5.2), (1800, 5.3)]) is None  # too few, too narrow
+    ok &= fit_line([(1000, 9.0), (5000, 7.0), (9000, 5.0)]) is None   # a negative slope is not a rate
+    ok &= fit_line([(6974, 11.433), (23691, 12.588)]) is None         # the real pair that returned 14,471 tok/s
+    ok &= fit_line(known[:2] + [(64577, 36.5 * 2)]) is None           # one point no line through the others explains
+    print(f"estimator on a known 8.00 s + 5150 tok/s line: fixed {fit[0]:.2f} s, {fit[1]:.0f} tok/s" if fit else "fit: FAILED")
+    print(f"shipped constants against the 23,691-token control prefill they came from: "
+          f"{1 * ARGS.card_fixed + 23691 / ARGS.card_rate:.2f} s predicted, {obs24:.2f} s observed")
     print("selftest:", "OK" if ok else "FAIL"); return 0 if ok else 1
 
 
@@ -279,8 +297,8 @@ def main():
     ap.add_argument("--threshold", type=int, default=0, help="operator's cap: cold tokens at or above which the card ALWAYS prefills (0 = off); keeps a Metal server off long prefills")
     ap.add_argument("--no-auto", dest="auto", action="store_false", help="disable the cost model (then only --threshold routes to the card)")
     ap.add_argument("--metal-rate", type=float, default=660.0, help="Metal prefill tok/s for this model (measured 664 on the M4 Max, Qwen3-Coder-Next)")
-    ap.add_argument("--card-rate", type=float, default=2460.0, help="card marginal prefill tok/s (fit of 23,691 tok/15.3 s and 6,974 tok/8.5 s)")
-    ap.add_argument("--card-fixed", type=float, default=5.7, help="card fixed seconds per prompt: the expert stream across the link (same fit)")
+    ap.add_argument("--card-rate", type=float, default=5150.0, help="card marginal prefill tok/s (driver ad308bd, NCPUMOE=48, 2026-09-17 window 2; the pre-ad308bd fit was 2460 and is superseded)")
+    ap.add_argument("--card-fixed", type=float, default=8.0, help="card seconds per UBATCH: 43.7 GiB of experts across the link at 5.46 GiB/s (same window, the two 24K prefills under the byte-fraction model). The first prefill after a load looks MORE expensive than this; window 3 measures it")
     ap.add_argument("--card-ubatch", type=int, default=24576, help="the card server's -ub: the expert stream is paid once per ubatch, so this shapes the prediction for prompts past it")
     ap.add_argument("--handoff-per-token", type=float, default=3e-5, help="seconds per token to save and restore the state (662 MB / 23,691 tok in 0.8 s)")
     ap.add_argument("--no-learn", dest="learn", action="store_false", help="freeze the cost model: do not refit it from observed prefills")
