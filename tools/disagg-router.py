@@ -14,7 +14,9 @@ else is passed straight to Metal). Per request:
      it ALWAYS go to the card, which keeps a Metal server off long prefills) or when the cost model predicts the card is
      faster: Metal costs cold/metal_rate; the card costs a FIXED stream of every expert across the link (~5.7 s here,
      paid whatever the prompt length) plus cold/card_rate plus the handoff. Fitted from two measured points, break-even
-     ~5,300 cold tokens for Qwen3-Coder-Next on this Mac; --selftest prints the curve. No healthy card server: Metal;
+     ~5,300 cold tokens for Qwen3-Coder-Next on this Mac; --selftest prints the curve. The constants are only defaults:
+     the router refits them from what it observes (Metal's prefill rate from its timings, the card's fixed cost and
+     rate from a rolling fit of its prefills, the handoff from save+restore), --no-learn freezes them. No card: Metal;
   3. otherwise the card prefills all but the LAST token (the recurrent state cannot be rewound, so the decode side must
      evaluate one token itself), saves the slot's state under a name derived from the tokens, Metal restores it, and the
      original request is forwarded to Metal with cache_prompt on: Metal finds N-1 cached tokens, evaluates one, decodes.
@@ -37,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ARGS = None
 LOCK = threading.Lock()            # one request at a time: one slot on each server
-STATE = {"metal_tokens": []}       # the prompt tokens Metal's slot holds, as far as the router has sent them
+STATE = {"metal_tokens": [], "card_obs": [], "metal_obs": []}   # Metal's slot contents as sent; observed (tokens, seconds) per side
 
 
 def log(msg):
@@ -108,6 +110,43 @@ def card_prefill(ids):
         f"save {s.get('n_saved')} tok {s.get('n_written', 0)/1e6:.0f} MB {t2-t1:.1f} s; restore {m.get('n_restored')} tok {t3-t2:.1f} s")
     if m.get("n_restored") != len(head): raise RuntimeError(f"restore returned {m.get('n_restored')} tokens for {len(head)}")
     STATE["metal_tokens"] = list(head)
+    if t.get("prompt_n") and t.get("prompt_ms"): observe_card(int(t["prompt_n"]), t["prompt_ms"] / 1000.0, (t2 - t1) + (t3 - t2))
+
+
+def fit_line(obs):
+    """Least squares seconds = a + b*tokens over (tokens, seconds) pairs; None unless >= 2 points spanning >= 1000 tokens
+    with a positive slope. Returns (fixed_seconds, tokens_per_second)."""
+    if len(obs) < 2 or max(n for n, _ in obs) - min(n for n, _ in obs) < 1000: return None
+    k = len(obs); sx = sum(n for n, _ in obs); sy = sum(t for _, t in obs)
+    sxx = sum(n * n for n, _ in obs); sxy = sum(n * t for n, t in obs)
+    den = k * sxx - sx * sx
+    if den <= 0: return None
+    b = (k * sxy - sx * sy) / den; a = (sy - b * sx) / k
+    if b <= 0 or a < 0: return None
+    return a, 1.0 / b
+
+
+def observe_card(tokens, seconds, handoff_seconds):
+    """A card prefill happened: refit the fixed cost and rate from the last 8, and the handoff per token."""
+    if not ARGS.learn or tokens < 256: return
+    STATE["card_obs"] = (STATE["card_obs"] + [(tokens, seconds)])[-8:]
+    fit = fit_line(STATE["card_obs"])
+    hp = handoff_seconds / tokens
+    changed = abs(hp - ARGS.handoff_per_token) > 0.1 * ARGS.handoff_per_token
+    ARGS.handoff_per_token = 0.5 * ARGS.handoff_per_token + 0.5 * hp
+    if fit:
+        fixed, rate = fit
+        changed |= abs(fixed - ARGS.card_fixed) > 0.05 * ARGS.card_fixed or abs(rate - ARGS.card_rate) > 0.05 * ARGS.card_rate
+        ARGS.card_fixed, ARGS.card_rate = fixed, rate
+    if changed: log(f"calibration: card fixed {ARGS.card_fixed:.1f} s + {ARGS.card_rate:.0f} tok/s, handoff {ARGS.handoff_per_token*1e6:.0f} us/token ({len(STATE['card_obs'])} observations)")
+
+
+def observe_metal(tokens, seconds):
+    """Metal prefilled `tokens` itself: track its rate (only prefills long enough to be a rate, not an overhead)."""
+    if not ARGS.learn or tokens < 256 or seconds <= 0: return
+    rate = tokens / seconds; old = ARGS.metal_rate
+    ARGS.metal_rate = 0.5 * ARGS.metal_rate + 0.5 * rate
+    if abs(ARGS.metal_rate - old) > 0.05 * old: log(f"calibration: metal {ARGS.metal_rate:.0f} tok/s (observed {rate:.0f} over {tokens} tokens)")
 
 
 def predict(cold):
@@ -148,6 +187,11 @@ def selftest():
         ok &= (want == "card") == (c < m or (ARGS.threshold and cold >= ARGS.threshold))
     ok &= decide(24000, 24001, lambda: False)[0] == "metal"          # a card that is down never wins
     ok &= decide(0, 5000, lambda: True)[0] == "metal"                # nothing cold: nothing to route
+    fit = fit_line([(6974, 8.5), (23691, 15.3)])                      # the two measured points give back the defaults
+    ok &= fit is not None and abs(fit[0] - 5.66) < 0.05 and abs(fit[1] - 2458) < 5
+    ok &= fit_line([(6974, 8.5)]) is None and fit_line([(1000, 5.0), (1500, 5.2)]) is None   # too few, too narrow
+    ok &= fit_line([(1000, 9.0), (9000, 5.0)]) is None                # a negative slope is not a rate
+    print(f"fit of the two measured points: fixed {fit[0]:.2f} s, {fit[1]:.0f} tok/s" if fit else "fit: FAILED")
     print("selftest:", "OK" if ok else "FAIL"); return 0 if ok else 1
 
 
@@ -205,8 +249,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 d = json.loads(tail) if tail.strip().startswith(b"{") else None
                 t = (d or {}).get("timings") or {}
-                if t: log(f"metal: prompt_n {t.get('prompt_n')} cache_n {t.get('cache_n')} prompt {t.get('prompt_ms', 0)/1000:.1f} s, "
-                          f"decode {t.get('predicted_n')} tok at {t.get('predicted_per_second', 0):.1f} tok/s (wall {time.perf_counter()-t0:.1f} s)")
+                if t:
+                    log(f"metal: prompt_n {t.get('prompt_n')} cache_n {t.get('cache_n')} prompt {t.get('prompt_ms', 0)/1000:.1f} s, "
+                        f"decode {t.get('predicted_n')} tok at {t.get('predicted_per_second', 0):.1f} tok/s (wall {time.perf_counter()-t0:.1f} s)")
+                    if route == "metal" and t.get("prompt_n") and t.get("prompt_ms"): observe_metal(int(t["prompt_n"]), t["prompt_ms"] / 1000.0)
             except ValueError: pass
 
 
@@ -221,6 +267,7 @@ def main():
     ap.add_argument("--card-rate", type=float, default=2460.0, help="card marginal prefill tok/s (fit of 23,691 tok/15.3 s and 6,974 tok/8.5 s)")
     ap.add_argument("--card-fixed", type=float, default=5.7, help="card fixed seconds per prompt: the expert stream across the link (same fit)")
     ap.add_argument("--handoff-per-token", type=float, default=3e-5, help="seconds per token to save and restore the state (662 MB / 23,691 tok in 0.8 s)")
+    ap.add_argument("--no-learn", dest="learn", action="store_false", help="freeze the cost model: do not refit it from observed prefills")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--state-dir", default=None, help="the --slot-save-path both servers share, to delete handed-over files"); ap.add_argument("--slot", type=int, default=0)
     ARGS = ap.parse_args()
