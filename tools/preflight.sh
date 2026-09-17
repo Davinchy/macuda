@@ -51,7 +51,12 @@ present=0; matches=0; snapshot=0; [ -f "$SNAP" ] && snapshot=1
 dart_all=$(ioreg -l -w0 2>/dev/null | grep -o '"pci-dart-error-data" = <[0-9a-f]*>' | head -1)
 if [ -n "$dart_all" ]; then
   present=1; cur=$dart_all
-  [ $snapshot = 1 ] && grep -qxF "$cur" "$SNAP" && matches=1
+  # A shell string compare, not grep -F: with a 176 KB flag (~4400 records, 2026-09-16 19:57) grep -qxF under /bin/sh
+  # dies "out of memory" with exit 2, which reads as no-match and so as a NEW fault - a gate that cannot compare a large
+  # flag aborts forever after any real fault stream, refusing the card to everyone. Found in the macuda tree 2026-09-17
+  # (A had already fixed it in the EGPU tree; this is that fix, keeping this tree's portable SNAP resolution). The
+  # snapshot line is the last line of the file (tools/dart-stale.sh writes it last).
+  [ $snapshot = 1 ] && [ "$(tail -n 1 "$SNAP")" = "$cur" ] && matches=1
 fi
 case $(dart_verdict $present $snapshot $matches) in
   stale)     echo "   DART error data present, byte-identical to the snapshot: stale, not a new fault"
