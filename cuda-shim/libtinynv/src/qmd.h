@@ -38,6 +38,17 @@
 // blockDim at word 216 and gridDim at word 220, each three words. See tinynv_qmd_cbuf0.
 #define TINYNV_CBUF0_NTID 216
 #define TINYNV_CBUF0_NCTAID 220
+// And Ampere's, which are at the very bottom of the bank: blockDim at dword 0 and gridDim at dword 3, leaving dwords
+// 6..11 for the two windows and the trap address exactly where the oracle puts them, with nothing overlapping.
+//
+// MEASURED, not assumed, and not from a header. The dims kernel loads its own geometry from constant bank 0 at offsets
+// the compiler chose, so the offsets are IN ITS SASS: nvdisasm of spike/dims.cu built for sm_86 stores c[0x0][0xc] to
+// p[0] (gridDim.x) and c[0x0][0x0] to p[3] (blockDim.x), and computes its block index from c[0x0][0xc] and c[0x0][0x10]
+// as gridDim.x and .y. The same reading of the sm_120 build returns 0x360 and 0x370 - dwords 216 and 220, the two
+// numbers above, which were originally found by filling the region with markers on real hardware. A method that
+// reproduces the known answer for one architecture is a method worth trusting for the other.
+#define TINYNV_QMD_V3_CBUF0_NTID 0
+#define TINYNV_QMD_V3_CBUF0_NCTAID 3
 
 typedef struct {
   uint8_t b[TINYNV_QMD_BYTES];

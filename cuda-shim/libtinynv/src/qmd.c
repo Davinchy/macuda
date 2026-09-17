@@ -325,14 +325,15 @@ uint32_t tinynv_qmd_cbuf0(uint32_t *out, uint32_t cap, int v3, uint64_t shared_w
   // asks - so these two offsets are the first thing in this driver that no recording could supply. They were measured:
   // the region was filled with one marker per word and a kernel asked what it saw, which came back as the markers at
   // word 216 and word 220. Nothing is inferred from a header here, and the dims kernel in spike/ re-checks all six.
-  // AND ON AMPERE THESE TWO OFFSETS ARE NOT KNOWN. The ones below were measured on a GB202 with a kernel that reported
-  // which word it saw its markers in; nothing derived them from a header, and no recording can supply them because the
-  // oracle compiles its launch sizes in as literals and never reads them. The same measurement has not been made on an
-  // Ampere card. A guess here does not fail: it makes blockDim read as zero, `blockIdx.x * blockDim.x + threadIdx.x`
-  // collapse to `threadIdx.x`, and every block write over the first block's output - correct for one block and quietly
-  // wrong for any more. So a caller that needs them on Ampere is refused until spike/dims.cu has been run there.
-  if (v3 && (grid || block)) return 0;
-  if (grid) for (int i = 0; i < 3; i++) out[TINYNV_CBUF0_NCTAID + i] = grid[i];
-  if (block) for (int i = 0; i < 3; i++) out[TINYNV_CBUF0_NTID + i] = block[i];
+  // blockDim and gridDim. A CUDA kernel does not get these from a register on either architecture - it loads them out
+  // of the parameter region of constant bank 0, and if the driver does not put them there they read as zero. The
+  // symptom is not a failure: `i = blockIdx.x * blockDim.x + threadIdx.x` becomes `i = threadIdx.x`, so a launch of one
+  // block is exactly right and anything larger quietly writes over the first block's output. It is worth stating twice
+  // because it is what a 3060 did on 2026-09-17: every op in test-backend-ops came back wrong by about 2.0 with the
+  // whole stack otherwise working, and nothing in the failure pointed here.
+  uint32_t nctaid = v3 ? TINYNV_QMD_V3_CBUF0_NCTAID : TINYNV_CBUF0_NCTAID;
+  uint32_t ntid   = v3 ? TINYNV_QMD_V3_CBUF0_NTID   : TINYNV_CBUF0_NTID;
+  if (grid) for (int i = 0; i < 3; i++) out[nctaid + i] = grid[i];
+  if (block) for (int i = 0; i < 3; i++) out[ntid + i] = block[i];
   return cap;
 }

@@ -429,6 +429,8 @@ TINYNV_AT(tinynv_copy_pdes_t, levels, 40);
 #define TINYNV_CLASS_COMPUTE_AMPERE     0xc7c0
 #define TINYNV_CLASS_DMA_COPY_AMPERE    0xc7b5
 #define TINYNV_CLASS_COMPUTE_ADA        0xc9c0
+// the class the descriptor generation turns on: at or above this, a launch descriptor is v5; below it, v3
+#define TINYNV_CLASS_COMPUTE_BLACKWELL_A 0xcdc0
 #define TINYNV_CLASS_GPFIFO_BLACKWELL   0xc96f
 #define TINYNV_CLASS_COMPUTE_BLACKWELL  0xcec0
 #define TINYNV_CLASS_DMA_COPY_BLACKWELL 0xcab5

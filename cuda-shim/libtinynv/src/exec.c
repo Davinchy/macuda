@@ -1320,6 +1320,9 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
 
   tinynv_qmd_t q;
   memset(&q, 0, sizeof(q));
+  // Which descriptor generation this chip takes, by the same test the oracle makes: the compute class it answers to.
+  // Ampere and Ada take v3, Blackwell v5. memset left this at v5, which is right for exactly one of the three.
+  q.v3 = ex->g->dev.class_compute < TINYNV_CLASS_COMPUTE_BLACKWELL_A;
   tinynv_qmd_program_t prog = {.regs = k->regs,
                                // What the kernel declared plus what the caller asked for at the call site. The descriptor
                                // holds one number, so the two have to be added here: a kernel given only its static
