@@ -1,0 +1,64 @@
+#!/bin/sh
+# tinycc — the split CUDA "compiler" for the shim build: device-compile a .cu to a fatbin with nvcc, then host-compile it
+# on the Mac with clang --cuda-host-only --offload-arch=<same arch>, embedding the fatbin. The offload arch
+# matters on the HOST side too: it sets __CUDA_ARCH_LIST__, which ggml's dispatch reads to decide which kernels exist, and
+# which CUB/thrust bake into their inline namespace (and so into kernel names). Without it clang assumes sm_52. Output one Mach-O .o, ready to link
+# against libtinycudart/libtinycublas/libtinynv. Usage:  tinycc <src.cu> -o <out.o> [-I<dir> ...] [-D<x> ...] [-std=..]
+#
+# The device half runs nvcc in a container by default (TINYCC_DOCKER_IMAGE), which on Apple silicon is a native arm64
+# image: nvcc needs no GPU to emit a cubin, so no NVIDIA hardware and no second machine are involved. The repository is
+# bind-mounted at ITS OWN ABSOLUTE PATH inside the container, so every -I and the source path are valid verbatim on both
+# sides and there is nothing to translate and nothing to rsync.
+#
+# Setting TINYCC_HOST restores the original behaviour — device compile over ssh on a Linux box with the ggml tree synced
+# to $TINYCC_GGML_LINUX — for the case where a real CUDA box is the faster or only option.
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd); R=${EGPU_ROOT:-$(cd "$ROOT/.." && pwd)}
+CLANG=/opt/homebrew/opt/llvm/bin/clang++
+ARCH=${TINYCC_ARCH:-sm_120a}
+IMAGE=${TINYCC_DOCKER_IMAGE:-nvidia/cuda:13.0.3-devel-ubuntu24.04}
+DOCKER=${TINYCC_DOCKER:-docker}
+# SASS only, no portable PTX (what ggml's own CMake ships as 120a-real): nvcc expands -arch=sm_120a into an sm_120a pass
+# PLUS a compute_120 PTX pass compiled without the architecture-specific feature macro, and ggml's Blackwell gate checks
+# only the architecture number, so that PTX carries the block-scaled MMA and ptxas rejects it. The explicit -gencode
+# form has no such second pass. The fatbin then holds exactly one ELF, which is what the shim's loader expects.
+GMAC=${TINYCC_GGML_MAC:-$R/llama.cpp/ggml}; GLIN=${TINYCC_GGML_LINUX:-ggml}
+src=""; out=""; hostI=""; devI=""; defs=""; std="-std=c++17"
+while [ $# -gt 0 ]; do case "$1" in
+  *.cu) src="$1";;
+  -o) out="$2"; shift;;
+  -I*) d="${1#-I}"; hostI="$hostI -I$d"; case "$d" in "$GMAC"*) devI="$devI -I$GLIN${d#$GMAC}";; esac;;
+  -D*) defs="$defs $1";;
+  -std=*) std="$1";;
+esac; shift; done
+[ -n "$src" ] && [ -n "$out" ] || { echo "tinycc: need <src.cu> -o <out.o>" >&2; exit 2; }
+rel="${src#$GMAC/}"; base=$(basename "$src" .cu); fat="/tmp/tinycc_$base.fatbin"
+NVCC_ARGS="--fatbin -gencode arch=compute_${ARCH#sm_},code=$ARCH --extended-lambda --expt-relaxed-constexpr"
+# 1) device compile
+# TINYCC_REUSE_FATBIN=1 skips the device compile when the fatbin from a previous run is still here (host-only rebuilds)
+if [ "${TINYCC_REUSE_FATBIN:-0}" = 1 ] && [ -s "$fat" ]; then :; else
+if [ -n "${TINYCC_HOST:-}" ]; then
+  KEY=${TINYCC_KEY:-}   # TINYCC_KEY: ssh identity file, optional
+  SSH="ssh ${KEY:+-i $KEY} -o BatchMode=yes -o ControlMaster=auto -o ControlPath=$ROOT/.cache/cc-%C -o ControlPersist=300"
+  $SSH "$TINYCC_HOST" "export PATH=/usr/local/cuda/bin:\$PATH; nvcc $NVCC_ARGS $devI $defs -o /tmp/tinycc_$base.fatbin '$GLIN/$rel'"
+  scp -q ${KEY:+-i "$KEY"} -o "ControlPath=$ROOT/.cache/cc-%C" "$TINYCC_HOST:/tmp/tinycc_$base.fatbin" "$fat"
+else
+  # Same absolute path inside the container as outside, so $hostI and $src need no rewriting. The fatbin is written to a
+  # mounted directory as the invoking user, not root, so the host half can read it and a later run can overwrite it.
+  mkdir -p "$ROOT/.cache/fatbin"
+  $DOCKER run --rm --platform linux/arm64 --user "$(id -u):$(id -g)" \
+    -v "$R:$R:ro" -v "$ROOT/.cache/fatbin:/fatbin" \
+    "$IMAGE" nvcc $NVCC_ARGS $hostI $defs -o "/fatbin/tinycc_$base.fatbin" "$src"
+  cp "$ROOT/.cache/fatbin/tinycc_$base.fatbin" "$fat"
+fi
+fi
+# 2) host compile on the Mac, embed the fatbin
+# The SDK is passed EXPLICITLY. Without -isysroot, Homebrew's clang looks for an SDK named after the OS it is targeting
+# - MacOSX27.sdk for macos 27 - and the Command Line Tools do not ship one under that name, so every translation unit
+# died in libc++'s math.h on an undeclared FP_NAN, which reads like a CUDA problem and is not one. build/sdk.sh already
+# answers this question by linking a one-line program; TINYCC_SYSROOT lets a caller compute it once for a whole build
+# instead of once per translation unit.
+SYSROOT=${TINYCC_SYSROOT:-$(sh "$ROOT/build/sdk.sh")}
+$CLANG $std -DNDEBUG -isysroot "$SYSROOT" -x cuda --cuda-host-only --offload-arch=$ARCH --cuda-path=$ROOT/cuda-13 -nocudalib -Wno-unknown-cuda-version \
+  -include $ROOT/spike/tinycudart_compat.h -I$ROOT/cuda-13/include/cccl $hostI $defs \
+  -Xclang -fcuda-include-gpubinary -Xclang "$fat" -c "$src" -o "$out"

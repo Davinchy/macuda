@@ -1,4 +1,12 @@
-build/
+# build/ holds BOTH the scripts that drive the build and everything those scripts produce. Ignoring the whole directory
+# meant tinycc, cc-one.sh, build-ggml-cuda.sh, link-null.sh, link-llama-bench.sh, sdk.sh and fetch-cuda-headers.sh -
+# every one of them named in the README's Layout section - were never committed. A fresh clone of this repository could
+# not build, and the move to a new machine on 2026-09-17 carried them only because it was a file copy and not a clone.
+# So: the outputs stay ignored, the scripts do not. Note this must be `build/*` and not `build/`, because a negation
+# cannot reach inside a directory git has been told to ignore entirely.
+build/*
+!build/*.sh
+!build/tinycc
 *.o
 *.a
 *.dSYM/
