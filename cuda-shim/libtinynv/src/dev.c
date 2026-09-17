@@ -7,6 +7,7 @@
 #include "dev.h"
 #include "internal.h"
 #include "nv_regs.h"
+#include "nv_structs.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -111,6 +112,18 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   // Blackwell and later boot the falcon through the FSP chain of trust and use the third MMU generation
   d->fmc_boot = d->architecture >= 0x1a;
   d->mmu_ver = d->fmc_boot ? 3 : 2;
+
+  // The channel, compute and copy classes the engines answer to. Ampere's are the base set, because that is how the
+  // oracle spells it: Ada keeps Ampere's channel and copy classes and moves only compute, Blackwell moves all three.
+  d->class_gpfifo = TINYNV_CLASS_GPFIFO_AMPERE;
+  d->class_compute = TINYNV_CLASS_COMPUTE_AMPERE;
+  d->class_dma_copy = TINYNV_CLASS_DMA_COPY_AMPERE;
+  if (d->architecture == 0x19) d->class_compute = TINYNV_CLASS_COMPUTE_ADA;
+  else if (d->architecture >= 0x1b) {
+    d->class_gpfifo = TINYNV_CLASS_GPFIFO_BLACKWELL;
+    d->class_compute = TINYNV_CLASS_COMPUTE_BLACKWELL;
+    d->class_dma_copy = TINYNV_CLASS_DMA_COPY_BLACKWELL;
+  }
 
   // The firmware that runs at power-on signals it has finished; until then the chip is not ready to be driven. Where it
   // signals differs by architecture, which is the whole of the difference here.

@@ -212,6 +212,21 @@ static int rpc_send_record(tinynv_gpu_t *g, uint32_t func, const void *payload, 
   nv_wr32(&gsp->queues.view, q->base + offsetof(tinynv_msgq_tx_header_t, writePtr), (wp + elem_count) % q->tx.msgCount);
   __sync_synchronize(); // the doorbell must not be seen before the record it announces
 
+  // TINYNV_RPC_TRACE names every record and where it landed. A divergence in a replay is reported as an offset in the
+  // shared allocation, which says nothing about which call went wrong; this is what turns that offset into a function.
+  if (getenv("TINYNV_RPC_TRACE"))
+  {
+    // an allocation names the class it is creating, which is the only part that identifies it at a glance
+    char what[64] = "";
+    if (func == TINYNV_MSG_FUNCTION_GSP_RM_ALLOC && len >= sizeof(tinynv_rpc_rm_alloc_t)) {
+      tinynv_rpc_rm_alloc_t a;
+      memcpy(&a, payload, sizeof(a));
+      snprintf(what, sizeof(what), " class %#x object %#x parent %#x", a.hClass, a.hObject, a.hParent);
+    }
+    fprintf(stderr, "tinynv: rpc function %u, %zu bytes payload, %u element(s) at mem:0 %#llx (seq %u)%s\n",
+            func, len, elem_count, (unsigned long long)(ring + off), q->seq, what);
+  }
+
   q->seq++;
   tinynv_wr32(&g->dev, NV_PGSP_QUEUE_HEAD(0), 0);
   free(rec);
@@ -943,7 +958,7 @@ int tinynv_gsp_init_channel(tinynv_gpu_t *g) {
   if (fill_channel_state(g, TINYNV_RM_PRIV_ROOT, &p, &gsp->ramfc, &gsp->mthdbuf)) return -1;
   p.userdMem = (tinynv_memory_desc_t){.base = gsp->gpfifo.ranges[0].paddr + userd_off, .size = 0x20, .addressSpace = 2};
 
-  if (rm_alloc(g, gsp->device, TINYNV_CLASS_GPFIFO, &p, sizeof(p), &gsp->channel)) return -1;
+  if (rm_alloc(g, gsp->device, g->dev.class_gpfifo, &p, sizeof(p), &gsp->channel)) return -1;
 
   // which runlist this channel is on, which submitting work later has to name
   gsp->channel_runlist = 0;
@@ -1011,8 +1026,8 @@ int tinynv_gsp_init_gr_context(tinynv_gpu_t *g) {
   if (rc) return -1;
 
   // the classes the channel will actually run: compute, and the copy engine behind memcpy
-  if (rm_alloc(g, gsp->channel, TINYNV_CLASS_COMPUTE, NULL, 0, &gsp->compute_obj)) return -1;
-  return rm_alloc(g, gsp->channel, TINYNV_CLASS_DMA_COPY, NULL, 0, &gsp->dma_copy_obj);
+  if (rm_alloc(g, gsp->channel, g->dev.class_compute, NULL, 0, &gsp->compute_obj)) return -1;
+  return rm_alloc(g, gsp->channel, g->dev.class_dma_copy, NULL, 0, &gsp->dma_copy_obj);
 }
 
 // The client the driver works through, as against the privileged one that set the graphics context up.
@@ -1198,10 +1213,10 @@ static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32
   p.hContextShare = gsp->user_ctxshare;
   if (!compute && gsp->copy_ctxshare) p.hContextShare = gsp->copy_ctxshare;
   if (fill_channel_state(g, cl, &p, NULL, NULL)) return -1;
-  if (rm_alloc_as(g, cl, gsp->user_group, 0, TINYNV_CLASS_GPFIFO, &p, sizeof(p), &q->channel)) return -1;
+  if (rm_alloc_as(g, cl, gsp->user_group, 0, g->dev.class_gpfifo, &p, sizeof(p), &q->channel)) return -1;
 
   if (compute) {
-    if (rm_alloc_as(g, cl, q->channel, 0, TINYNV_CLASS_COMPUTE, NULL, 0, &q->object)) return -1;
+    if (rm_alloc_as(g, cl, q->channel, 0, g->dev.class_compute, NULL, 0, &q->object)) return -1;
 
     // A compute object on an ordinary client gets its own copy of the first three context buffers, promoted twice: once
     // by physical address so the engine can initialise them, then by virtual address so it can reach them.
@@ -1229,7 +1244,7 @@ static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32
     dbg.hAppClient = cl;
     dbg.hClass3dObject = q->object;
     if (rm_alloc_as(g, cl, gsp->user_device, 0, TINYNV_CLASS_DEBUGGER, &dbg, sizeof(dbg), &gsp->user_debugger)) return -1;
-  } else if (rm_alloc_as(g, cl, q->channel, 0, TINYNV_CLASS_DMA_COPY, NULL, 0, &q->object)) return -1;
+  } else if (rm_alloc_as(g, cl, q->channel, 0, g->dev.class_dma_copy, NULL, 0, &q->object)) return -1;
 
   // the token names this channel at the doorbell. gsp-rm fills in only the channel part; the runlist and, on this
   // architecture, an enable bit are the driver's to add.

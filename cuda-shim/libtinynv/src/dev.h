@@ -12,6 +12,7 @@ typedef struct {
   char fw_name[16];     // the firmware directory the boot images come from
   int fmc_boot;         // Blackwell and later: boot through the FSP chain of trust rather than the VBIOS
   int mmu_ver;          // page table generation, 2 or 3
+  uint32_t class_gpfifo, class_compute, class_dma_copy; // the engine classes this architecture answers to
   int wpr2_was_up;      // firmware was already resident when we arrived, so the chip was reset
   int large_bar;        // the whole of video memory is cpu visible
   uint64_t vram_size;

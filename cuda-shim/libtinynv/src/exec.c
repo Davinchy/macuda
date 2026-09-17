@@ -1631,13 +1631,13 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   uint64_t va;
   tinynv_cmdbuf_t c;
   if (batch_begin(ex, &g->gsp.compute_q, 64, &c, &va)) return -1;
-  if (tinynv_cmd_set_object(&c, 1, TINYNV_CLASS_COMPUTE)) return -1;
+  if (tinynv_cmd_set_object(&c, 1, g->dev.class_compute)) return -1;
   if (tinynv_cmd_shader_window(&c, 0, TINYNV_LOCAL_WINDOW)) return -1;
   if (tinynv_cmd_shader_window(&c, 1, TINYNV_SHARED_WINDOW)) return -1;
   if (run(ex, &g->gsp.compute_q, &c, va)) return -1;
 
   if (batch_begin(ex, &g->gsp.copy_q, 40, &c, &va)) return -1;
-  if (tinynv_cmd_set_object(&c, 4, TINYNV_CLASS_DMA_COPY)) return -1;
+  if (tinynv_cmd_set_object(&c, 4, g->dev.class_dma_copy)) return -1;
   if (run(ex, &g->gsp.copy_q, &c, va)) return -1;
   // the engines must be bound before anything is built on them, and this happens once
   if (tinynv_exec_idle(ex)) return -1;

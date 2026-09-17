@@ -422,9 +422,16 @@ TINYNV_AT(tinynv_copy_pdes_t, levels, 40);
 // --- a channel ------------------------------------------------------------------------------------------------------
 // Work reaches the GPU through a channel: a ring of pointers to command buffers, plus several small areas GSP-RM keeps
 // the channel's state in. The classes are per architecture; these are Blackwell's.
-#define TINYNV_CLASS_GPFIFO 0xc96f
-#define TINYNV_CLASS_COMPUTE 0xcec0
-#define TINYNV_CLASS_DMA_COPY 0xcab5
+// One set per architecture, and an object allocated under the wrong one does not fail cleanly: GSP-RM accepts the
+// allocation and the engine then answers to methods the driver is not sending. dev.c picks the set from the chip and
+// puts it in tinynv_dev_t, so nothing here is reachable without having chosen.
+#define TINYNV_CLASS_GPFIFO_AMPERE      0xc56f
+#define TINYNV_CLASS_COMPUTE_AMPERE     0xc7c0
+#define TINYNV_CLASS_DMA_COPY_AMPERE    0xc7b5
+#define TINYNV_CLASS_COMPUTE_ADA        0xc9c0
+#define TINYNV_CLASS_GPFIFO_BLACKWELL   0xc96f
+#define TINYNV_CLASS_COMPUTE_BLACKWELL  0xcec0
+#define TINYNV_CLASS_DMA_COPY_BLACKWELL 0xcab5
 
 typedef struct { uint64_t base, size; uint32_t addressSpace, cacheAttrib; } tinynv_memory_desc_t;
 TINYNV_SIZE(tinynv_memory_desc_t, 24);

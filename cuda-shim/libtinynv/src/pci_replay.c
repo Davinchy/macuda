@@ -156,11 +156,22 @@ static uint64_t fnv1a(const void *data, size_t n) {
   return h;
 }
 
+// Only the FIRST divergence is kept for the summary, because in a desynchronised replay the rest are usually the same
+// mistake restated thousands of times. But when a replay is nearly clean - three divergences in half a million
+// operations - the second and third are the interesting ones and there was no way to see them. TINYNV_REPLAY_ALL prints
+// each as it happens.
 static void diverge(replay_t *r, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   if (!r->divergences) vsnprintf(r->first_divergence, sizeof(r->first_divergence), fmt, ap);
   va_end(ap);
+  if (getenv("TINYNV_REPLAY_ALL")) {
+    va_start(ap, fmt);
+    fprintf(stderr, "tinynv: divergence %zu: ", r->divergences + 1);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+  }
   r->divergences++;
 }
 
