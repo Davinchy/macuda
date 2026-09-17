@@ -204,6 +204,11 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@# is committed because the recording is not something to repeat casually; it is regenerated when the snapshot is there.
 	@if [ -f $(SNAPSHOT) ]; then $(PYTHON) tools/nv_reference_hw.py $(SNAPSHOT) test/reference-hw.txt >/dev/null; fi
 	@$(BUILD)/test_qmd_hw test/reference-hw.txt
+	@# and the same against descriptors a 3060 was handed, which is a DIFFERENT descriptor generation: 256 bytes of QMD
+	@# v3 where the above is 384 of v5, with the grid under another name, the driver's parameters at the start of
+	@# constant bank 0 instead of dword 188, and two fields Ampere has that Blackwell does not. Both are checked every
+	@# run, because the whole point of one driver for two cards is that neither is allowed to drift.
+	@$(BUILD)/test_qmd_hw test/reference-hw-sm86.txt
 	@# both modes: faithful reproduces the recording operation for operation with nothing forgiven, which is what the
 	@# first hardware runs use; fast skips reads whose values are proven held, which is what everything else uses.
 	@if [ -f $(TRACE).trace ]; then TINYNV_FAITHFUL=1 $(BUILD)/test_dev $(TRACE) && $(BUILD)/test_dev $(TRACE); \

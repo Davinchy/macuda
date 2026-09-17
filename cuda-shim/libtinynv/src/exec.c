@@ -1379,7 +1379,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
       tinynv_qmd_chain(&ex->chain[ex->nchain - 1].qmd, qmd_va, ex->chain_prefetch)) return -1;
 
   memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
-  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW,
+  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, q.v3, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW,
                    l.grid, l.block);
   if (params_len) memcpy(host + slot + k->param_base, params, params_len);
 
