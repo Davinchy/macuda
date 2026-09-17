@@ -39,11 +39,15 @@ tools/disagg-serve.sh start` → the requests (`test`, `chat`) → `stop` → `s
 
 ## What is next
 
-1. **A time-based threshold.** The card pays a fixed ~7-8 s to stream all 47 GB of experts whatever the prompt length,
-   so a 7K prompt barely wins (8.5 s vs ~10.5 s on Metal). Route by estimated seconds (fixed stream cost + tokens/rate)
-   against Metal's rate, not by a token count. Offline work in `tools/disagg-router.py`.
-2. **Partial expert residency.** About 20 of the 48 expert layers fit on the card beside the 11.2 GB compute buffer;
-   `NCPUMOE=28` would roughly halve the fixed cost. Needs one measured slot (same shape as above).
+1. **A time-based threshold: DONE (d608b5e).** Fitted from the two measured points: card = 5.7 s fixed + 2,460 tok/s
+   + handoff, Metal = 664 tok/s, break-even ~5,300 cold tokens; `--threshold` is now the operator's cap (A's 512),
+   `--selftest` prints the curve. Plumbing 10/10 on the 0.8B.
+2. **Partial expert residency.** At a 24K ubatch the compute buffer is ~8.4 GB, so ~18 of the 48 expert layers
+   (`NCPUMOE=30`) fit beside it, cutting the fixed cost by ~37% and the break-even to ~3,300 tokens. HAZARD: that puts
+   the driver's allocator near 30 GB of 32, and the snapshot driver 2fe7091 still reserves a flat 64 MB for the
+   firmware where WPR2 actually spans ~203 MB (README §Known limits: safe only because the allocator has never been half
+   full). The EGPU tree's main carries the 256 MB carveout (52842fc). Run this measurement ONLY on A's gated build
+   (BIN=<cuda-shim-f>/build/bin) or not at all; requested from A 2026-09-16 ~17:50 with that condition.
 3. **Prompts over 24,576 tokens** stream the experts once per ubatch (ggml-cuda's MoE id helper caps a ubatch at 25,088
    tokens on sm_120): measure a 64K prompt before promising numbers there.
 4. **A second model** through the same gate (the dense 27B), since the placement flags were found by crashing on one.
