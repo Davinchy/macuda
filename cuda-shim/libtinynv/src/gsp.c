@@ -20,9 +20,20 @@
 // The firmware this driver is pinned to. The hashes are the version: a firmware image is code the GPU's secure boot
 // executes, so the file's name is not evidence of anything and the content is checked before it is used.
 static const char *GSP_SHA = "a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f";
-static const char *BL_SHA = "d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071";
+
+// GSP-RM itself ships once, under ga102, and runs on every architecture here. Its RISC-V bootloader does NOT: there is
+// one per chip, under that chip's own directory, and they are different images with different hashes. This was a single
+// constant pinned to Blackwell's, which meant an Ampere card loaded its own correct bootloader and then had it refused
+// for hashing to something other than a Blackwell image - a refusal that reads like a corrupt download.
+static const char *bl_sha(const char *fw_name) {
+  if (!strcmp(fw_name, "gb202")) return "d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071";
+  if (!strcmp(fw_name, "ga102")) return "82428f532240727e95bb3083fbaaba9b2cc7b937314323f2d546ce7245f27fad";
+  if (!strcmp(fw_name, "ad102")) return "65ab2e6b6e0fca95365c4deac79a34582abcfeb15b6ae234138f22e7183118a8";
+  return NULL;
+}
 
 static uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+static uint64_t round_down(uint64_t v, uint64_t a) { return v / a * a; }
 
 // chip names are ascii and the firmware section names are their lowercase form; not locale's business
 static char lower_ascii(char c) { return c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c; }
@@ -1328,7 +1339,9 @@ static int init_gsp_image(tinynv_gpu_t *g) {
 // The RISC-V bootloader that starts GSP-RM, in NVIDIA's own container rather than an ELF.
 static int init_boot_binary_image(tinynv_gpu_t *g) {
   tinynv_gsp_t *gsp = &g->gsp;
-  if (tinynv_fw_load(g->dev.fw_name, "bootloader-" TINYNV_FW_VER ".bin", BL_SHA, &gsp->bl_fw)) return -1;
+  const char *sha = bl_sha(g->dev.fw_name);
+  if (!sha) return tinynv_fail("no riscv bootloader hash is pinned for %s, so its image cannot be trusted", g->dev.fw_name);
+  if (tinynv_fw_load(g->dev.fw_name, "bootloader-" TINYNV_FW_VER ".bin", sha, &gsp->bl_fw)) return -1;
 
   tinynv_nvfw_bin_hdr_t h;
   if (gsp->bl_fw.size < sizeof(h)) return tinynv_fail("the riscv bootloader is truncated");
@@ -1360,13 +1373,48 @@ static int init_wpr_meta(tinynv_gpu_t *g) {
   m.bootloaderDataOffset = gsp->bl_desc.monitorDataOffset;
   m.bootloaderManifestOffset = gsp->bl_desc.manifestOffset;
 
-  if (!g->dev.fmc_boot) return tinynv_fail("the vbios boot path does not build this structure the same way");
-  // on the chain-of-trust path the firmware places its own carveout, so these are sizes and not offsets
-  m.vgaWorkspaceSize = 0x20000;
-  m.pmuReservedSize = 0x1820000;
-  m.nonWprHeapSize = 0x220000;
-  m.gspFwHeapSize = 0x8700000;
-  m.frtsSize = 0x100000;
+  if (g->dev.fmc_boot) {
+    // on the chain-of-trust path the firmware places its own carveout, so these are sizes and not offsets
+    m.vgaWorkspaceSize = 0x20000;
+    m.pmuReservedSize = 0x1820000;
+    m.nonWprHeapSize = 0x220000;
+    m.gspFwHeapSize = 0x8700000;
+    m.frtsSize = 0x100000;
+  } else {
+    // On the vbios path nothing lays the carveout out for us, so the driver does it and hands GSP-RM every boundary.
+    // Downwards from the top of video memory: the vga workspace, the write-protected region FWSEC has already placed,
+    // the boot binary, gsp-rm's own image, its heap, and the non-wpr heap under that. Every boundary is rounded DOWN,
+    // so a region that does not divide evenly eats into its own space rather than into the one below it.
+    uint64_t vga_sz = 0x100000, vga_off = g->dev.vram_size - vga_sz;
+    uint64_t frts_sz = 0x100000, frts_off = vga_off - frts_sz;
+    uint64_t boot_off = frts_off - gsp->bootloader_size;
+    uint64_t gsp_off = round_down(boot_off - gsp->gsp_image_size, 0x10000);
+    uint64_t heap_sz = 0x8100000, heap_off = round_down(gsp_off - heap_sz, 0x100000);
+    uint64_t wpr_start = round_down(heap_off - PAGE, 0x100000);
+    uint64_t non_wpr_sz = 0x100000, non_wpr_off = round_down(wpr_start - non_wpr_sz, 0x100000);
+
+    m.vgaWorkspaceSize = vga_sz;
+    m.vgaWorkspaceOffset = vga_off;
+    m.gspFwWprEnd = vga_off;
+    m.frtsSize = frts_sz;
+    m.frtsOffset = frts_off;
+    m.bootBinOffset = boot_off;
+    m.gspFwOffset = gsp_off;
+    m.gspFwHeapSize = heap_sz;
+    m.gspFwHeapOffset = heap_off;
+    m.gspFwWprStart = wpr_start;
+    m.nonWprHeapSize = non_wpr_sz;
+    m.nonWprHeapOffset = non_wpr_off;
+    m.gspFwRsvdStart = non_wpr_off;
+    m.fbSize = g->dev.vram_size;
+
+    // FWSEC was told where to place the region before this structure existed, from its own arithmetic in flcn.c. If the
+    // two ever disagree, GSP-RM is handed a region that is not the one on the chip and nothing says so - so the oracle
+    // compares them, and this does too.
+    if (g->flcn.frts_offset != m.frtsOffset)
+      return tinynv_fail("fwsec was told to place the protected region at %#llx but the metadata says %#llx",
+                         (unsigned long long)g->flcn.frts_offset, (unsigned long long)m.frtsOffset);
+  }
 
   if (tinynv_alloc_boot_mem(&g->mm, sizeof(m), &m, -1, &gsp->wpr_meta)) return -1;
   gsp->wpr_meta_sysmem = gsp->wpr_meta.addrs[0];
