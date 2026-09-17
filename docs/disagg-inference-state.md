@@ -47,7 +47,8 @@ tools/disagg-serve.sh start` → the requests (`test`, `chat`) → `stop` → `s
    the driver's allocator near 30 GB of 32, and the snapshot driver 2fe7091 still reserves a flat 64 MB for the
    firmware where WPR2 actually spans ~203 MB (README §Known limits: safe only because the allocator has never been half
    full). The EGPU tree's main carries the 256 MB carveout (52842fc). Run this measurement ONLY on A's gated build
-   (BIN=<cuda-shim-f>/build/bin) or not at all; requested from A 2026-09-16 ~17:50 with that condition.
+   (BIN=<cuda-shim-f>/build/bin) or not at all. The request was drafted 2026-09-16 17:50 but A's session had just been
+   replaced by a restart, so it is PENDING: the next A should expect it from V1 in the slot shape above.
 3. **Prompts over 24,576 tokens** stream the experts once per ubatch (ggml-cuda's MoE id helper caps a ubatch at 25,088
    tokens on sm_120): measure a 64K prompt before promising numbers there.
 4. **A second model** through the same gate (the dense 27B), since the placement flags were found by crashing on one.
