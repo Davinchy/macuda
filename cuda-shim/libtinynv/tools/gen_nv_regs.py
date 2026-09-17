@@ -50,6 +50,8 @@ WANTED = [
   # whether the boot firmware has finished: Ampere signals it here rather than in the THERM scratch Blackwell uses
   ("dev_gc6_island", "ga102", "NV_PGC6_AON_SECURE_SCRATCH_GROUP_05"),
   ("dev_gc6_island", "ga102", "NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK"),
+  # how SEC2 says it has handed off, which the register sequencer's resume step waits for
+  ("dev_gc6_island", "ga102", "NV_PGC6_BSI_SECURE_SCRATCH_14"),
   # the GSP falcon, and the mailbox pair the libos arguments are handed through before it is started
   ("dev_gsp", "ga102", "NV_PGSP_FALCON_ENGINE"),
   ("dev_gsp", "ga102", "NV_PGSP_FALCON_MAILBOX0"),

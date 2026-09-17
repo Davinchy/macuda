@@ -64,8 +64,20 @@ static int flcn_dma(tinynv_dev_t *d, uint64_t base, uint32_t cmd, uint32_t dest,
                          FLD(NV_PFALCON_FALCON_DMATRFCMD, IDLE), 10000, "waiting for the falcon's dma to drain");
 }
 
+// Let the engine address memory physically, without a context.
+void tinynv_flcn_disable_ctx_req(tinynv_dev_t *d, uint64_t base) {
+  flcn_rmw(d, base + NV_PFALCON_FBIF_CTL, FLD(NV_PFALCON_FBIF_CTL, ALLOW_PHYS_NO_CTX),
+           NV_SET(NV_PFALCON_FBIF_CTL, ALLOW_PHYS_NO_CTX, 1));
+  tinynv_wr32(d, base + NV_PFALCON_FALCON_DMACTL, 0);
+}
+
+int tinynv_flcn_wait_cpu_halted(tinynv_dev_t *d, uint64_t base) {
+  return tinynv_wait_reg(d, base + NV_PFALCON_FALCON_CPUCTL, FLD(NV_PFALCON_FALCON_CPUCTL, HALTED),
+                         FLD(NV_PFALCON_FALCON_CPUCTL, HALTED), 10000, "waiting for the falcon to halt");
+}
+
 // Two ways to start a core, and the chip says which: where the alias register is enabled it is the one that works.
-static void flcn_start_cpu(tinynv_dev_t *d, uint64_t base) {
+void tinynv_flcn_start_cpu(tinynv_dev_t *d, uint64_t base) {
   if (NV_GET(tinynv_rd32(d, base + NV_PFALCON_FALCON_CPUCTL), NV_PFALCON_FALCON_CPUCTL, ALIAS_EN))
     tinynv_wr32(d, base + NV_PFALCON_FALCON_CPUCTL_ALIAS, NV_SET(NV_PFALCON_FALCON_CPUCTL_ALIAS, STARTCPU, 1));
   else
@@ -75,7 +87,7 @@ static void flcn_start_cpu(tinynv_dev_t *d, uint64_t base) {
 // Reset a falcon and wait for it to finish scrubbing its own memory. `riscv` selects the RISC-V core for the next boot
 // rather than the falcon one; without it, a core that HAS a RISC-V half is put back on the falcon half and told which
 // chip it is on.
-static int flcn_reset(tinynv_gpu_t *g, uint64_t base, int riscv) {
+int tinynv_flcn_reset(tinynv_gpu_t *g, uint64_t base, int riscv) {
   tinynv_dev_t *d = &g->dev;
   uint64_t engine = (base == g->flcn.falcon) ? NV_PGSP_FALCON_ENGINE : NV_PSEC_FALCON_ENGINE;
   tinynv_wr32(d, engine, NV_SET(NV_PGSP_FALCON_ENGINE, RESET, 1));
@@ -108,10 +120,7 @@ static int flcn_execute_hs(tinynv_gpu_t *g, uint64_t base, uint64_t img_paddr, u
                           const uint64_t *mailbox, uint32_t out_mbox[2]) {
   tinynv_dev_t *d = &g->dev;
 
-  // let the engine address memory physically, without a context
-  flcn_rmw(d, base + NV_PFALCON_FBIF_CTL, FLD(NV_PFALCON_FBIF_CTL, ALLOW_PHYS_NO_CTX),
-           NV_SET(NV_PFALCON_FBIF_CTL, ALLOW_PHYS_NO_CTX, 1));
-  tinynv_wr32(d, base + NV_PFALCON_FALCON_DMACTL, 0);
+  tinynv_flcn_disable_ctx_req(d, base);
 
   // aperture 0 is video memory. It is not in the published headers under any name, which is why it is a bare 0 here
   // and in the oracle.
@@ -149,9 +158,8 @@ static int flcn_execute_hs(tinynv_gpu_t *g, uint64_t base, uint64_t img_paddr, u
     tinynv_wr32(d, base + NV_PFALCON_FALCON_MAILBOX1, (uint32_t)(*mailbox >> 32));
   }
 
-  flcn_start_cpu(d, base);
-  if (tinynv_wait_reg(d, base + NV_PFALCON_FALCON_CPUCTL, FLD(NV_PFALCON_FALCON_CPUCTL, HALTED),
-                      FLD(NV_PFALCON_FALCON_CPUCTL, HALTED), 10000, "waiting for the falcon to halt")) return -1;
+  tinynv_flcn_start_cpu(d, base);
+  if (tinynv_flcn_wait_cpu_halted(d, base)) return -1;
 
   if (out_mbox) {
     out_mbox[0] = tinynv_rd32(d, base + NV_PFALCON_FALCON_MAILBOX0);
@@ -325,7 +333,7 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
 
   // FWSEC, out of the card's own rom, on the gsp falcon. Its data segment loads at virtual zero, which is why the
   // dmem virtual base is a literal here and the code's is not.
-  if (flcn_reset(g, f->falcon, 0)) return -1;
+  if (tinynv_flcn_reset(g, f->falcon, 0)) return -1;
   if (flcn_execute_hs(g, f->falcon, f->fwsec.image.paddr, 0, dsc->IMEMLoadSize,
                       dsc->IMEMPhysBase, dsc->IMEMVirtBase, dsc->IMEMLoadSize,
                       dsc->DMEMPhysBase, 0, dsc->DMEMLoadSize,
@@ -336,13 +344,13 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
     return tinynv_fail("fwsec ran and halted but the write-protected region is still unplaced");
 
   // the same falcon again, now selecting its riscv core, and told where gsp-rm's arguments are
-  if (flcn_reset(g, f->falcon, 1)) return -1;
+  if (tinynv_flcn_reset(g, f->falcon, 1)) return -1;
   tinynv_wr32(d, NV_PGSP_FALCON_MAILBOX0, (uint32_t)gsp->libos_args_sysmem);
   tinynv_wr32(d, NV_PGSP_FALCON_MAILBOX1, (uint32_t)(gsp->libos_args_sysmem >> 32));
 
   // booter_load on SEC2, carrying the wpr metadata. engine id 1 and ucode id 3 are what this image declares itself to
   // be; the boot rom refuses it under any other pair.
-  if (flcn_reset(g, f->sec2, 0)) return -1;
+  if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
   uint32_t mbx[2] = {0, 0};
   uint64_t wpr = gsp->wpr_meta_sysmem;
   if (flcn_execute_hs(g, f->sec2, f->booter_image.paddr, f->booter_code_off, f->booter_data_off,

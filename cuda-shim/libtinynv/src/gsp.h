@@ -215,6 +215,7 @@ typedef struct {
   int fault_sm_have;      // no mmu fault, but an SM reported an error: a kernel did something illegal
   uint32_t fault_sm_esr;  // that SM's warp error status, which says what
   uint32_t cpu_seq_requests; // register sequences gsp-rm asked us to run. zero in the recording, so watch it on hardware
+  uint32_t cpu_seq_saved[8]; // the sequencer's save-register op: eight slots, matching rpc_run_cpu_sequencer's own area
   // An rpc gave up waiting, so its reply may still be coming and nothing has claimed it. The next request must not be
   // allowed to match it: replies carry a function number and no request identity, so a late reply to one control looks
   // exactly like the answer to the next control, and the parameters would be copied back from the wrong one. Set on a

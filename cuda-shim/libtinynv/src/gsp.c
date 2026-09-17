@@ -58,10 +58,14 @@ static void run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
   g->gsp.cpu_seq_requests++;
   fprintf(stderr, "tinynv: gsp-rm asked the driver to run a register sequence (%zu bytes, request %u). "
                   "the recorded boot never did this, so this path is unproven.\n", len, g->gsp.cpu_seq_requests);
-  const size_t hdr = 32; // rpc_run_cpu_sequencer_v17_00: the command count is the last word of it
+  // rpc_run_cpu_sequencer_v17_00 is FORTY bytes, not thirty-two: bufferSizeDWord at 0, cmdIndex at 4, then a register
+  // save area of EIGHT words, and only then the commands. This read 32 and took the command count from the last word of
+  // that, which is regSaveArea[5], and then started decoding at regSaveArea[6]. Nothing caught it because the recorded
+  // 5090 boot never sends a sequence at all, so until an Ampere card asked for one this function had never run.
+  const size_t hdr = 40;
   if (len < hdr) return;
   uint32_t cmd_index;
-  memcpy(&cmd_index, msg + hdr - 4, 4);
+  memcpy(&cmd_index, msg + 4, 4);
   const uint32_t *w = (const uint32_t *)(const void *)(msg + hdr);
   size_t have = (len - hdr) / 4, i = 0;
   if (cmd_index < have) have = cmd_index;
@@ -86,6 +90,38 @@ static void run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
         NEXT(us);
         struct timespec ts = {.tv_sec = us / 1000000, .tv_nsec = (long)(us % 1000000) * 1000L};
         nanosleep(&ts, NULL);
+        break;
+      }
+      // Save a register into the request's own save area. The oracle decodes that area into a local copy and writes
+      // there, so the stored value goes nowhere and is never read back - but the READ happens, and on a replay a read
+      // that does not happen is a divergence. So the read is what matters and the value is kept beside it.
+      case 0x4: {
+        uint32_t index;
+        NEXT(addr); NEXT(index);
+        uint32_t v = tinynv_rd32(&g->dev, addr);
+        if (index < sizeof(g->gsp.cpu_seq_saved) / sizeof(g->gsp.cpu_seq_saved[0])) g->gsp.cpu_seq_saved[index] = v;
+        break;
+      }
+      // The remaining four ask the driver to drive the GSP falcon itself, which is why flcn.c exposes these.
+      case 0x5:
+        if (tinynv_flcn_reset(g, g->flcn.falcon, 0)) return;
+        tinynv_flcn_disable_ctx_req(&g->dev, g->flcn.falcon);
+        break;
+      case 0x6: tinynv_flcn_start_cpu(&g->dev, g->flcn.falcon); break;
+      case 0x7: if (tinynv_flcn_wait_cpu_halted(&g->dev, g->flcn.falcon)) return; break;
+      // Resume: the gsp falcon comes back on its riscv core with gsp-rm's arguments in the mailbox, then SEC2 is started
+      // and has to say it handed off. SEC2's own mailbox reports a refusal, as it does for booter_load.
+      case 0x8: {
+        if (tinynv_flcn_reset(g, g->flcn.falcon, 1)) return;
+        tinynv_wr32(&g->dev, NV_PGSP_FALCON_MAILBOX0, (uint32_t)g->gsp.libos_args_sysmem);
+        tinynv_wr32(&g->dev, NV_PGSP_FALCON_MAILBOX1, (uint32_t)(g->gsp.libos_args_sysmem >> 32));
+        tinynv_flcn_start_cpu(&g->dev, g->flcn.sec2);
+        if (tinynv_wait_reg(&g->dev, NV_PGC6_BSI_SECURE_SCRATCH_14,
+                            1u << NV_PGC6_BSI_SECURE_SCRATCH_14_BOOT_STAGE_3_HANDOFF_LO,
+                            1u << NV_PGC6_BSI_SECURE_SCRATCH_14_BOOT_STAGE_3_HANDOFF_LO, 10000,
+                            "waiting for sec2 to hand off")) return;
+        uint32_t mbx = tinynv_rd32(&g->dev, g->flcn.sec2 + NV_PFALCON_FALCON_MAILBOX0);
+        if (mbx) { tinynv_fail("sec2 refused the sequencer's resume step: mailbox %#x", mbx); return; }
         break;
       }
       default: tinynv_fail("gsp-rm asked for register operation %#x, which this driver does not know", op); return;

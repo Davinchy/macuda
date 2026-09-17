@@ -10,6 +10,7 @@
 // itself is driven identically either way.
 #ifndef TINYNV_FLCN_H
 #define TINYNV_FLCN_H
+#include "dev.h"
 #include "fw.h"
 #include "mmu.h"
 #include "vbios.h"
@@ -35,6 +36,12 @@ typedef struct {
   tinynv_bootmem_t booter_image;
   uint32_t booter_code_off, booter_code_sz, booter_data_off, booter_data_sz;
 } tinynv_flcn_t;
+
+// Driving a falcon, which GSP-RM's register sequencer asks the driver to do on its behalf (gsp.c run_cpu_seq).
+int tinynv_flcn_reset(tinynv_gpu_t *g, uint64_t base, int riscv);
+void tinynv_flcn_disable_ctx_req(tinynv_dev_t *d, uint64_t base);
+void tinynv_flcn_start_cpu(tinynv_dev_t *d, uint64_t base);
+int tinynv_flcn_wait_cpu_halted(tinynv_dev_t *d, uint64_t base);
 
 int tinynv_flcn_init_sw(tinynv_gpu_t *g); // place the boot image and its arguments. no hardware.
 int tinynv_flcn_init_hw(tinynv_gpu_t *g); // send the chain of trust message and wait for the falcon to be released.
