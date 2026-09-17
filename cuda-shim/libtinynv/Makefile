@@ -53,7 +53,7 @@ always:
 $(BUILD)/src/build_id.o: always
 
 UNAME := $(shell uname -s)
-SRCS  := src/err.c src/build_id.c src/qmd.c src/image.c src/arena.c src/exec.c src/cubin.c src/sha256.c src/fw.c src/dev.c src/mmu.c src/tlsf.c src/pt.c src/gpu.c src/gsp.c src/flcn.c src/submit.c \
+SRCS  := src/err.c src/build_id.c src/qmd.c src/image.c src/arena.c src/exec.c src/cubin.c src/sha256.c src/fw.c src/dev.c src/mmu.c src/tlsf.c src/pt.c src/gpu.c src/gsp.c src/flcn.c src/vbios.c src/submit.c \
          src/tinynv.c src/pci_replay.c src/pci_tinygpu.c
 ifeq ($(UNAME),Linux)
 SRCS  += src/pci_sysfs.c

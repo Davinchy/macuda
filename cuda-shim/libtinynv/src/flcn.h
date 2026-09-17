@@ -2,18 +2,22 @@
 //
 // Nothing on this chip executes unsigned code. A separate security processor, the FSP, holds the root of trust; the
 // driver hands it a message naming the boot image, its hash, its signature and the public key that signs it, and the FSP
-// verifies the chain and releases the GSP falcon from lockdown. Ampere does this differently, out of the VBIOS, which is
-// why this file is only the Blackwell path.
+// verifies the chain and releases the GSP falcon from lockdown.
+//
+// Ampere has no such processor. The image it runs to place the write-protected region is already on the card, inside the
+// VBIOS, and the driver runs it on the GSP falcon itself; only then can booter_load, on SEC2, unpack GSP-RM. Both paths
+// live here, because both end in the same place - a GSP falcon out of lockdown with our firmware in it - and the falcon
+// itself is driven identically either way.
 #ifndef TINYNV_FLCN_H
 #define TINYNV_FLCN_H
 #include "fw.h"
 #include "mmu.h"
-
-typedef struct tinynv_gpu tinynv_gpu_t;
+#include "vbios.h"
 
 typedef struct {
   tinynv_gpu_t *gpu;
   uint64_t falcon; // the register base of the GSP falcon
+  uint64_t sec2;   // and of SEC2, the second falcon, which is where booter_load runs on the vbios path
 
   tinynv_bootmem_t boot_args; // what the boot firmware is told when it starts
   uint64_t boot_args_sysmem;
@@ -23,6 +27,13 @@ typedef struct {
   uint64_t fmc_sysmem;
   const uint8_t *hash, *sig, *pkey; // the authentication material, pointing into fmc_fw
   size_t hash_len, sig_len, pkey_len;
+
+  // the vbios path: FWSEC out of the card's own rom, then booter_load over SEC2
+  tinynv_fwsec_t fwsec;
+  uint64_t frts_offset;         // where fwsec is asked to place the write-protected region
+  tinynv_blob_t booter_fw;
+  tinynv_bootmem_t booter_image;
+  uint32_t booter_code_off, booter_code_sz, booter_data_off, booter_data_sz;
 } tinynv_flcn_t;
 
 int tinynv_flcn_init_sw(tinynv_gpu_t *g); // place the boot image and its arguments. no hardware.
