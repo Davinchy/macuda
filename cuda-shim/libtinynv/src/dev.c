@@ -81,7 +81,13 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
 
   // a GPU whose write-protected region is still up has a live firmware on it from a previous run: reset it, but stop it
   // mastering the bus first, or it keeps writing into host memory that is about to be unmapped underneath it
-  d->wpr2_was_up = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI) != 0;
+  // ALL ONES IS NOT A FIRMWARE. This read is the first thing the driver does, and if the memory window is not decoding
+  // it answers 0xffffffff - which is non-zero, so it used to read as "a firmware is resident", which asked for a reset,
+  // which clears the window again. A loop that sustains itself: every open after the first one reset a healthy card and
+  // then found it unreadable, and the only thing that ever broke it was a physical replug, because re-enumeration is
+  // what reprograms the command register. Cost most of a day on a 3060 and was blamed on the enclosure's power supply.
+  uint32_t wpr2 = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+  d->wpr2_was_up = wpr2 != 0 && wpr2 != 0xffffffff;
   if (d->wpr2_was_up) {
     uint32_t cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
     cfg_write_flush(d, PCI_COMMAND, cmd & ~PCI_COMMAND_MASTER, 2);
@@ -89,14 +95,27 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
     sleep_ms(100); // the function is not answering until it has come out of reset
   }
 
-  // only bus mastering: whether the memory window is decoding is the backend's business, settled when it opened the
-  // device, and writing more than the oracle does would diverge on a board that comes up with it off
+  // Bus mastering AND the memory window. The window was the backend's business, settled when it opened the device - but
+  // the reset above happens after that, and a reset clears the command register outright. So on the one path where this
+  // matters nobody was restoring it, and the driver went on to read a card whose window was off.
+  //
+  // This cannot diverge from the recording, which is why it is safe to widen: the recorded boot reads 0x7 here and
+  // writes 0x7, and 0x7 with these two bits set is still 0x7. It only does anything on a register the oracle never saw,
+  // because the oracle never opened a card it had just reset.
   uint32_t cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
-  cfg_write_flush(d, PCI_COMMAND, cmd | PCI_COMMAND_MASTER, 2);
+  cfg_write_flush(d, PCI_COMMAND, cmd | PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY, 2);
 
+  // Two impossible answers, not one. All ones is a window that is not decoding or a card that has gone; ZERO is a chip
+  // that is present and not answering - halted, still in reset, or not yet back from having been put down at the end of
+  // a previous run. Only the first was checked, so the second fell through to the architecture table and came out as
+  // "architecture 0 is not one this driver knows", which reads like an unsupported GPU and sent a day's debugging after
+  // the wrong thing. A real NV_PMC_BOOT_0 is never either value.
   d->chip_id = tinynv_rd32(d, NV_PMC_BOOT_0);
   if (d->chip_id == 0xffffffff)
     return tinynv_fail("the gpu reads all ones: it has fallen off the bus, or its memory window is not enabled");
+  if (d->chip_id == 0)
+    return tinynv_fail("the gpu reads zero: it is on the bus but not answering - halted, in reset, or not yet back from "
+                       "being put down. A replug re-enumerates it; tools/nv_quiesce.sh does not wake it.");
 
   uint32_t boot42 = tinynv_rd32(d, NV_PMC_BOOT_42);
   d->architecture = NV_GET(boot42, NV_PMC_BOOT_42, ARCHITECTURE);

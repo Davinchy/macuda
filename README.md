@@ -5,7 +5,7 @@ eGPU enclosure on **macOS**, correct and fast, with no NVIDIA driver on the Mac.
 
 ```
 llama.cpp + ggml-cuda        host code compiled on the Mac by clang (--cuda-host-only); device .cu compiled to sm_120a
-        │                    cubins by nvcc on a Linux box, embedded in the host objects (cuda-shim/build/tinycc)
+        │                    cubins by nvcc in a container on this Mac, embedded in the host objects (cuda-shim/build/tinycc)
   libtinycudart.a            the cudart ABI ggml-cuda links against: fatbin/module loading, kernel launch, memcpy, streams, events
   libtinycublas.a            the cuBLAS entry points ggml uses, on one tensor-core GEMM cubin (f16 wmma / TF32, strided-batched)
   libtinynv.a                a C userspace NVIDIA driver: GSP-RM boot (firmware 570.144), RM object model over RPC, MMU v3 page
@@ -37,15 +37,25 @@ load; MoE numbers move more (see `docs/03-cuda-shim-plan.md` and the log excerpt
 
 ## What you need
 
-**Hardware.** An Apple Silicon Mac (built and measured on an M4 Max, macOS 27.0) and an RTX 5090 in a Thunderbolt enclosure. The
-card is fragile over Thunderbolt: a wedged GSP or a latched DART fault needs a physical replug, and nothing here can do that for you.
-Read `tools/preflight.sh` and the protocol in §Run before touching it.
+**Hardware.** An Apple Silicon Mac (measured on an M4 Max and an M3 Max, macOS 27.0) and an NVIDIA card in a Thunderbolt
+enclosure. Two are validated: an **RTX 5090** (GB202, sm_120) and an **RTX 3060** (GA106, sm_86) — see §Two architectures.
+The card is fragile over Thunderbolt: a wedged GSP or a latched DART fault needs a physical replug, and nothing here can do
+that for you. Read `tools/preflight.sh` and the protocol in §Run before touching it.
+
+**Give the enclosure its own power.** An underpowered one drops the card off the bus mid-run, and the symptom is not a
+message about power: every register and every page-table entry reads all ones, which surfaces as allocations refused for
+addresses that are free, or as a device reporting the wrong compute capability. A 3060 in an enclosure on a marginal
+supply did both, twice, while idle. If numbers stop making sense, check this before reading any code.
 
 **On the Mac.**
 - Xcode / Command Line Tools (the build picks a macOS SDK by *linking a one-line program* — `cuda-shim/build/sdk.sh` — because SDK
   paths moved under the tree more than once), CMake, `python3`.
 - Homebrew LLVM at `/opt/homebrew/opt/llvm` (`brew install llvm`): its clang does the CUDA host-only compile and its `libLLVMDemangle`
   is linked into the runtime.
+- **Docker**, and that is the whole of the device-side toolchain. `nvcc` needs no GPU to emit a cubin and NVIDIA publishes a
+  native arm64 CUDA image, so the device compile and the CUDA headers both come from a container on this Mac. **No second
+  machine is required.** It is also faster than shipping source to one: 188 ggml-cuda translation units for `sm_86` in 188
+  seconds. Setting `TINYCC_HOST` still selects the original ssh path to a Linux box if you would rather use one.
 - **TinyGPU.app and its DriverKit dext** (`org.tinygrad.tinygpu.driver2`): tinygrad's signed release,
   `https://github.com/tinygrad/tinygpu_releases/raw/c0d024f9ff0e1dc8fdf217f255da7101d91e8323/TinyGPU.zip`, unzipped to `/Applications`,
   then `/Applications/TinyGPU.app/Contents/MacOS/TinyGPU install` (approve the system extension). `tools/tinygpu-server.sh` starts and
@@ -54,36 +64,43 @@ Read `tools/preflight.sh` and the protocol in §Run before touching it.
   driver was developed against — see `env.sh` for which tool needs which) in `tinygrad/` and `tinygrad-stable/`, with a Python 3.12
   venv in `venv/` that has tinygrad installed editable.
 
-**A Linux box with CUDA 13 (`nvcc`) reachable over ssh**, for the device side of every CUDA compile (ggml-cuda's ~190 translation
-units, and the shim's own three kernels). Nothing NVIDIA runs on the Mac; the cubins are your own build output. Set `TINYCC_HOST`
-(and `TINYCC_KEY` if needed) before any step that compiles device code. A prebuilt `libggml-cuda.a` for the pinned llama.cpp commit is
-enough to link and run without that box (see §Build).
+**Nothing NVIDIA runs on the Mac, and the cubins are your own build output** — `nvcc` only ever compiles here, in a
+container, and never sees the card. `TINYCC_HOST` (with `TINYCC_KEY` if it needs an identity file) points the device
+compile at a Linux box over ssh instead, which is how this was originally built, but it is no longer needed for anything.
 
 **Fetched by `setup.sh deps`, not in the repository:** NVIDIA's `open-gpu-kernel-modules` headers at commit `81fe4fb` (release
 570.86.16, the one that added the RTX 5090; the build asserts the driver's structure sizes against them), the three signed GSP
-firmware images for 570.144 from linux-firmware (hash-pinned), and the CUDA Toolkit headers (copied from the nvcc box's
-`/usr/local/cuda/include`). The header/firmware skew (570.86.16 / 570.144) is deliberate and proven by booting the card with it.
+firmware images for 570.144 from linux-firmware (hash-pinned — five images, since Ampere boots from the VBIOS and needs
+`booter_load` and its own `bootloader` where Blackwell needs the FSP's `fmc`), and the CUDA Toolkit headers, taken out of
+the same container image that compiles the device code. The header/firmware skew (570.86.16 / 570.144) is deliberate and
+proven by booting the card with it.
 
 ## Build
 
 ```sh
-export TINYCC_HOST=user@linux-box            # the nvcc box (TINYCC_KEY=~/.ssh/... if it needs an identity file)
-sh setup.sh deps                            # NVIDIA headers + firmware (hash-checked) + CUDA headers
+export TINYCC_ARCH=sm_86                    # sm_86 for an Ampere card, sm_120a for Blackwell. Nothing else selects it.
+sh setup.sh deps                            # NVIDIA headers + firmware (hash-checked) + CUDA headers (from the container)
 sh setup.sh llama                           # llama.cpp at ad6c668 + upstream fix 2f53959, CPU-only static build in llama.cpp/build-null
 sh setup.sh sd                              # stable-diffusion.cpp at 59c23bc on llama.cpp's ggml (+ patches/), build-null
 sh setup.sh shim                            # libtinynv.a + libtinycudart.a + libtinycublas.a (no GPU; ~3 s)
 sh setup.sh link                            # the *-null binaries in cuda-shim/build/bin
 ```
 
-`setup.sh` is the whole sequence; each step is idempotent. `LLAMA_SRC=` / `SD_SRC=` copy from a local clone instead of GitHub.
+`setup.sh` is the whole sequence; each step is idempotent, and on a Mac with docker and Homebrew LLVM it needs nothing else.
+`LLAMA_SRC=` / `SD_SRC=` copy from a local clone instead of GitHub.
 
-**The ggml-cuda archive.** `cuda-shim/build/libggml-cuda.a` (plus `ggml-backend-reg.cuda.o`) is every ggml-cuda translation unit
-compiled for `sm_120a` with the shim's configuration (`-DGGML_CUDA_FORCE_MMQ -DGGML_CUDA_NO_VMM`, CUDA graphs compiled out) through
-`cuda-shim/build/tinycc`: device compile on the Linux box, host compile on the Mac, one Mach-O object each. It is a build output
-(gitignored) and it belongs to the pinned llama.cpp commit. To rebuild it, sync `llama.cpp/ggml` to `~/ggml` on the box
-(`rsync -a llama.cpp/ggml/ $TINYCC_HOST:ggml/`) and run `JOBS=8 sh cuda-shim/build/build-ggml-cuda.sh` (about an hour). The shim's
-own kernels (`libtinycudart/copy1d.cu`, `copy2d.cu`, `libtinycublas/gemm.cu`) ship as committed cubins with the `nvcc -arch=sm_120`
-line that built them in each source file.
+**The ggml-cuda archive.** `cuda-shim/build/libggml-cuda.<arch>.a` (plus `ggml-backend-reg.cuda.o`) is every ggml-cuda
+translation unit compiled for one architecture with the shim's configuration (`-DGGML_CUDA_FORCE_MMQ -DGGML_CUDA_NO_VMM`, CUDA
+graphs compiled out) through `cuda-shim/build/tinycc`: device compile in the container, host compile on the Mac, one Mach-O
+object each. It is a build output (gitignored) and it belongs to the pinned llama.cpp commit.
+
+    ARCH=sm_86 JOBS=8 sh cuda-shim/build/build-ggml-cuda.sh      # 188 translation units, about 3 minutes
+
+**There is one archive per architecture** and the plain `libggml-cuda.a` is a symlink to whichever the tree currently links
+against, so `ls -l` answers which one that is and a build for a second card cannot destroy the first card's. The shim's own
+kernels (`libtinycudart/copy1d.cu`, `copy2d.cu`, `libtinycublas/gemm.cu`) are committed as `<name>.sm_86.cubin` and
+`<name>.sm_120.cubin` with the `nvcc` line that built them in each source file, and the same symlink convention. `gemm.cu`
+needs no change between the two: its `wmma` m16n16k16 f16 and m16n16k8 TF32 fragments are valid on both.
 
 **How the binaries are made.** llama.cpp is built once as a plain CPU-only *static* tree (`build-null`; no Metal, no CUDA). `build/link-null.sh`
 replays the exact link line CMake generated for a target and inserts, ahead of `libggml.a`: the backend registry object compiled with

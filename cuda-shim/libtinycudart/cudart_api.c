@@ -63,12 +63,35 @@ static int optin_smem_for(int cc_major, int cc_minor) {
   return 48 * 1024;
 }
 static tinynv_device_props_t props(void) {
-  tinynv_device_props_t p; memset(&p, 0, sizeof p); tinynv_device_props(tinycudart_device(), &p);
-  static int announced;
+  tinynv_device_props_t p; memset(&p, 0, sizeof p);
+  tinynv_status_t rc = tinynv_device_props(tinycudart_device(), &p);
+  static int announced, complained;
   const char *env = getenv("TINYCUDART_NULL_PROFILE");
+
+  // THE RETURN VALUE IS THE WHOLE POINT, and this used to throw it away. Two different things leave cc_major at zero
+  // and only one of them may be answered with a made-up card:
+  //
+  //   the null device      answers TINYNV_OK, names itself "tinynv-null (no gpu)", and leaves cc_major 0 as its marker.
+  //                        Presenting a 5090 there is deliberate: there is no card, nothing executes, and ggml should
+  //                        dispatch the way it will on the target.
+  //   a real card that     answers TINYNV_ERR_DRIVER with an empty name. There IS a card. Describing it as a 32 GB
+  //   could not be read    5090 told stable-diffusion.cpp's auto-fit planner it had thirty-two gigabytes to plan
+  //                        against on a twelve gigabyte 3060; it committed six gigabytes of weights accordingly and
+  //                        died on a 221 MiB allocation, with the only clue an empty device name in a log line. A
+  //                        plausible wrong answer is worse than an obvious missing one.
+  if (rc != TINYNV_OK) {
+    if (!complained++)
+      fprintf(stderr, "[tinycudart] the driver could not describe the device: %s\n"
+                      "[tinycudart] NOT substituting a profile - there is a real card here and guessing its size is how "
+                      "a caller comes to plan against memory that does not exist\n", tinynv_last_error());
+    return p;
+  }
+
   if (p.cc_major == 0 && !(env && *env == '0')) {
     if (!announced++) fprintf(stderr, "[tinycudart] %s: presenting the RTX 5090 profile (sm_120, 170 SMs, 32 GB) so ggml dispatches as it will on the target\n", p.name);
-    p.cc_major = 12; p.cc_minor = 0; p.sm_count = 170; p.total_mem = 32607ull << 20; p.warp_size = 32;
+    p.cc_major = 12; p.cc_minor = 0; p.sm_count = 170; p.warp_size = 32;
+    // only where the driver had nothing to say: a size it DID report is the card's own and outranks this table
+    if (!p.total_mem) p.total_mem = 32607ull << 20;
     p.max_threads_per_block = 1024; p.max_shared_per_block = 48 * 1024; p.max_shared_per_sm = 100 * 1024;  // consumer Blackwell, measured
   }
   return p;
