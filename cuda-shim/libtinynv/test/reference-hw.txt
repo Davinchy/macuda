@@ -1,4 +1,4 @@
-# from /Volumes/512SSD/EGPU_MAC_Nvidia/traces/5090-launch2-launch.json: descriptors and command buffers a 5090 was handed, captured in the driver
+# from /Volumes/Thunder-4/EGPU_MAC_Nvidia/traces/5090-launch2-launch.json: descriptors and command buffers a 5090 was handed, captured in the driver
 # tinygrad 0ff2c9299, sm_120 sm_version 0xa04, 6 launches, 9 command buffers
 device slm_per_thread=576 sass_version=164 shared_window=0x729400000000 local_window=0x729300000000 num_gpcs=12 num_tpc_per_gpc=8 num_sm_per_tpc=2 max_warps_per_sm=48
 launch=0 regs=12 shmem=1024 slm_per_thread=576 prog_size=256 const0_size=912 grid=1,1,1 block=3,1,1 releases=ts chain=0 cbuf0_dwords=224 qmd_slot=512
