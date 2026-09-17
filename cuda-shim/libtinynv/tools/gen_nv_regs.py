@@ -8,7 +8,7 @@ same definitions, so a divergence under replay is a logic difference and never a
     python tools/gen_nv_regs.py cuda-shim/libtinynv/src/nv_regs.h
 """
 from __future__ import annotations
-import sys, pathlib
+import re, sys, pathlib
 
 # (module, architecture, register) for everything the driver touches. Add to this as the port grows; the generator
 # fails loudly if a name is not in the upstream tables rather than emitting something plausible.
@@ -274,9 +274,108 @@ def main(out_path: str):
     lines.append("")
     return len(qmd_plain) + len(qmd_indexed) * QMD_INDEXED_MAX, len(qmd_values)
 
+  # The descriptor fields the DRIVER uses, paired across the two architectures so qmd.c can index them by version
+  # rather than naming forty v3 macros by hand. The correspondence is derived here, where both field sets are in scope,
+  # and every rule below is applied to a name that has no exact counterpart:
+  #
+  #   stem_SHIFTED<n> -> stem            the value is pre-divided on one architecture and whole on the other
+  #
+  # POSITIONS ONLY. The shift a field wants is deliberately NOT emitted, because a field's name is not reliable about
+  # it: CONSTANT_BUFFER_SIZE_SHIFTED4 is named for a shift the oracle does not give it - it writes the size in bytes -
+  # and qmd.c says so where it writes that field. A machine-derived shift would have quietly divided it by sixteen. The
+  # shifts stay at the call sites, where they can be checked against the reference descriptors that the oracle itself
+  # generates, which is the only witness that has ever been right about this.
+  #   GRID_*          -> CTA_RASTER_*    the same three numbers under a different name
+  #   RELEASE_SEMAPHORE<i>_ADDR_*    -> RELEASE<i>_ADDRESS_*
+  #   RELEASE_SEMAPHORE<i>_PAYLOAD_* -> RELEASE<i>_PAYLOAD_*
+  #   RELEASE_STRUCTURE_SIZE_<i>     -> RELEASE<i>_STRUCTURE_SIZE
+  #   REGISTER_COUNT                 -> REGISTER_COUNT_V
+  #
+  # A field with no counterpart under any rule stops the generator. One that genuinely does not exist on the other
+  # architecture is listed in QMD_V5_ONLY, so it is declared absent rather than silently missing.
+  QMD_V5_ONLY = {"QMD_TYPE"}   # v3 has no descriptor-type field at all
+
+  def v3_name(n, f3):
+    if n in f3: return n, 0, 0
+    m = re.match(r"^(.*)_SHIFTED(\d+)$", n)
+    if m and m.group(1) in f3: return m.group(1), int(m.group(2)), 0
+    if m and m.group(1) + "_SHIFTED" + m.group(2) in f3: return n, 0, 0
+    if n.startswith("GRID_") and (c := "CTA_RASTER_" + n[5:]) in f3: return c, 0, 0
+    m = re.match(r"^RELEASE_SEMAPHORE(\d)_(ADDR|PAYLOAD)_(LOWER|UPPER)$", n)
+    if m:
+      c = f"RELEASE{m.group(1)}_{'ADDRESS' if m.group(2) == 'ADDR' else 'PAYLOAD'}_{m.group(3)}"
+      if c in f3: return c, 0, 0
+    m = re.match(r"^RELEASE_STRUCTURE_SIZE_(\d)$", n)
+    if m and (c := f"RELEASE{m.group(1)}_STRUCTURE_SIZE") in f3: return c, 0, 0
+    if n == "REGISTER_COUNT" and "REGISTER_COUNT_V" in f3: return "REGISTER_COUNT_V", 0, 0
+    if n in QMD_V5_ONLY: return None, 0, 1
+    raise SystemExit(f"no v3 counterpart for descriptor field {n}: add a rule or list it in QMD_V5_ONLY")
+
+  def emit_pairs(p5, p3, names):
+    def table(prefix, max_i):
+      out = {}
+      for n, v in vars(nv_gpu).items():
+        if not n.startswith(prefix): continue
+        k = n[len(prefix):]
+        if isinstance(v, tuple): out[k] = v
+        elif callable(v):
+          for i in range(max_i): out[f"{k}_{i}"] = v(i)
+      return out
+    t5, t3 = table(p5, QMD_INDEXED_MAX), table(p3, QMD_INDEXED_MAX)
+    lines.append("// The fields qmd.c uses, paired {v5, v3} so one table can be indexed by descriptor version. POSITIONS")
+    lines.append("// only: see the note in the generator about why no shift is emitted. An absent v3 half is spelled")
+    lines.append("// {0,0} and flagged by _V3_ABSENT, so a writer skips it rather than writing bits 0..0 of the block.")
+    # A field that is one-per-constant-buffer comes out of the autogen as a callable and is expanded to eight names.
+    # Naming the base in the list above and expanding here keeps that list readable; the pairing rules then run on the
+    # base and the index is re-attached, so CONSTANT_BUFFER_ADDR_LOWER_SHIFTED6_3 pairs with CONSTANT_BUFFER_ADDR_LOWER_3.
+    expanded = []
+    for n in names:
+      if n in t5: expanded.append((n, n))
+      elif f"{n}_0" in t5: expanded += [(f"{n}_{i}", n) for i in range(QMD_INDEXED_MAX)]
+      else: raise SystemExit(f"{n} is not a v5 descriptor field, indexed or otherwise")
+
+    n_absent = 0
+    for n, base in sorted(expanded):
+      hi5, lo5 = t5[n]
+      idx = n[len(base):]                      # "" or "_<i>"
+      c, sh5, absent = v3_name(base, {k[:len(k) - len(idx)] if idx and k.endswith(idx) else k: v for k, v in t3.items()})
+      if c is not None: c += idx
+      if absent:
+        n_absent += 1
+        lines.append(f"#define TINYNV_QMD_BOTH_{n} {{{{{lo5},{hi5}}}, {{0,0}}}}")
+        lines.append(f"#define TINYNV_QMD_BOTH_{n}_V3_ABSENT 1")
+        continue
+      if c not in t3: raise SystemExit(f"paired {n} to {c}, which is not a v3 descriptor field")
+      hi3, lo3 = t3[c]
+      lines.append(f"// {n} <-> {c}")
+      lines.append(f"#define TINYNV_QMD_BOTH_{n} {{{{{lo5},{hi5}}}, {{{lo3},{hi3}}}}}")
+      lines.append(f"#define TINYNV_QMD_BOTH_{n}_V3_ABSENT 0")
+    lines.append("")
+    return len(expanded), n_absent
+
+  QMD_DRIVER_FIELDS = [
+    "CONSTANT_BUFFER_ADDR_LOWER_SHIFTED6", "CONSTANT_BUFFER_ADDR_UPPER_SHIFTED6", "CONSTANT_BUFFER_SIZE_SHIFTED4",
+    "CONSTANT_BUFFER_VALID", "CONSTANT_BUFFER_INVALIDATE_0",
+    "RELEASE_STRUCTURE_SIZE_0", "RELEASE_STRUCTURE_SIZE_1", "RELEASE0_ENABLE", "RELEASE1_ENABLE",
+    "RELEASE_SEMAPHORE0_ADDR_LOWER", "RELEASE_SEMAPHORE0_ADDR_UPPER", "RELEASE_SEMAPHORE1_ADDR_LOWER",
+    "RELEASE_SEMAPHORE1_ADDR_UPPER", "RELEASE_SEMAPHORE0_PAYLOAD_LOWER", "RELEASE_SEMAPHORE0_PAYLOAD_UPPER",
+    "RELEASE_SEMAPHORE1_PAYLOAD_LOWER", "RELEASE_SEMAPHORE1_PAYLOAD_UPPER",
+    "PROGRAM_ADDRESS_LOWER_SHIFTED4", "PROGRAM_ADDRESS_UPPER_SHIFTED4",
+    "PROGRAM_PREFETCH_ADDR_LOWER_SHIFTED", "PROGRAM_PREFETCH_ADDR_UPPER_SHIFTED", "PROGRAM_PREFETCH_SIZE",
+    "GRID_WIDTH", "GRID_HEIGHT", "GRID_DEPTH",
+    "CTA_THREAD_DIMENSION0", "CTA_THREAD_DIMENSION1", "CTA_THREAD_DIMENSION2",
+    "QMD_MAJOR_VERSION", "QMD_TYPE", "QMD_GROUP_ID", "REGISTER_COUNT", "SASS_VERSION", "BARRIER_COUNT",
+    "SHARED_MEMORY_SIZE_SHIFTED7", "SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4",
+    "MIN_SM_CONFIG_SHARED_MEM_SIZE", "TARGET_SM_CONFIG_SHARED_MEM_SIZE", "MAX_SM_CONFIG_SHARED_MEM_SIZE",
+    "INVALIDATE_TEXTURE_HEADER_CACHE", "INVALIDATE_TEXTURE_SAMPLER_CACHE", "INVALIDATE_TEXTURE_DATA_CACHE",
+    "INVALIDATE_SHADER_DATA_CACHE", "API_VISIBLE_CALL_LIMIT", "SAMPLER_INDEX", "CWD_MEMBAR_TYPE",
+    "DEPENDENT_QMD0_POINTER", "DEPENDENT_QMD0_ACTION", "DEPENDENT_QMD0_PREFETCH", "DEPENDENT_QMD0_ENABLE",
+  ]
+
   nfields, nvalues = emit_qmd("NVCEC0_QMDV05_00_", 5, 0x60 * 4, "", "TINYNV_QMDV_")
   f3, v3 = emit_qmd("NVC6C0_QMDV03_00_", 3, 0x40 * 4, "V3_", "TINYNV_QMDV3_")
   nfields += f3; nvalues += v3
+  npairs, nabsent = emit_pairs("NVCEC0_QMDV05_00_", "NVC6C0_QMDV03_00_", QMD_DRIVER_FIELDS)
 
   # Upstream folds one register's fields into another's table here and there - NV_PGC6_AON_SECURE_SCRATCH_GROUP_05
   # carries the priv_level_mask fields as well as its own - so the same macro can be generated twice. C accepts an
@@ -301,7 +400,8 @@ def main(out_path: str):
   pathlib.Path(out_path).write_text(text)
   print(f"wrote {out_path}: {len(WANTED)} registers, {len(METHODS)} class methods and "
         f"{nfields} descriptor fields and {nvalues} values "
-        f"from open-gpu-kernel-modules {commit[:12]}")
+        f"from open-gpu-kernel-modules {commit[:12]}; {npairs} fields paired across both architectures, "
+        f"{nabsent} absent on v3")
 
 if __name__ == "__main__":
   main(sys.argv[1] if len(sys.argv) > 1 else "cuda-shim/libtinynv/src/nv_regs.h")
