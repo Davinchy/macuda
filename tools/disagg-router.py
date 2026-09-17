@@ -12,8 +12,8 @@ else is passed straight to Metal). Per request:
   2. the cold part is what Metal's slot does not already hold (the router is the slot's only client, so it tracks the
      prompt it last sent there). The card gets it when the operator's cap says so (--threshold: cold tokens at or above
      it ALWAYS go to the card, which keeps a Metal server off long prefills) or when the cost model predicts the card is
-     faster: Metal costs cold/metal_rate; the card costs a FIXED stream of every expert across the link (~5.7 s here,
-     paid whatever the prompt length) plus cold/card_rate plus the handoff. Fitted from two measured points, break-even
+     faster: Metal costs cold/metal_rate; the card costs a stream of every expert across the link (~5.7 s here) ONCE PER
+     UBATCH - ggml copies the host-resident experts for every ubatch it evaluates - plus cold/card_rate plus the handoff. Fitted from two measured points, break-even
      ~5,300 cold tokens for Qwen3-Coder-Next on this Mac; --selftest prints the curve. The constants are only defaults:
      the router refits them from what it observes (Metal's prefill rate from its timings, the card's fixed cost and
      rate from a rolling fit of its prefills, the handoff from save+restore), --no-learn freezes them. No card: Metal;
@@ -113,16 +113,26 @@ def card_prefill(ids):
     if t.get("prompt_n") and t.get("prompt_ms"): observe_card(int(t["prompt_n"]), t["prompt_ms"] / 1000.0, (t2 - t1) + (t3 - t2))
 
 
+def ubatches(cold):
+    """How many ubatches the card needs for `cold` tokens. The expert stream is paid ONCE PER UBATCH, not once per
+    prompt: ggml's scheduler copies each layer's host-resident experts to the card for every ubatch it evaluates."""
+    return max(1, -(-cold // ARGS.card_ubatch))
+
+
 def fit_line(obs):
-    """Least squares seconds = a + b*tokens over (tokens, seconds) pairs; None unless >= 2 points spanning >= 1000 tokens
-    with a positive slope. Returns (fixed_seconds, tokens_per_second)."""
+    """Least squares over (tokens, seconds): seconds = fixed*ubatches(tokens) + tokens/rate, no intercept beyond the
+    per-ubatch fixed cost. Returns (fixed_seconds, tokens_per_second), or None when the observations cannot support a
+    fit: fewer than two, spanning under 1000 tokens, a singular design, or a non-positive fixed cost or rate."""
     if len(obs) < 2 or max(n for n, _ in obs) - min(n for n, _ in obs) < 1000: return None
-    k = len(obs); sx = sum(n for n, _ in obs); sy = sum(t for _, t in obs)
-    sxx = sum(n * n for n, _ in obs); sxy = sum(n * t for n, t in obs)
-    den = k * sxx - sx * sx
+    suu = sun = snn = sut = snt = 0.0
+    for n, t in obs:
+        u = ubatches(n)
+        suu += u * u; sun += u * n; snn += n * n; sut += u * t; snt += n * t
+    den = suu * snn - sun * sun
     if den <= 0: return None
-    b = (k * sxy - sx * sy) / den; a = (sy - b * sx) / k
-    if b <= 0 or a < 0: return None
+    a = (sut * snn - snt * sun) / den      # seconds per ubatch (the expert stream)
+    b = (suu * snt - sun * sut) / den      # seconds per token (1/rate)
+    if a <= 0 or b <= 0: return None
     return a, 1.0 / b
 
 
@@ -150,9 +160,11 @@ def observe_metal(tokens, seconds):
 
 
 def predict(cold):
-    """Seconds of prompt work for `cold` uncached tokens: on Metal, and on the card including the handoff."""
+    """Seconds of prompt work for `cold` uncached tokens: on Metal, and on the card including the handoff. The card's
+    expert stream is charged PER UBATCH, so a prompt past the ubatch pays it again - the single-ubatch form
+    under-predicted a 62,000-token prompt by 11 s (found while preparing that run, 2026-09-17)."""
     metal = cold / ARGS.metal_rate
-    card = ARGS.card_fixed + cold / ARGS.card_rate + cold * ARGS.handoff_per_token
+    card = ubatches(cold) * ARGS.card_fixed + cold / ARGS.card_rate + cold * ARGS.handoff_per_token
     return metal, card
 
 
@@ -179,16 +191,19 @@ def selftest():
         mid = (lo + hi) // 2; m, c = predict(mid)
         if c < m: hi = mid
         else: lo = mid
-    print(f"cost model: metal {ARGS.metal_rate:.0f} tok/s; card fixed {ARGS.card_fixed:.1f} s + {ARGS.card_rate:.0f} tok/s + handoff {ARGS.handoff_per_token*1e6:.0f} us/token; break-even {hi} cold tokens")
+    print(f"cost model: metal {ARGS.metal_rate:.0f} tok/s; card {ARGS.card_fixed:.1f} s per ubatch of {ARGS.card_ubatch} + {ARGS.card_rate:.0f} tok/s + handoff {ARGS.handoff_per_token*1e6:.0f} us/token; break-even {hi} cold tokens")
     ok = True
     for cold in (512, 2000, 5000, 8000, 24000, 64000):
         m, c = predict(cold); want, why = decide(cold, cold + 1, lambda: True)
-        print(f"   {cold:>6} cold: metal {m:6.1f} s  card {c:6.1f} s  -> {want}")
+        print(f"   {cold:>6} cold: metal {m:6.1f} s  card {c:6.1f} s ({ubatches(cold)} ubatch{'es' if ubatches(cold) > 1 else ''})  -> {want}")
         ok &= (want == "card") == (c < m or (ARGS.threshold and cold >= ARGS.threshold))
     ok &= decide(24000, 24001, lambda: False)[0] == "metal"          # a card that is down never wins
     ok &= decide(0, 5000, lambda: True)[0] == "metal"                # nothing cold: nothing to route
     fit = fit_line([(6974, 8.5), (23691, 15.3)])                      # the two measured points give back the defaults
     ok &= fit is not None and abs(fit[0] - 5.66) < 0.05 and abs(fit[1] - 2458) < 5
+    ok &= ubatches(24576) == 1 and ubatches(24577) == 2 and ubatches(62031) == 3      # the stream is per ubatch
+    m3, c3 = predict(62031)                                           # and a 3-ubatch prompt pays it three times
+    ok &= abs(c3 - (3 * ARGS.card_fixed + 62031 / ARGS.card_rate + 62031 * ARGS.handoff_per_token)) < 0.01
     ok &= fit_line([(6974, 8.5)]) is None and fit_line([(1000, 5.0), (1500, 5.2)]) is None   # too few, too narrow
     ok &= fit_line([(1000, 9.0), (9000, 5.0)]) is None                # a negative slope is not a rate
     print(f"fit of the two measured points: fixed {fit[0]:.2f} s, {fit[1]:.0f} tok/s" if fit else "fit: FAILED")
@@ -266,6 +281,7 @@ def main():
     ap.add_argument("--metal-rate", type=float, default=660.0, help="Metal prefill tok/s for this model (measured 664 on the M4 Max, Qwen3-Coder-Next)")
     ap.add_argument("--card-rate", type=float, default=2460.0, help="card marginal prefill tok/s (fit of 23,691 tok/15.3 s and 6,974 tok/8.5 s)")
     ap.add_argument("--card-fixed", type=float, default=5.7, help="card fixed seconds per prompt: the expert stream across the link (same fit)")
+    ap.add_argument("--card-ubatch", type=int, default=24576, help="the card server's -ub: the expert stream is paid once per ubatch, so this shapes the prediction for prompts past it")
     ap.add_argument("--handoff-per-token", type=float, default=3e-5, help="seconds per token to save and restore the state (662 MB / 23,691 tok in 0.8 s)")
     ap.add_argument("--no-learn", dest="learn", action="store_false", help="freeze the cost model: do not refit it from observed prefills")
     ap.add_argument("--selftest", action="store_true")
