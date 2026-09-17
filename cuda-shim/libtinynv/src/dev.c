@@ -41,6 +41,22 @@ int tinynv_wait_reg(tinynv_dev_t *d, uint64_t off, uint32_t mask, uint32_t want,
                      what, (unsigned long long)off, v, want, mask, timeout_ms);
 }
 
+// Ampere's power-on firmware signals it has finished through the always-on scratch group rather than the thermal one,
+// and it takes TWO reads: the privilege mask on the group has to have dropped to level 0, and then the scratch's own low
+// byte has to read 0xff. The ORDER is not incidental. The oracle tests the mask first and reads the scratch only once
+// that has passed, so a recording taken from it contains no scratch read before the mask has dropped, and a driver that
+// read them the other way round would diverge on the first poll of a replay while being perfectly correct on hardware.
+static int wait_gfw_ampere(tinynv_dev_t *d, int timeout_ms) {
+  double deadline = tinynv_now_s() + timeout_ms / 1000.0;
+  uint32_t plm = 0, scratch = 0;
+  do {
+    plm = tinynv_rd32(d, NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK);
+    if (!NV_GET(plm, NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK, READ_PROTECTION_LEVEL0)) continue;
+    if (((scratch = tinynv_rd32(d, NV_PGC6_AON_SECURE_SCRATCH_GROUP_05(0))) & 0xff) == 0xff) return 0;
+  } while (tinynv_now_s() < deadline);
+  return tinynv_fail("the boot firmware did not finish in %d ms (privilege mask %#x, scratch %#x)", timeout_ms, plm, scratch);
+}
+
 static const char *arch_prefix(uint32_t arch) {
   switch (arch) {
     case 0x17: return "GA1";
@@ -96,10 +112,16 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   d->fmc_boot = d->architecture >= 0x1a;
   d->mmu_ver = d->fmc_boot ? 3 : 2;
 
-  // the firmware that runs at power-on signals it has finished; until then the chip is not ready to be driven
-  if (!d->fmc_boot) return tinynv_fail("%s boots its falcon from the vbios, which this driver does not implement", d->chip_name);
-  if (tinynv_wait_reg(d, NV_THERM_I2CS_SCRATCH, 0xffffffff, 0xff, 10000, "waiting for the boot firmware")) return -1;
-  return 0;
+  // The firmware that runs at power-on signals it has finished; until then the chip is not ready to be driven. Where it
+  // signals differs by architecture, which is the whole of the difference here.
+  //
+  // The refusal for an architecture whose falcon boot is not implemented used to be on this line. It is in flcn.c now,
+  // because that is where the gap is: identifying the chip and setting up its page tables are the same work whatever
+  // boots the falcon, so they should run for any chip this driver can name, and a replay should get as far as the thing
+  // that is actually missing rather than stopping three reads in.
+  if (d->fmc_boot)
+    return tinynv_wait_reg(d, NV_THERM_I2CS_SCRATCH, 0xffffffff, 0xff, 10000, "waiting for the boot firmware");
+  return wait_gfw_ampere(d, 10000);
 }
 
 int tinynv_dev_mmu_init(tinynv_dev_t *d) {

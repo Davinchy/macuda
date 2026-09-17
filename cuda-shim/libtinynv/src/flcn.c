@@ -22,6 +22,13 @@ static const char *FMC_SHA = "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd5
 
 int tinynv_flcn_init_sw(tinynv_gpu_t *g) {
   tinynv_flcn_t *f = &g->flcn;
+  // The Ampere path - FWSEC out of the card's own VBIOS to place the write-protected region, then booter_load over
+  // SEC2 to unpack GSP-RM - is not implemented in this file yet. Everything it needs is already here: the registers
+  // (nv_regs.h, dev_falcon_v4/ga102 and friends) and the signed images (third_party/firmware/nvidia/ga102). What is
+  // missing is the code, and this is the line a replay of an Ampere boot stops on.
+  if (!g->dev.fmc_boot)
+    return tinynv_fail("%s boots its falcon from the vbios (FWSEC/FRTS, then booter over SEC2), which is not implemented yet",
+                       g->dev.chip_name);
   f->gpu = g;
   f->falcon = 0x00110000;
 

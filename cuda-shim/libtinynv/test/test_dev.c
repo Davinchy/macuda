@@ -121,8 +121,12 @@ int main(int argc, char **argv) {
   // Skipping is opt-in and loud, because a green run that tested nothing is worse than a red one that says why. Session A
   // ran this binary from the wrong directory, got 12 operations and "all checks passed", and was one careless read away
   // from reporting the chain of trust as verified.
+  // Which image to probe for depends on how the chip boots, not on the driver's preferences: the chain-of-trust path
+  // needs the FMC the FSP verifies, and the vbios path needs booter_load, which SEC2 runs to unpack GSP-RM. Probing for
+  // the FMC on an Ampere card reported "firmware is missing" about a tree that had everything that card needs.
   tinynv_blob_t probe;
-  int have_fw = !rc && !tinynv_fw_load(g.dev.fw_name, "fmc-" TINYNV_FW_VER ".bin", NULL, &probe);
+  const char *first_image = g.dev.fmc_boot ? "fmc-" TINYNV_FW_VER ".bin" : "booter_load-" TINYNV_FW_VER ".bin";
+  int have_fw = !rc && !tinynv_fw_load(g.dev.fw_name, first_image, NULL, &probe);
   int allow_no_fw = getenv("TINYNV_ALLOW_NO_FIRMWARE") != NULL;
   if (have_fw) tinynv_fw_free(&probe);
   else if (!rc) {
