@@ -313,6 +313,12 @@ int tinynv_mm_page_tables(tinynv_mm_t *mm, uint64_t root, uint64_t vaddr, uint64
 // confusing - the driver was right that something was there and wrong about what.
 //
 // Walking per entry is not slow: an invalid entry high in the tree skips everything beneath it in one step.
+// What the collision actually was, filled in beside the address so a refusal names the entry rather than only the
+// address. "0x1000000000 is already mapped" is true and useless; which level, which index and what the entry holds is
+// the difference between reading this code and fixing it.
+static int clash_lv = -1, clash_idx = -1;
+static uint64_t clash_entry;
+
 static int range_is_mapped(tinynv_mm_t *mm, uint64_t root, uint64_t vaddr, uint64_t size, uint64_t *where) {
   tinynv_pt_walk_t look;
   tinynv_pt_walk_begin(&look, mm, root, vaddr, 0);
@@ -325,6 +331,9 @@ static int range_is_mapped(tinynv_mm_t *mm, uint64_t root, uint64_t vaddr, uint6
       uint64_t at = vaddr + run.off + (uint64_t)e * run.covers;
       if (tinynv_pt_is_page(mm, &run.pt, run.idx + e)) {
         if (where) *where = at;
+        uint64_t w[2] = {0, 0};
+        entry_read(mm, &run.pt, run.idx + e, w);
+        clash_lv = run.pt.lv; clash_idx = (int)(run.idx + e); clash_entry = w[0];
         return 1;
       }
       // Valid and not a page: a table an earlier mapping left behind. Whether this range is free depends on what is
@@ -378,8 +387,9 @@ int tinynv_mm_map_range(tinynv_mm_t *mm, uint64_t root, uint64_t vaddr, uint64_t
   int busy = range_is_mapped(mm, root, vaddr, size, &clash);
   if (busy < 0) return -1;
   if (busy)
-    return tinynv_fail("mapping %#llx+%#llx: %#llx is already mapped", (unsigned long long)vaddr,
-                       (unsigned long long)size, (unsigned long long)clash);
+    return tinynv_fail("mapping %#llx+%#llx: %#llx is already mapped by level %d entry %d = %#llx (of %d levels)",
+                       (unsigned long long)vaddr, (unsigned long long)size, (unsigned long long)clash,
+                       clash_lv, clash_idx, (unsigned long long)clash_entry, mm->levels);
   int rc;
   tinynv_pt_run_t run;
   uint64_t left, off;

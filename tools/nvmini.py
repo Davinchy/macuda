@@ -1,12 +1,26 @@
 # Minimal NV register access through the TinyGPU server, without booting anything. Mirrors NVDev._early_ip_init's includes.
-import time, socket, tinygrad.runtime.autogen.nv_regs
+import os, time, socket, tinygrad.runtime.autogen.nv_regs
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.support.system import APLRemotePCIDevice, System
 from tinygrad.runtime.support.nv.nvdev import NVReg
 
 class MiniNVDev:
   def __init__(self, timeout=20, map_bar0=True):
-    self.pd = APLRemotePCIDevice("NV", System.pci_scan_bus(0x10de, ((0xff00, (0x2b00,)),), 0x03)[0]); self.pd.sock.settimeout(timeout)
+    # ANY NVIDIA display device, not just the 5090 family. This scanned for 0x2b00 alone, so every recovery tool built
+    # on this class - nv_e3_flr.py, nv_temp.py, nv_e2_regs.py, nv_quiesce.sh - raised IndexError on a 3060 that was on
+    # the bus and needed resetting. The families are the ones PCIIface itself lists; EGPU_GPU_DEVID pins one.
+    # POINT AT THE RUNNING SERVER. Without APL_REMOTE_SOCK, tinygrad's APLRemotePCIDevice calls ensure_app(), which
+    # pkills the TinyGPU server, re-downloads the app and reinstalls it - because the check it makes is for its own
+    # downloaded zip, which a machine that installed the app by hand does not have. So every recovery tool built on this
+    # class killed the server it was about to talk through, on a card that was already wedged. A custom socket means a
+    # custom server, and ensure_app() is skipped entirely.
+    os.environ.setdefault("APL_REMOTE_SOCK", os.path.join(os.environ.get("TMPDIR", "/tmp"), "tinygpu.sock"))
+    fams = (0x2200, 0x2400, 0x2500, 0x2600, 0x2700, 0x2800, 0x2b00, 0x2c00, 0x2d00, 0x2f00)
+    want = os.environ.get("EGPU_GPU_DEVID", "")
+    if want: fams = (int(want, 16) & 0xff00,)
+    devs = System.pci_scan_bus(0x10de, ((0xff00, fams),), 0x03)
+    if not devs: raise RuntimeError("no NVIDIA display device on the PCI bus: nothing to open")
+    self.pd = APLRemotePCIDevice("NV", devs[0]); self.pd.sock.settimeout(timeout)
     self.mmio = self.pd.map_bar(0, fmt='I') if map_bar0 else None
     for name, arch in (("nv_ref", ""), ("dev_fb", "tu102"), ("dev_gc6_island", "ga102"), ("dev_therm", "gb202")): self.include(name, arch)
   def include(self, name, arch):
