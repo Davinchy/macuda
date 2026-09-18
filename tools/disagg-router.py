@@ -94,8 +94,36 @@ def common_prefix(a, b):
     return i
 
 
-def card_prefill(ids):
-    """Prefill ids[:-1] on the card, hand the state to Metal. Raises on any failure; the caller falls back."""
+def sync_metal_to_card():
+    """Push Metal's current slot state onto the card's slot, when the card has fallen behind: llama-server's slot
+    save/restore format is symmetric (same code compiled into both binaries, confirmed by reading
+    llama-kv-cache.cpp/llama-memory-hybrid.cpp 2026-09-18 - card->metal already relies on this working one way),
+    so after this the card recognizes the same shared prefix Metal does and only prefills the true delta, instead
+    of redoing the whole conversation (the 09-18 finding: a stale card redid 21,343 tokens for a 6,573-token ask)."""
+    name = "router-sync-" + hashlib.sha1(json.dumps(STATE["metal_tokens"]).encode()).hexdigest()[:16] + ".bin"
+    t0 = time.perf_counter()
+    s = post_json(ARGS.metal, f"/slots/{ARGS.slot}?action=save", {"filename": name}); t1 = time.perf_counter()
+    r = post_json(ARGS.card, f"/slots/{ARGS.slot}?action=restore", {"filename": name}); t2 = time.perf_counter()
+    if ARGS.state_dir:
+        try: os.unlink(os.path.join(ARGS.state_dir, name))
+        except OSError: pass
+    log(f"sync: metal->card {s.get('n_saved')} tok {s.get('n_written', 0)/1e6:.0f} MB, save {t1-t0:.1f} s, restore {t2-t1:.1f} s")
+    if r.get("n_restored") != s.get("n_saved"):
+        # a length check against the round trip itself, not against STATE["metal_tokens"]: Metal's real cache is
+        # usually LONGER than the prompt tokens the router tracked, because decoding a reply extends it too - found
+        # 2026-09-18 (2,943 saved for a 2,912-token tracked prompt, the 31-token gap being the last reply's own
+        # decode). That's normal, not a fault; only a save/restore round trip that doesn't preserve its own count is.
+        raise RuntimeError(f"card restore returned {r.get('n_restored')} tokens, save reported {s.get('n_saved')}")
+    STATE["card_tokens"] = list(STATE["metal_tokens"])   # the known prefix; any extra decoded tail on the card is
+    # untracked (its identity isn't known here) but harmless - cache_prompt matching on the next request will
+    # simply find the mismatch and stop at the same point this tracks
+
+
+def card_prefill(ids, sync_needed):
+    """Prefill ids[:-1] on the card, hand the state to Metal. Raises on any failure; the caller falls back.
+    sync_needed: the card's own cache is behind Metal's for this request - pull Metal's state onto the card
+    first, so the card's cache_prompt match below sees the same prefix Metal does."""
+    if sync_needed: sync_metal_to_card()
     head = ids[:-1]
     name = "router-" + hashlib.sha1(json.dumps(head).encode()).hexdigest()[:16] + ".bin"
     t0 = time.perf_counter()
@@ -171,35 +199,38 @@ def observe_metal(tokens, seconds):
     if abs(ARGS.metal_rate - old) > 0.05 * old: log(f"calibration: metal {ARGS.metal_rate:.0f} tok/s (observed {rate:.0f} over {tokens} tokens)")
 
 
-def predict(cold_metal, cold_card):
-    """Seconds of prompt work: Metal on its own cold count, the card on ITS OWN cold count including the handoff -
-    the two differ whenever the card was skipped on a recent turn, because the card's slot only recognizes a
-    prefix match against what IT last held, not against what Metal has cached. A card invocation after being
-    skipped must redo everything since the card's own last use, not just what's new since Metal's (found
-    2026-09-18: routing a 6,573-cold-token turn to the card after 6 metal-only turns actually cost a 21,343-token
-    prefill - the full conversation so far - not the 6,573 the naive shared-cold model predicted). The card's
-    expert stream is charged PER UBATCH, so a prompt past the ubatch pays it again - the single-ubatch form
-    under-predicted a 62,000-token prompt by 11 s (found while preparing that run, 2026-09-17)."""
+def predict(cold_metal, sync_tokens):
+    """Seconds of prompt work: Metal on its own cold count; the card on cold_metal too, PLUS a one-time sync tax
+    when its slot has fallen behind Metal's (sync_tokens > 0). Before 2026-09-18 the card's own cold count was
+    used instead of cold_metal, and a stale card had to redo everything since ITS own last use - found the hard
+    way (a 6,573-cold-token turn, after 6 metal-only turns, actually cost a 21,343-token prefill: the whole
+    conversation). Fixed by syncing Metal's slot state onto the card first (`sync_metal_to_card()`; the format is
+    symmetric, confirmed by reading llama-kv-cache.cpp/llama-memory-hybrid.cpp) - now the card only ever prefills
+    the true cold_metal delta, at the cost of transferring sync_tokens once (charged at the same per-token handoff
+    rate as the existing card->metal handoff, since it's the same kind of state transfer, just the other way).
+    The card's expert stream is charged PER UBATCH, so a prompt past the ubatch pays it again - the single-ubatch
+    form under-predicted a 62,000-token prompt by 11 s (found while preparing that run, 2026-09-17)."""
     metal = cold_metal / ARGS.metal_rate
-    card = ubatches(cold_card) * ARGS.card_fixed + cold_card / ARGS.card_rate + cold_card * ARGS.handoff_per_token
+    card = ubatches(cold_metal) * ARGS.card_fixed + cold_metal / ARGS.card_rate + cold_metal * ARGS.handoff_per_token
+    card += sync_tokens * ARGS.handoff_per_token
     return metal, card
 
 
-def decide(cold_metal, cold_card, n_total, card_up):
+def decide(cold_metal, sync_tokens, n_total, card_up):
     """Where the cold part of a prompt goes. cold_metal is what's new since Metal's own cache (what Metal would have
-    to prefill); cold_card is what's new since the CARD's own cache (what the card would have to prefill if chosen -
-    often larger, if the card was skipped on recent turns). The operator's cap wins on cold_metal (cold_metal >=
-    --threshold always goes to the card, so a Metal server can be kept off long prefills); otherwise the cost model
-    picks the faster side using each side's own real cost. card_up is a callable, consulted only when the card
-    would be chosen: a health probe is a round trip."""
+    to prefill, and - since 2026-09-18 - what the card would ALSO end up prefilling, once synced). sync_tokens is
+    the one-time cost of catching the card's slot up to Metal's before it can do that (0 if the card is already in
+    sync). The operator's cap wins on cold_metal (cold_metal >= --threshold always goes to the card, so a Metal
+    server can be kept off long prefills); otherwise the cost model picks the faster side using each side's own
+    real cost. card_up is a callable, consulted only when the card would be chosen: a health probe is a round trip."""
     if n_total <= 1 or cold_metal <= 0: return "metal", "nothing cold" if cold_metal <= 0 else "one token"
-    m, c = predict(cold_metal, cold_card)
+    m, c = predict(cold_metal, sync_tokens)
     if ARGS.threshold and cold_metal >= ARGS.threshold:
-        want, why = "card", f"cold {cold_metal} >= cap {ARGS.threshold}; predicted card {c:.1f} s ({cold_card} tok), metal {m:.1f} s"
+        want, why = "card", f"cold {cold_metal} >= cap {ARGS.threshold}; predicted card {c:.1f} s (sync {sync_tokens} tok), metal {m:.1f} s"
     elif ARGS.auto and c < m:
-        want, why = "card", f"predicted card {c:.1f} s ({cold_card} tok) < metal {m:.1f} s"
+        want, why = "card", f"predicted card {c:.1f} s (sync {sync_tokens} tok) < metal {m:.1f} s"
     else:
-        return "metal", f"predicted metal {m:.1f} s <= card {c:.1f} s ({cold_card} tok)" if ARGS.auto else "auto off, under the cap"
+        return "metal", f"predicted metal {m:.1f} s <= card {c:.1f} s (sync {sync_tokens} tok)" if ARGS.auto else "auto off, under the cap"
     if not card_up(): return "metal", why + "; card server not healthy"
     return want, why
 
@@ -208,30 +239,34 @@ def selftest():
     """The cost model at a few sizes, the break-even, and the two properties the rule must have."""
     lo, hi = 1, 200000
     while hi - lo > 1:
-        mid = (lo + hi) // 2; m, c = predict(mid, mid)
+        mid = (lo + hi) // 2; m, c = predict(mid, 0)
         if c < m: hi = mid
         else: lo = mid
-    print(f"cost model: metal {ARGS.metal_rate:.0f} tok/s; card {ARGS.card_fixed:.1f} s per ubatch of {ARGS.card_ubatch} + {ARGS.card_rate:.0f} tok/s + handoff {ARGS.handoff_per_token*1e6:.0f} us/token; break-even {hi} cold tokens")
+    print(f"cost model: metal {ARGS.metal_rate:.0f} tok/s; card {ARGS.card_fixed:.1f} s per ubatch of {ARGS.card_ubatch} + {ARGS.card_rate:.0f} tok/s + handoff {ARGS.handoff_per_token*1e6:.0f} us/token; break-even {hi} cold tokens (card already in sync)")
     ok = True
     for cold in (512, 2000, 5000, 8000, 24000, 64000):
-        m, c = predict(cold, cold); want, why = decide(cold, cold, cold + 1, lambda: True)
+        m, c = predict(cold, 0); want, why = decide(cold, 0, cold + 1, lambda: True)
         print(f"   {cold:>6} cold: metal {m:6.1f} s  card {c:6.1f} s ({ubatches(cold)} ubatch{'es' if ubatches(cold) > 1 else ''})  -> {want}")
         ok &= (want == "card") == (c < m or (ARGS.threshold and cold >= ARGS.threshold))
-    ok &= decide(24000, 24000, 24001, lambda: False)[0] == "metal"   # a card that is down never wins
+    ok &= decide(24000, 0, 24001, lambda: False)[0] == "metal"       # a card that is down never wins
     ok &= decide(0, 0, 5000, lambda: True)[0] == "metal"             # nothing cold: nothing to route
-    # the card fell behind (skipped for several turns): its own cold count is bigger than Metal's, and that must
-    # be what decides it - a card that HAD been kept in sync would win this exact request (found 2026-09-18: a
-    # 6,573-cold-token turn, after 6 metal-only turns, actually cost a 21,344-token card prefill, not 6,573 - the
-    # naive shared-cold model said "card wins, 9.3s vs 10.0s" and was wrong; the real card cost was 15.3s)
-    ok &= decide(6573, 21344, 21345, lambda: True)[0] == "metal"
-    ok &= decide(6573, 6573, 6574, lambda: True)[0] == "card"        # same request, card kept in sync: card wins as before
+    # 2026-09-18: a stale card (skipped for several turns) used to be charged its OWN cold count, and a stale
+    # card had to redo everything since its own last use (a 6,573-cold-token turn, after 6 metal-only turns,
+    # actually cost a 21,344-token card prefill, not 6,573 - the naive shared-cold model said "card wins" and was
+    # wrong by 5.8 s). Fixed by syncing Metal's state onto the card first, so the card only ever pays cold_metal
+    # plus a one-time sync tax - cheaper than a full reprocess, but not free, and both properties must hold:
+    m_fresh, c_fresh = predict(6573, 0)                              # card already in sync: cheapest case
+    m_sync, c_sync = predict(6573, 14771)                            # card 14,771 tokens behind: pays to catch up
+    c_reprocess = ubatches(21344) * ARGS.card_fixed + 21344 / ARGS.card_rate + 21344 * ARGS.handoff_per_token
+    ok &= c_sync > c_fresh                                           # syncing costs something over being in sync...
+    ok &= c_sync < c_reprocess                                       # ...but far less than redoing all 21,344 tokens
     known = [(6974, 8.0 + 6974 / 5150), (23691, 8.0 + 23691 / 5150), (64577, 3 * 8.0 + 64577 / 5150)]
     fit = fit_line(known)                                             # the estimator recovers a line it was given
     ok &= fit is not None and abs(fit[0] - 8.0) < 0.05 and abs(fit[1] - 5150) < 25
     obs24 = 12.588                                                    # the control prefill the constants were fitted on
     ok &= abs((1 * ARGS.card_fixed + 23691 / ARGS.card_rate) - obs24) < 0.3
     ok &= ubatches(24576) == 1 and ubatches(24577) == 2 and ubatches(62031) == 3      # the stream is per ubatch
-    m3, c3 = predict(62031, 62031)                                     # and a 3-ubatch prompt pays it three times
+    m3, c3 = predict(62031, 0)                                        # and a 3-ubatch prompt pays it three times
     ok &= abs(c3 - (3 * ARGS.card_fixed + 62031 / ARGS.card_rate + 62031 * ARGS.handoff_per_token)) < 0.01
     ok &= fit_line([(6974, 8.5)]) is None and fit_line([(1000, 5.0), (1500, 5.2), (1800, 5.3)]) is None  # too few, too narrow
     ok &= fit_line([(1000, 9.0), (5000, 7.0), (9000, 5.0)]) is None   # a negative slope is not a rate
@@ -285,12 +320,13 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e: log(f"tokenize failed ({e}); metal-only")
             if ids:
                 cached = common_prefix(STATE["metal_tokens"], ids); cold = len(ids) - cached
-                cold_card = len(ids) - common_prefix(STATE["card_tokens"], ids)
-                want, why = decide(cold, cold_card, len(ids), lambda: healthy(ARGS.card))
+                cached_card = common_prefix(STATE["card_tokens"], ids)
+                sync_tokens = max(0, cached - cached_card)
+                want, why = decide(cold, sync_tokens, len(ids), lambda: healthy(ARGS.card))
                 if want == "card":
-                    try: card_prefill(ids); route = "card+metal"
+                    try: card_prefill(ids, sync_tokens > 0); route = "card+metal"
                     except Exception as e: log(f"card path failed ({e}); metal-only")
-                stale = f", {cold_card} cold at card" if cold_card != cold else ""
+                stale = f", card {sync_tokens} tok behind" if sync_tokens else ""
                 log(f"{path}: {len(ids)} tokens, {cached} cached at metal, {cold} cold{stale} -> {route} ({why})")
                 body["cache_prompt"] = True; body["id_slot"] = ARGS.slot; raw = json.dumps(body).encode()
             t0 = time.perf_counter(); status, tail = self._relay("POST", self.path, raw)

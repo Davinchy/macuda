@@ -315,6 +315,30 @@ cause. **The identical 9-turn benchmark repeated immediately after did NOT repro
 op-verify 450/450) — n=1 either way, so this neither confirms nor rules out the workload as a trigger, but it's
 not deterministic on this exact shape.
 
+## Reverse sync implemented, tested, and did NOT achieve the intended effect, 2026-09-18
+
+Following the strategy review below, `tools/disagg-router.py` gained `sync_metal_to_card()`: before the card
+prefills, if its own slot has fallen behind Metal's, push Metal's current slot state onto the card first (same
+symmetric save/restore API the working card->metal direction already relies on), so the card's own `cache_prompt`
+matching should then recognize the shared prefix and only prefill the true delta. `predict()`/`decide()` updated
+to cost this as `cold_metal` plus a one-time sync tax, replacing the "card's own stale cold count" model from the
+staleness fix earlier today. Verified on the desk (`--selftest`, `disagg-router-fit-test.py`).
+
+**Tested for real and it did NOT work.** Sequence: 3 small turns to Metal, then one large turn (21,344 total
+tokens, 18,432 new). The sync itself succeeded cleanly — Metal's state saved (2,943 tokens, matching a tracked
+2,912-token prompt plus 31 tokens of the previous turn's own decoded output extending Metal's real cache, a
+harmless and expected gap fixed as a side effect: the original assertion compared against the router's own
+tracked count and raised a false error on this exact mismatch on the first attempt; fixed to compare the
+save/restore round trip against itself instead), restored onto the card (0.0 s, `n_restored` matched `n_saved`).
+But the card's own subsequent `/completion` with `cache_prompt: true` reported `prompt_n: 21343` — it reprocessed
+the ENTIRE prompt, not the ~18,432-token delta the restored prefix should have left for it. The restore round-trip
+succeeded; the card's own cache_prompt matching did not recognize it afterward. This is the opposite of the
+established, repeatedly-proven card->Metal direction, where every successful run in this project's history shows
+the receiving side correctly reporting `cache_n` matching the restored length. Root cause not yet known - under
+investigation (a fresh agent is reading the actual server-side restore/cache_prompt-matching code, not just the
+KV-cache serialization format the earlier research confirmed symmetric, since that confirmation was evidently
+insufficient). Item 1 is not closed; do not assume reverse sync works until this is resolved.
+
 ## eGPU strategy review, 2026-09-18 — ranked, ahead of working through them
 
 A research pass (GGUF metadata read directly, driver/shim docs, upstream `llama.cpp` prior art) ranked strategies
