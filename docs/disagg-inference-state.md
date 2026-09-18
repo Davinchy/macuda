@@ -525,12 +525,23 @@ parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever
    Once the router can predict whether a reverse-sync would hit or catastrophically miss (7), the 512-cap
    question in 6 stops being a judgment call — the router just gets it right on its own, no operator cap needed.
    Don't spend effort deciding the cap's default separately from building 7.
-7. **Wire reverse sync into the router's actual routing decision.** It's confirmed working (2026-09-18), not just
-   hand-tested — the remaining work is making the ROUTER track enough of Metal's real state (specifically:
-   capture the actual decoded token ids via `return_tokens` on relayed requests, not just the sent prompt) so it
-   can predict whether a sync will hit cleanly, rather than only detecting a miss after paying for it. This also
-   retires "keep-warm scheduling" for good (an earlier pass ruled it out only because sync didn't work yet — once
-   it does, `THRESH=0` + working sync already captures the benefit with no separate keep-warm policy needed).
+7. **DONE, 2026-09-18: reverse sync wired into the router's actual routing decision, with a provable safety
+   check, not a guess.** `do_POST` now sets `return_tokens: true` on every relayed request and, when the reply
+   isn't a stream, captures Metal's REAL decoded token ids and appends them to `STATE["metal_tokens"]` — so the
+   router's tracking reflects what Metal actually holds (prompt + its real output), not just the prompt it was
+   sent. A sync is now only ever attempted when `common_prefix(metal_tokens, ids) == len(metal_tokens)` — i.e.
+   Metal's ENTIRE tracked state is confirmed to be a genuine prefix of the new request — which is exactly the
+   condition that was missing when the catastrophic-miss bug was found. When that's not confirmed, the card (if
+   chosen at all) falls back to its own raw mismatch cost, provably safe, never the artificially-cheap
+   post-sync estimate that caused the original surprise. Re-ran the exact original failure scenario (3 small
+   turns building up an untracked decoded tail, then a big jump) end to end: every small turn now correctly logs
+   `(sync unconfirmed)` and safely routes to Metal; the big jump correctly recognized that even the raw
+   full-reprocess fallback (12.8s predicted) beats Metal's own cost for that jump (27.9s) and delivered 14.1s
+   actual — no catastrophic surprise, because the cost model was never given a false premise. `_relay`'s tail
+   buffer also grew from 4096 to 65536 bytes, since the old size silently defeated the self-check (and this new
+   token capture) for any reply long enough to push the JSON past it. Card came through clean, op-verify 450/450.
+   This also retires "keep-warm scheduling" for good (an earlier pass ruled it out only because sync didn't work
+   yet — now that it does, safely, `THRESH=0` already captures the benefit with no separate keep-warm policy).
 8. **DONE, 2026-09-18: promoted the parallel-slot batching win into reusable tooling** — `tools/disagg-batch.sh`,
    confirmed 4.1x on real hardware through the actual tool, both Metal-hosted and card-only. See above.
 9. **DONE, 2026-09-18: batching + NCPUMOE=30 residency, confirmed 5.95x (up from 4.1x at NCPUMOE=48).** First
@@ -549,11 +560,19 @@ parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever
     actually run. Running it before item 7 lands would keep hitting the decoded-tail cache-miss artifact and
     understate the real number, since `tools/gen-coding-chat.py`'s checkpoints are static pre-written text, not
     live model output — the exact condition that triggers that miss.
-11. **A cheap, currently-open gap: no direct card-only vs. Metal-only decode comparison exists for a model that
-    fits both places.** Qwen3.8-27B has real on-card decode numbers (124 tok/s single-request, ~207 tok/s at 8
-    slots, via `nv_shim_step.sh spec`) but no matching Metal-only number for the same model anywhere in this
-    project — nobody has actually verified card-only is the right choice once a model fits in ~31.8 GiB rather
-    than assumed it.
+11. **DONE, 2026-09-18: card-only vs. Metal-only decode, measured on both sides for Qwen3.8-27B.** Metal, kit's
+    own `llama-server` (the proper backend, not tinygrad's — see below), plain greedy decode: **22.68 tok/s**.
+    Metal with the same MTP speculative-decode setup the card uses (`--spec-type draft-mtp`, same draft model):
+    **17.00 tok/s** — draft acceptance ~58%, but *worse* than plain Metal decode, because Metal's baseline is
+    already fast enough that running two models per step costs more than the accepted drafts save. Against the
+    card's existing numbers (124 tok/s single-request, ~207 tok/s aggregate at 8 slots): **the card is ~5.5x
+    faster than Metal's best real option and ~7.3x faster than Metal's own speculative attempt** — card-only is
+    decisively the right choice for this model, now measured rather than assumed. **Correction to the record:**
+    the "metal" figure already on file for this model (`METAL_Qwen3.8-27B-UD-Q4_K_M_p256_d128_20260917-215146.txt`,
+    2.277 tok/s) is confirmed stale — that ran on tinygrad's own minimal Metal backend (`DEV=METAL JITBEAM=2`),
+    ~10x slower than the kit's proper backend used everywhere else in this project; 22.68 tok/s is the real
+    comparison point going forward. Speculative decoding helping enormously on the card while hurting on Metal is
+    itself a small, separate, not-yet-investigated finding — noted, not chased further here.
 12. **The vision-projector asset** (`qwen38-mmproj-F16.gguf` for Qwen3.8-27B) is architecturally analogous to the
     proven prefill-offload pattern (one-shot, compute-heavy, non-resident-friendly) but it's genuinely unknown
     whether llama.cpp's server API supports routing the vision-encoder pass to a different process than the main
