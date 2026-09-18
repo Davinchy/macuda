@@ -812,6 +812,18 @@ int tinynv_gsp_init_objects(tinynv_gpu_t *g) {
     gsp->engines[i] = info->entries[i].engineData[2];
     gsp->runlists[i] = info->entries[i].engineData[3];
   }
+  // Read-only, fetched on every ordinary boot regardless of TINYNV_RUNQUEUE_SPLIT, printed on none of them until
+  // now: numPbdmas/pbdmaIds per engine. NVIDIA's real kernel_fifo_*.c validates a channel's requested runqueue
+  // against this count for its OWN engine before scheduling it (kfifoGetNumRunqueues_HAL, runqueue bounds-checked
+  // against numSrcPbdmaIds); this driver's channel-alloc path never has, for any engine, on any boot. If the copy
+  // (DMA_COPY) engine reports numPbdmas=1, runqueue ONE is not a real hardware lane for it at all, and setting
+  // NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE_ONE on that channel is undefined behaviour GSP-RM never rejects - which
+  // would fully explain both hardware outcomes seen 2026-09-18 (a NULL-deref crash and, on a different build, a
+  // hang ending in a real DART fault) as one root cause landing two different ways, not two different bugs.
+  for (uint32_t i = 0; i < gsp->nengines; i++)
+    fprintf(stderr, "tinynv: engine %-16s type 0x%x runlist %u numPbdmas %u pbdmaIds [%u,%u]\n",
+            info->entries[i].engineName, gsp->engines[i], gsp->runlists[i],
+            info->entries[i].numPbdmas, info->entries[i].pbdmaIds[0], info->entries[i].pbdmaIds[1]);
   free(info);
 
   // Half a gigabyte of address space whose page tables are built now and described to GSP-RM, so that the two sides
@@ -1150,6 +1162,55 @@ static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32
   // engine together where one subcontext cannot, but nothing here has measured that and no recording contains it.
   p.hContextShare = gsp->user_ctxshare;
   if (!compute && gsp->copy_ctxshare) p.hContextShare = gsp->copy_ctxshare;
+  // A different axis from the ctxshare guess above, from NVIDIA's own header rather than a hypothesis about our
+  // code: alloc_channel.h's NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE (bit 4:4, GP10x+) "specifies which runqueue the
+  // allocated channel will be executed on in a TSG. Channels on different runqueues within a TSG may be able to
+  // feed methods into the engine simultaneously." Both our channels have always defaulted to runqueue 0 (`p.flags`
+  // is memset to zero and nothing here has ever set this bit) - so the copy and compute channels contending for
+  // one runlist slot at every token boundary (the mechanism this file's own comments above settled) has never
+  // been tested against the one flag NVIDIA's own driver uses to let two channels in a TSG feed the engine at
+  // once. TINYNV_RUNQUEUE_SPLIT=1 puts the copy channel on runqueue ONE; compute stays on the default. Off by
+  // default: NVIDIA's own doc hedges ("may be able to"), and this could land like TINYNV_TIMESLICE_US - a real,
+  // exercised mechanism that doesn't net out to a shorter token. One hardware run decides it.
+  //
+  // RUN, 2026-09-18: it does not just fail to help - it crashes. The GPFIFO alloc itself succeeds (GSP-RM accepts
+  // the channel on runqueue ONE without complaint, boot proceeds, ggml_cuda_init reports the card normally), but
+  // the FIRST real copy-engine job after it - the first H2D weight upload in llama_model_loader::load_all_data -
+  // SIGSEGVs inside tinynv_exec_upload (NULL deref; symbolicated: tinynv_exec_upload+216 <- tinynv_memcpy_htod
+  // <- cudaMemcpyAsync <- ggml_backend_cuda_buffer_set_tensor <- load_all_data). Card verified undamaged after
+  // (preflight clean, no re-enumeration, op-verify 450/450 at chain depths 32/64/128 on the stock binary).
+  //
+  // RETRIED on a different build the same day: no crash this time, but a hang - the process spun at 100% CPU
+  // (confirmed via ps: state R, not blocked) at the same point, consistent with tinynv_exec_idle's wait looping
+  // on a completion value that never arrives. Had to be force-killed; the card then showed a genuine DART fault
+  // (not the benign re-enumeration pattern this project usually sees), needing a physical replug. Two different
+  // failure shapes, same program point, on two different builds - consistent with one root defect resolving as
+  // undefined behaviour rather than two separate bugs.
+  //
+  // ROOT CAUSE FOUND, 2026-09-18, without touching hardware again: this driver has always fetched, and always
+  // thrown away, exactly the fact that answers this. tinynv_gsp_init_objects's FIFO_GET_DEVICE_INFO_TABLE call
+  // (above this function) returns numPbdmas/pbdmaIds per engine - printed for the first time on the ordinary
+  // boot that produced this comment: GR0 (compute) reports numPbdmas=2, but EVERY copy engine instance (CE0
+  // through CE7) reports numPbdmas=1. NVIDIA's real driver validates a channel's requested runqueue against its
+  // OWN engine's PBDMA count before scheduling it (kfifoGetNumRunqueues_HAL, bounds-checked against
+  // numSrcPbdmaIds in kernel_fifo_gm107.c); this driver's channel-alloc path never has, for any engine, on any
+  // boot. So NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE_ONE on the copy channel asks GSP-RM for a PBDMA index the copy
+  // engine does not have - an out-of-range hardware selector that the allocation call happily accepts (nothing
+  // in the accept path checks it), and which then produces undefined behaviour whose exact shape depends on
+  // incidental memory layout - the crash and the hang are the same defect landing two different ways.
+  //
+  // This also settles the mechanism question, not just the crash: the flag's own wording ("channels on different
+  // runqueues within a TSG may be able to feed methods into THE ENGINE simultaneously" - singular) describes two
+  // channels of the SAME engine sharing that engine's PBDMA pair, not two channels of DIFFERENT engines (compute
+  // vs copy) coordinating with each other. GR0 having 2 PBDMAs could in principle let two COMPUTE channels feed
+  // concurrently; it says nothing about the compute<->copy handoff this project actually needs to shorten. Not a
+  // missing-plumbing problem - the wrong mechanism for this job, now confirmed by hardware data rather than
+  // inferred from a crash. Left OFF, in the tree, as the evidence - same status as TINYNV_SPLIT_CTXSHARE above.
+  { const char *e = getenv("TINYNV_RUNQUEUE_SPLIT");
+    if (e && *e && *e != '0' && !compute) {
+      p.flags |= (1u << 4); // NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE_ONE, field 4:4
+      fprintf(stderr, "libtinynv: the copy channel was put on runqueue ONE (was asked for)\n");
+    } }
   if (fill_channel_state(g, cl, &p, NULL, NULL)) return -1;
   if (rm_alloc_as(g, cl, gsp->user_group, 0, TINYNV_CLASS_GPFIFO, &p, sizeof(p), &q->channel)) return -1;
 
