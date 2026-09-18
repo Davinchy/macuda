@@ -826,7 +826,44 @@ static int submit_batch(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c
   return ex->sync ? tinynv_exec_wait(ex, upto, 30.0) : 0;
 }
 
+// Diagnostic only, built for the 2026-09-18 MoE per-token descriptor-delta measurement. Dumps every submitted
+// batch's raw dwords, exactly as built, so two decode tokens' worth of batches can be diffed offline. TINYNV_
+// DUMP_CMD=<path> turns it on; unset, this is one getenv call, cached.
+//
+// NEEDS A REAL DEVICE - checked and it does not work on the null device, corrected here after finding out the
+// hard way: tinynv.c's launch path only reaches tinynv_exec_run (and so this hook) when s->dev->has_pci; without
+// a card it takes an early-return "would launch" print and never touches exec.c's batch machinery at all. There
+// is no card-free way to capture this.
+//
+// MEASURED, real hardware, 16-token MoE decode (Qwen3.5-35B-A3B), two consecutive steady-state tokens (same
+// 26-record size sequence, so aligned position-for-position): of 2,435 dwords submitted per token across those
+// 26 batches, only 65 (2.7%, 260 bytes) actually differ from the previous token - one dword in the big compute
+// chain, three per small copy-engine record (mostly KV-cache write offset/address pairs). The changed values are
+// not just small, they are PREDICTABLE FIXED-STRIDE COUNTERS: the offset field advances by exactly the same
+// delta every layer within a token (e.g. +2635), and the paired address dwords advance by exactly the same
+// delta every layer too (+4276224 bytes) - consistent with the ggml-cuda code-level finding that MoE expert
+// selection is expressed as small on-device buffer *content* (mmid.cu's ids/ids_src1), never as changed launch
+// addresses. This is well inside TINYNV_INLINE_MAX (a single call) and the default inline-pend budget with
+// large margin - confirms extending the existing, already-hardware-proven TINYNV_INLINE_UPLOAD path to patch
+// this delta in place is sufficient; no second GPFIFO channel is needed for this specific problem.
+// Record format: [u32 queue: 0=compute 1=copy][u32 n dwords][n*4 bytes], appended, never truncated.
+static void dump_cmd_maybe(const tinynv_queue_t *q, const tinynv_exec_t *ex, const tinynv_cmdbuf_t *c) {
+  static int checked = 0;
+  static FILE *f = NULL;
+  if (!checked) {
+    checked = 1;
+    const char *path = getenv("TINYNV_DUMP_CMD");
+    if (path && *path) f = fopen(path, "ab");
+  }
+  if (!f) return;
+  uint32_t hdr[2] = {(uint32_t)(q == &ex->g->gsp.copy_q), c->n};
+  fwrite(hdr, sizeof(hdr), 1, f);
+  fwrite(c->words, 4, c->n, f);
+  fflush(f);
+}
+
 static int run(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c, uint64_t cmdbuf_va) {
+  dump_cmd_maybe(q, ex, c);
   // The timeline only moves once the work is actually on the ring. Advancing first and then failing to submit would
   // leave a value nothing will ever release, and every wait after it - including the arena's - would sit out its whole
   // timeout before reporting a fault that happened somewhere else entirely.
