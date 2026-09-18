@@ -533,10 +533,17 @@ parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever
    it does, `THRESH=0` + working sync already captures the benefit with no separate keep-warm policy needed).
 8. **DONE, 2026-09-18: promoted the parallel-slot batching win into reusable tooling** — `tools/disagg-batch.sh`,
    confirmed 4.1x on real hardware through the actual tool, both Metal-hosted and card-only. See above.
-9. **Rerun `tools/disagg-batch.sh` with `NCPUMOE=30` instead of the default 48** (config-only, no new code) —
-   residency cut prefill 24-33% in window 2, and since batching's win comes from amortizing that same one-time
-   fixed cost across jobs, cutting the fixed cost directly should push the win past 4.1x, especially for smaller
-   batches where the one-time prefill matters proportionally more.
+9. **DONE, 2026-09-18: batching + NCPUMOE=30 residency, confirmed 5.95x (up from 4.1x at NCPUMOE=48).** First
+   attempt OOM'd — `cudaMalloc failed: out of memory` trying to allocate an 8.7 GiB compute buffer, because the
+   tool's `-c 200000` default (sized for Metal-only isolation testing, where 128 GiB unified memory is generous)
+   left no VRAM headroom once residency also needed space for on-card experts. Fixed: the tool's default context
+   is now 53,248 (≈13,312 tokens/slot at 4 slots) — comfortable margin over an 11,461-token shared prompt, without
+   competing with residency for the card's ~31.8 GiB. Re-ran clean: prefill dropped **11.5s → 8.0s** (994 → 1438
+   tok/s, a 30% cut matching window 2's 24-33% prediction), and — not predicted in advance, found by running it —
+   the 4 seeded jobs *also* got faster (4.22s → 2.77s total), because residency lowers the expert-streaming cost
+   for any forward pass through the model, not just the one big initial prefill; every job still runs a small
+   MoE forward pass over its own new tokens. Total: **11.2s for all 4 jobs, 5.95x over the 66.7s all-Metal
+   baseline** (versus 4.1x at NCPUMOE=48). Card came through clean, no re-enumeration, op-verify 450/450.
 10. **Re-test reverse sync + NCPUMOE residency combined on hardware, sequenced AFTER item 7** — an earlier
     research pass estimated ~26% faster than all-Metal for this combination on the 9-turn benchmark shape, never
     actually run. Running it before item 7 lands would keep hitting the decoded-tail cache-miss artifact and

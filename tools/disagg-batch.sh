@@ -36,7 +36,14 @@ K=/Volumes/512SSD/LocalCode/offline-ai-kit; METAL_BIN=${METAL_BIN:-$K/bin/llama-
 CARD_BIN=${BIN:-$R/cuda-shim/build/bin/llama-server-null}
 ST=$R/logs/disagg/batch; mkdir -p "$ST"; PIDF=$ST/pids; META=$ST/meta
 CARD_PORT=${CARD_PORT:-8092}; METAL_PORT=${METAL_PORT:-8091}
-NCPUMOE_DEFAULT=48; CTX=${CTX:-200000}; UB=${UB:-24576}
+NCPUMOE_DEFAULT=48; UB=${UB:-24576}
+# CTX default is deliberately modest, not the 200000 used for Metal-only isolation testing: the CARD's ~31.8 GiB
+# VRAM is shared between this KV-cache reservation and whatever NCPUMOE residency also wants resident, and 200000
+# (52224/slot at n-slots=4) OOM'd outright once NCPUMOE dropped below 48 (found 2026-09-18: "cudaMalloc failed:
+# out of memory" trying to allocate an 8.7 GiB compute buffer). This default gives ~13,312 tokens/slot at 4
+# slots - comfortable margin over an 11,461-token shared prompt plus a small job - without competing hard with
+# residency. Override with CTX=<n> for a larger shared prompt or more slots, but budget VRAM by hand when doing so.
+CTX=${CTX:-53248}
 
 wait_health() { i=0; until [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$1/health" 2>/dev/null)" = 200 ]; do
   i=$((i+1)); [ $i -gt 1200 ] && { echo "   port $1 not healthy after 10 min"; return 1; }
