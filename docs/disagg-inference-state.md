@@ -315,6 +315,23 @@ cause. **The identical 9-turn benchmark repeated immediately after did NOT repro
 op-verify 450/450) — n=1 either way, so this neither confirms nor rules out the workload as a trigger, but it's
 not deterministic on this exact shape.
 
+**Root cause found, 2026-09-18: Antonio identified why his power adapter was disconnecting and is fixing it** —
+confirms the power-delivery hypothesis from the 09-16 events rather than leaving it open.
+
+**Standing authorization changed 2026-09-18:** these no longer need Antonio to look first every time. His words:
+"keep a log of these enumerations and any relevant data, but you can clear them as they don't seem to be harming
+anything." Clear autonomously (`tools/dart-stale.sh --clear`, verify it landed) whenever the link stays clean
+(DART absent, Thunderbolt/PCI "up") and log the occurrence here — this does not extend to an actual wedge, a
+latched DART fault, or "link NOT up".
+
+**Third re-enumeration, 2026-09-18 02:48:12** (dext pid 43805, vs. the prior record pid 20618 from 01:20:58).
+Same clean signature (link "up", DART absent). Landed right at the cleanup/step-down of the parallel-slot batching
+test (`batch-test.sh` killing the card and Metal server processes after ~140s of sustained load: an 11.7s card
+prefill plus 8 back-to-back ~15-17s Metal completions) — the fourth data point now (of four total re-enumerations
+across two days) landing at a step-down after sustained load, none during steady load itself and none while the
+card was mid-step. Cleared with `tools/dart-stale.sh --clear`, verified landed. No further testing was blocked by
+it once cleared.
+
 ## Reverse sync implemented, tested, and did NOT achieve the intended effect, 2026-09-18
 
 Following the strategy review below, `tools/disagg-router.py` gained `sync_metal_to_card()`: before the card
