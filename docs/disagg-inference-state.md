@@ -555,11 +555,33 @@ parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever
    for any forward pass through the model, not just the one big initial prefill; every job still runs a small
    MoE forward pass over its own new tokens. Total: **11.2s for all 4 jobs, 5.95x over the 66.7s all-Metal
    baseline** (versus 4.1x at NCPUMOE=48). Card came through clean, no re-enumeration, op-verify 450/450.
-10. **Re-test reverse sync + NCPUMOE residency combined on hardware, sequenced AFTER item 7** — an earlier
-    research pass estimated ~26% faster than all-Metal for this combination on the 9-turn benchmark shape, never
-    actually run. Running it before item 7 lands would keep hitting the decoded-tail cache-miss artifact and
-    understate the real number, since `tools/gen-coding-chat.py`'s checkpoints are static pre-written text, not
-    live model output — the exact condition that triggers that miss.
+10. **RUN, 2026-09-18: reverse sync + NCPUMOE=30 residency, and a real new finding — sync stayed unconfirmed even
+    in a genuinely live conversation.** Built a proper test this time: a real, live-growing conversation through
+    the router, where each turn's prompt is everything before it INCLUDING the model's own real reply (captured
+    from the previous response, not scripted) — exactly the condition `tools/gen-coding-chat.py`'s static
+    checkpoints can't provide. Three small turns, then a ~11,500-token injection. **Turns 2 and 4 still showed
+    `(sync unconfirmed)`, including the big injection** — so this run exercises the *raw-fallback + residency*
+    path, not confirmed-safe sync + residency, which is still unmeasured.
+
+    **Why, and it's a real, generalizable finding, not a bug in this session's code:** the router's own
+    `/tokenize` call and Metal's *internal* completion-string tokenization disagreed by exactly one token on the
+    very same growing text (turn 2's log: router predicted "103 cached," Metal's real response reported
+    `cache_n: 102`). The likely mechanism: this test reconstructs each turn's prompt from the *text* of the
+    previous reply (`d["content"]`), not its token ids — and detokenize-then-retokenize through a BPE tokenizer
+    is not always bit-exact at a boundary (here, where the reply's text meets the next `### User` marker). This
+    matters beyond this one test: **virtually all real chat clients reconstruct history as text**, the same way
+    this test did — so this 1-token slop is a plausible, common occurrence in real usage too, not a test
+    artifact. The safety check is doing exactly its job (refusing to trust an unconfirmed match) — but that also
+    means confirmed-safe syncs may be rarer in practice than "well-behaved client" framing suggested.
+
+    **What was actually measured, and it's still a real result:** the raw-fallback path with residency handled
+    the ~11,500-token injection in **8.1s prefill** (+0.4s save), ~8.8s wall total, close to the router's own
+    10.6s prediction — residency helps the fallback path too, just not via the sync mechanism specifically.
+
+    **Open refinement, not attempted here:** the safety check currently requires exact token-id equality. A
+    looser-but-still-principled check (comparing DETOKENIZED TEXT equivalence at the boundary, rather than raw
+    token ids) might recover confirmed-safe syncs for this common case without giving up the provable-safety
+    property — genuinely unexplored, flagged rather than guessed at.
 11. **DONE, 2026-09-18: card-only vs. Metal-only decode, measured on both sides for Qwen3.8-27B.** Metal, kit's
     own `llama-server` (the proper backend, not tinygrad's — see below), plain greedy decode: **22.68 tok/s**.
     Metal with the same MTP speculative-decode setup the card uses (`--spec-type draft-mtp`, same draft model):
