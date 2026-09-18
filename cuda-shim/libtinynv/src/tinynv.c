@@ -36,6 +36,15 @@ struct tinynv_device {
   // the gpu itself, brought up the first time something needs it rather than at init: opening the device should not
   // boot a card, and a shim that only asks what device is present should not pay for one
   int booted;
+  // Set when a boot got past the pci open and then failed. `booted` stays set so the card is still put down on the way
+  // out, but nothing else may proceed: before this, the second call after a failed init_hw returned 0 and the shim went
+  // on to describe (name from the pci id, cc 0) and allocate against a card whose firmware never came up (2026-09-17).
+  int boot_failed;
+  char boot_error[256];
+  // Set only once tinynv_exec_init has returned. put_the_card_down runs from atexit and the signal handler however far
+  // the boot got, and a boot that failed in init_hw (gsp never posted INIT_DONE) never initialised the exec - idling a
+  // zeroed exec spins forever in flush, which is what forced a physical replug after every failed boot on the 3060.
+  int exec_ready;
   // Set once the card has been put down. Nothing may touch it after that, and the calls that would are not errors: a
   // cudart shim unregisters its fat binaries from its own atexit handler, and the order two atexit handlers run in is
   // not something either of them chooses. So freeing after teardown does the host-side half and stops.
@@ -103,10 +112,11 @@ static void put_the_card_down(void) {
     fprintf(stderr, "libtinynv: %llu bytes in %llu mappings were leaked rather than reused, because the mmu never "
                     "acknowledged their invalidate. The card was not asked for memory again after that.\n",
             (unsigned long long)g_dev.gpu.mm.leaked_bytes, (unsigned long long)g_dev.gpu.mm.leaked_n);
-  tinynv_exec_idle(&g_dev.exec);   // let what was submitted finish before the mappings under it go away
+  if (g_dev.exec_ready) tinynv_exec_idle(&g_dev.exec);   // let what was submitted finish before the mappings under it go away
   g_dev.booted = 0;
   g_dev.torn_down = 1;
-  tinynv_exec_fini(&g_dev.exec);
+  if (g_dev.exec_ready) tinynv_exec_fini(&g_dev.exec);
+  g_dev.exec_ready = 0;
   tinynv_gpu_close(&g_dev.gpu);
 }
 
@@ -219,6 +229,7 @@ static void catch_the_ways_out(void) {
 }
 
 static int device_boot(tinynv_device_t d) {
+  if (d->boot_failed) return tinynv_fail("the gpu did not finish booting and this process will not try again: %s", d->boot_error);
   if (d->booted) return 0;
   if (d->torn_down) return tinynv_fail("the gpu has been put down for good; this process cannot use it again");
   if (!d->has_pci) return tinynv_fail("no gpu: this is the null device");
@@ -226,11 +237,14 @@ static int device_boot(tinynv_device_t d) {
   d->booted = 1; // from here the card is live and must be put down even if a later stage fails
   atexit(put_the_card_down);
   catch_the_ways_out();
-  if (tinynv_gpu_init_sw(&d->gpu) || tinynv_gpu_init_hw(&d->gpu)) return -1;
-  if (tinynv_gsp_init_objects(&d->gpu) || tinynv_gsp_init_channel(&d->gpu) || tinynv_gsp_init_gr_context(&d->gpu) ||
-      tinynv_gsp_open_client(&d->gpu) || tinynv_gsp_init_queues(&d->gpu))
-    return -1;
-  if (tinynv_exec_init(&d->gpu, &d->exec)) return -1;
+#define BOOT_STAGE(call) do { if (call) { d->boot_failed = 1; snprintf(d->boot_error, sizeof d->boot_error, "%s", tinynv_last_error()); \
+    return tinynv_fail("%s", d->boot_error); } } while (0)
+  BOOT_STAGE(tinynv_gpu_init_sw(&d->gpu) || tinynv_gpu_init_hw(&d->gpu));
+  BOOT_STAGE(tinynv_gsp_init_objects(&d->gpu) || tinynv_gsp_init_channel(&d->gpu) || tinynv_gsp_init_gr_context(&d->gpu) ||
+             tinynv_gsp_open_client(&d->gpu) || tinynv_gsp_init_queues(&d->gpu));
+  BOOT_STAGE(tinynv_exec_init(&d->gpu, &d->exec));
+  d->exec_ready = 1;
+#undef BOOT_STAGE
 
   // Sensors, unless refused. Arming costs one 464-byte host buffer, one object and two controls, all once; after that
   // the firmware refreshes the block on its own timer and reading it is a load. Nothing here touches the submission

@@ -87,6 +87,15 @@ static tinynv_device_props_t props(void) {
     return p;
   }
 
+  // A real card that answered with cc 0 is a card whose firmware never described itself. It is NOT the null device and
+  // gets no profile: this was the second of two paths that invented a 5090 here (the rc != OK branch above is the first).
+  if (p.cc_major == 0 && strncmp(p.name, "tinynv-null", 11) != 0) {
+    if (!complained++)
+      fprintf(stderr, "[tinycudart] the driver named the device '%s' but reported no compute capability: it did not boot. "
+                      "NOT substituting a profile.\n", p.name);
+    memset(&p, 0, sizeof p);
+    return p;
+  }
   if (p.cc_major == 0 && !(env && *env == '0')) {
     if (!announced++) fprintf(stderr, "[tinycudart] %s: presenting the RTX 5090 profile (sm_120, 170 SMs, 32 GB) so ggml dispatches as it will on the target\n", p.name);
     p.cc_major = 12; p.cc_minor = 0; p.sm_count = 170; p.warp_size = 32;

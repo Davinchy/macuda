@@ -52,7 +52,17 @@ static uint64_t id8_of(const char *s) {
 // The recorded 5090 boot never sends one -- there is not a single register write between the chain of trust and the
 // windows being retargeted -- so this path is written from the oracle and has not been exercised by the replay. It is
 // here rather than left as a failure because a board that does send one would otherwise stop dead.
-static void run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
+// Returns -1 with the reason in tinynv_last_error() if the sequence could not be completed. It used to be void and
+// `return` silently from every falcon step that failed, after which the caller sat in a 60 s wait for a start-up notice
+// that could never come and reported only the wait - the real failure was overwritten before anyone read it. On the
+// 3060 (2026-09-17) that was three boots in a row with nothing between the sequence line and the timeout.
+static int seq_fail(uint32_t op, unsigned nops, size_t i, size_t have, const char *why) {
+  char inner[256]; snprintf(inner, sizeof inner, "%s", tinynv_last_error());
+  fprintf(stderr, "tinynv: register sequence ABORTED at operation %u (op %#x, word %zu of %zu): %s%s%s\n",
+          nops, op, i, have, why, *inner ? " - " : "", inner);
+  return tinynv_fail("register sequence aborted at operation %u (op %#x): %s%s%s", nops, op, why, *inner ? " - " : "", inner);
+}
+static int run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
   // say so, every time. this path was never taken in the recording, so on real hardware a request is the driver leaving
   // the ground the oracle covers, and that should be visible in the log rather than inferred afterwards.
   g->gsp.cpu_seq_requests++;
@@ -63,17 +73,19 @@ static void run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
   // that, which is regSaveArea[5], and then started decoding at regSaveArea[6]. Nothing caught it because the recorded
   // 5090 boot never sends a sequence at all, so until an Ampere card asked for one this function had never run.
   const size_t hdr = 40;
-  if (len < hdr) return;
+  if (len < hdr) return tinynv_fail("register sequence request is %zu bytes, shorter than its %zu byte header", len, hdr);
   uint32_t cmd_index;
   memcpy(&cmd_index, msg + 4, 4);
   const uint32_t *w = (const uint32_t *)(const void *)(msg + hdr);
   size_t have = (len - hdr) / 4, i = 0;
   if (cmd_index < have) have = cmd_index;
 
-#define NEXT(out) do { if (i >= have) return; memcpy(&(out), &w[i++], 4); } while (0)
+#define NEXT(out) do { if (i >= have) return seq_fail(op, nops, i, have, "the sequence ended inside an operation"); memcpy(&(out), &w[i++], 4); } while (0)
+#define STEP(call, why) do { if (call) return seq_fail(op, nops, i, have, why); } while (0)
+  uint32_t op = 0; unsigned nops = 0;
   while (i < have) {
-    uint32_t op, addr, val, mask, us;
-    NEXT(op);
+    uint32_t addr, val, mask, us;
+    NEXT(op); nops++;
     switch (op) {
       case 0x0: NEXT(addr); NEXT(val); tinynv_wr32(&g->dev, addr, val); break;
       case 0x1:
@@ -83,7 +95,7 @@ static void run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
       case 0x2: {
         uint32_t ignored;
         NEXT(addr); NEXT(mask); NEXT(val); NEXT(ignored); NEXT(ignored);
-        tinynv_wait_reg(&g->dev, addr, mask, val, 10000, "a register poll gsp-rm asked for");
+        STEP(tinynv_wait_reg(&g->dev, addr, mask, val, 10000, "a register poll gsp-rm asked for"), "a register poll never matched");
         break;
       }
       case 0x3: {
@@ -104,30 +116,33 @@ static void run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
       }
       // The remaining four ask the driver to drive the GSP falcon itself, which is why flcn.c exposes these.
       case 0x5:
-        if (tinynv_flcn_reset(g, g->flcn.falcon, 0)) return;
+        STEP(tinynv_flcn_reset(g, g->flcn.falcon, 0), "the gsp falcon did not come out of reset");
         tinynv_flcn_disable_ctx_req(&g->dev, g->flcn.falcon);
         break;
       case 0x6: tinynv_flcn_start_cpu(&g->dev, g->flcn.falcon); break;
-      case 0x7: if (tinynv_flcn_wait_cpu_halted(&g->dev, g->flcn.falcon)) return; break;
+      case 0x7: STEP(tinynv_flcn_wait_cpu_halted(&g->dev, g->flcn.falcon), "the gsp falcon never halted"); break;
       // Resume: the gsp falcon comes back on its riscv core with gsp-rm's arguments in the mailbox, then SEC2 is started
       // and has to say it handed off. SEC2's own mailbox reports a refusal, as it does for booter_load.
       case 0x8: {
-        if (tinynv_flcn_reset(g, g->flcn.falcon, 1)) return;
+        STEP(tinynv_flcn_reset(g, g->flcn.falcon, 1), "the gsp falcon did not come out of reset on its riscv core");
         tinynv_wr32(&g->dev, NV_PGSP_FALCON_MAILBOX0, (uint32_t)g->gsp.libos_args_sysmem);
         tinynv_wr32(&g->dev, NV_PGSP_FALCON_MAILBOX1, (uint32_t)(g->gsp.libos_args_sysmem >> 32));
         tinynv_flcn_start_cpu(&g->dev, g->flcn.sec2);
-        if (tinynv_wait_reg(&g->dev, NV_PGC6_BSI_SECURE_SCRATCH_14,
-                            1u << NV_PGC6_BSI_SECURE_SCRATCH_14_BOOT_STAGE_3_HANDOFF_LO,
-                            1u << NV_PGC6_BSI_SECURE_SCRATCH_14_BOOT_STAGE_3_HANDOFF_LO, 10000,
-                            "waiting for sec2 to hand off")) return;
+        STEP(tinynv_wait_reg(&g->dev, NV_PGC6_BSI_SECURE_SCRATCH_14,
+                             1u << NV_PGC6_BSI_SECURE_SCRATCH_14_BOOT_STAGE_3_HANDOFF_LO,
+                             1u << NV_PGC6_BSI_SECURE_SCRATCH_14_BOOT_STAGE_3_HANDOFF_LO, 10000,
+                             "waiting for sec2 to hand off"), "sec2 never handed off");
         uint32_t mbx = tinynv_rd32(&g->dev, g->flcn.sec2 + NV_PFALCON_FALCON_MAILBOX0);
-        if (mbx) { tinynv_fail("sec2 refused the sequencer's resume step: mailbox %#x", mbx); return; }
+        if (mbx) { tinynv_fail("sec2 refused the sequencer's resume step: mailbox %#x", mbx); return seq_fail(op, nops, i, have, "sec2 refused"); }
         break;
       }
-      default: tinynv_fail("gsp-rm asked for register operation %#x, which this driver does not know", op); return;
+      default: tinynv_fail("gsp-rm asked for register operation %#x, which this driver does not know", op); return seq_fail(op, nops, i, have, "unknown operation");
     }
   }
 #undef NEXT
+#undef STEP
+  fprintf(stderr, "tinynv: register sequence done: %u operations, %zu of %zu words\n", nops, i, have);
+  return 0;
 }
 
 // --- the shared ring ------------------------------------------------------------------------------------------------
@@ -270,7 +285,7 @@ static int rpc_drain(tinynv_gpu_t *g, uint32_t want, int *seen, uint8_t **reply,
       nv_rd_block(&gsp->queues.view, slot + sizeof(tinynv_msg_element_t) + sizeof(tinynv_msg_header_t), msg, mh.length);
     }
 
-    if (mh.function == TINYNV_MSG_EVENT_GSP_RUN_CPU_SEQUENCER) run_cpu_seq(g, msg, mh.length);
+    if (mh.function == TINYNV_MSG_EVENT_GSP_RUN_CPU_SEQUENCER && run_cpu_seq(g, msg, mh.length)) { free(msg); return -1; }
     else if (mh.function == TINYNV_MSG_EVENT_OS_ERROR_LOG && mh.length > 12)
       fprintf(stderr, "tinynv: gsp log: %.*s\n", (int)(mh.length - 12), (const char *)msg + 12);
     if (mh.function == TINYNV_MSG_EVENT_OS_ERROR_LOG || mh.function == TINYNV_MSG_EVENT_MMU_FAULT_QUEUED) {
