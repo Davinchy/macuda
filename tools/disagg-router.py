@@ -39,9 +39,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ARGS = None
 LOCK = threading.Lock()            # one request at a time: one slot on each server
-STATE = {"metal_tokens": [], "card_tokens": [], "card_obs": [], "metal_obs": [], "card_synced_len": 0}
+STATE = {"metal_tokens": [], "metal_text": "", "card_tokens": [], "card_obs": [], "metal_obs": [], "card_synced_len": 0}
 # each side's own slot contents as last sent; observed (tokens, seconds) per side; card_synced_len is what a cache
-# hit should be after the last sync_metal_to_card(), to detect a mismatched-tail miss (see its docstring)
+# hit should be after the last sync_metal_to_card(), to detect a mismatched-tail miss (see its docstring).
+# metal_text is the exact text (prompt + Metal's own real decoded content) that produced metal_tokens - used by
+# prompt_tokens() to detect a literal continuation and avoid retokenizing the whole growing string every time
 
 
 def log(msg):
@@ -74,20 +76,52 @@ def healthy(base, timeout=2):
 
 
 def prompt_tokens(path, body):
-    """The token ids Metal will use for this request, or None when the shape is one the router does not handle."""
+    """The (token ids, rendered text) Metal will use for this request; (None, None) when the shape is one the
+    router does not handle, or text is None when the client sent pre-tokenized ids directly (nothing to compare
+    against Metal's tracked text in that case - the caller already manages its own tokens).
+
+    When the rendered text is confirmed - by a literal Python string prefix check, not a retokenize - to extend
+    STATE["metal_text"] exactly, reuses STATE["metal_tokens"] for that whole prefix and tokenizes ONLY the new
+    suffix (add_special=False: this is a continuation, never a fresh BOS). This avoids retokenizing the whole
+    growing string every request, which a BPE tokenizer does not always do losslessly at a boundary - found
+    2026-09-18: a real 27-token generation, once detokenized to text and reprocessed as part of a longer string,
+    retokenized as 26 tokens. A generic BPE property (multiple token sequences can represent the same text), not
+    a bug here, but it meant sync_safe in do_POST could rarely confirm true even for a genuinely live, real
+    conversation. This makes sync_safe true BY CONSTRUCTION for any well-behaved client (one that resends exactly
+    what it was shown, which is how virtually every real chat client works) instead of by chance, and it's
+    cheaper too - only the new suffix gets tokenized, not the whole history every time.
+
+    KNOWN REMAINING GAP, found 2026-09-18 chasing this fix's first confirmed-safe sync attempt failing with
+    cache_n=0 on real hardware: splitting a tokenize() call at this prefix/suffix boundary is not always
+    equivalent to one continuous tokenize() call over the same text, because a BPE merge can span the boundary.
+    Caught directly: Metal's own continuous tokenization encoded ",\n\n" (a comma the model generated, followed
+    by the next turn's blank lines) as ONE token (3554); tokenizing the same text as a fresh suffix, split right
+    after the comma, produced "," and "\n\n" as TWO tokens (11, 271) - same text, different token ids. So
+    STATE["metal_tokens"] + suffix_ids can, at a merge boundary, diverge from what Metal's real cache actually
+    holds even though the string-prefix check above is textually correct. Confirmed SAFE, not just theorized: the
+    card's own cache-prefix match simply misses (cache_n=0) and disagg-router falls back to a full reprocess (see
+    the "sync mismatch" log line in card_prefill), so this costs a wasted sync attempt's latency, never a wrong
+    answer. The real fix would re-tokenize a small overlap (the last few known-good characters plus the new
+    suffix) and only trust the reuse when that overlap's tokens match STATE["metal_tokens"] exactly - not done
+    here, since the failure mode is a latency cost on an already-optimization-only path, not a correctness bug."""
     if path in ("/completion", "/completions", "/v1/completions"):
         p = body.get("prompt")
-        if isinstance(p, list) and p and all(isinstance(t, int) for t in p): return p
-        if not isinstance(p, str): return None
+        if isinstance(p, list) and p and all(isinstance(t, int) for t in p): return p, None
+        if not isinstance(p, str): return None, None
         text = p
     elif path == "/v1/chat/completions":
-        if not isinstance(body.get("messages"), list): return None
+        if not isinstance(body.get("messages"), list): return None, None
         tpl = {k: v for k, v in body.items() if k in ("messages", "tools", "tool_choice", "chat_template_kwargs", "reasoning_format", "add_generation_prompt")}
         text = post_json(ARGS.metal, "/apply-template", tpl).get("prompt")
-        if not isinstance(text, str): return None
+        if not isinstance(text, str): return None, None
     else:
-        return None
-    return post_json(ARGS.metal, "/tokenize", {"content": text, "add_special": True, "parse_special": True})["tokens"]
+        return None, None
+    if STATE["metal_text"] and text.startswith(STATE["metal_text"]):
+        suffix = text[len(STATE["metal_text"]):]
+        suffix_ids = post_json(ARGS.metal, "/tokenize", {"content": suffix, "add_special": False, "parse_special": True})["tokens"] if suffix else []
+        return STATE["metal_tokens"] + suffix_ids, text
+    ids = post_json(ARGS.metal, "/tokenize", {"content": text, "add_special": True, "parse_special": True})["tokens"]
+    return ids, text
 
 
 def common_prefix(a, b):
@@ -341,9 +375,9 @@ class Handler(BaseHTTPRequestHandler):
         try: body = json.loads(raw) if raw else {}
         except ValueError: body = None
         with LOCK:
-            route = "metal"; ids = None
+            route = "metal"; ids = None; text = None
             if isinstance(body, dict):
-                try: ids = prompt_tokens(path, body)
+                try: ids, text = prompt_tokens(path, body)
                 except Exception as e: log(f"tokenize failed ({e}); metal-only")
             if ids:
                 cached = common_prefix(STATE["metal_tokens"], ids); cold = len(ids) - cached
@@ -369,9 +403,11 @@ class Handler(BaseHTTPRequestHandler):
                 raw = json.dumps(body).encode()
             t0 = time.perf_counter(); status, tail = self._relay("POST", self.path, raw)
             metal_tokens_next = list(ids) if ids else None
+            metal_text_next = text
             # the self-check, when the reply was not a stream: Metal's own prompt_n / cache_n for this request,
-            # and - the 2026-09-18 fix - the ACTUAL decoded token ids, so next turn's sync_safe check above is a
-            # verified fact about Metal's real content, not an assumption that a client resent it faithfully
+            # and - the 2026-09-18 fix - the ACTUAL decoded token ids AND text, so next turn's sync_safe check
+            # (and prompt_tokens()'s literal-continuation check) are verified facts about Metal's real content,
+            # not an assumption that a client resent it faithfully
             try:
                 d = json.loads(tail) if tail.strip().startswith(b"{") else None
                 t = (d or {}).get("timings") or {}
@@ -381,8 +417,12 @@ class Handler(BaseHTTPRequestHandler):
                     if route == "metal" and t.get("prompt_n") and t.get("prompt_ms"): observe_metal(int(t["prompt_n"]), t["prompt_ms"] / 1000.0)
                 if ids and isinstance((d or {}).get("tokens"), list) and t.get("predicted_n") == len(d["tokens"]):
                     metal_tokens_next = list(ids) + list(d["tokens"])
+                if text is not None and isinstance((d or {}).get("content"), str):
+                    metal_text_next = text + d["content"]
             except ValueError: pass
-            if ids and status == 200: STATE["metal_tokens"] = metal_tokens_next
+            if ids and status == 200:
+                STATE["metal_tokens"] = metal_tokens_next
+                STATE["metal_text"] = metal_text_next or ""
 
 
 def main():

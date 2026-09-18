@@ -578,10 +578,38 @@ parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever
     the ~11,500-token injection in **8.1s prefill** (+0.4s save), ~8.8s wall total, close to the router's own
     10.6s prediction — residency helps the fallback path too, just not via the sync mechanism specifically.
 
-    **Open refinement, not attempted here:** the safety check currently requires exact token-id equality. A
-    looser-but-still-principled check (comparing DETOKENIZED TEXT equivalence at the boundary, rather than raw
-    token ids) might recover confirmed-safe syncs for this common case without giving up the provable-safety
-    property — genuinely unexplored, flagged rather than guessed at.
+    **Dug into, 2026-09-18 (same day, follow-up): the text-equivalence idea above works, and also surfaces a
+    deeper, separate limit on how far it can go.** Implemented it in `prompt_tokens()`: when a request's rendered
+    text is confirmed by a literal Python string prefix check to extend `STATE["metal_text"]` (the exact text —
+    prompt plus Metal's own real decoded content — behind `metal_tokens`), reuse `metal_tokens` verbatim for that
+    whole prefix and tokenize only the new suffix (`add_special=False`). Reran the live-growing-conversation test:
+    turn 3 now correctly shows no `(sync unconfirmed)` — the fix works for plain text continuity — and for the
+    first time ever, the router attempted a **confirmed-safe** sync on turn 4 (the big injection): `sync:
+    metal->card 262 tok 85 MB, save 0.1s, restore 0.0s`.
+
+    That attempt still missed completely (`cache_n=0`) despite being correctly confirmed safe by the router's own
+    bookkeeping. Root-caused with `LLAMA_SERVER_SLOTS_DEBUG=1` on the card (`logs/disagg/serve/drs-card.log`,
+    2026-09-18 05:04): the mismatch is a BPE merge spanning the exact prefix/suffix split point the fix
+    introduces. Metal's own continuous tokenization encoded `,\n\n` (a comma the model generated, immediately
+    followed by the next turn's blank lines) as **one token** (3554); tokenizing the same span as a **fresh
+    suffix**, split right after the comma because that's where the known-good prefix happened to end, produced
+    `,` and `\n\n` as **two separate tokens** (11, 271) — identical text, different token ids. So
+    `metal_tokens + suffix_ids` can diverge from what Metal's real cache actually holds even when the string-
+    prefix check is textually correct — the same generic BPE non-uniqueness property that motivated this fix in
+    the first place, now showing up at the boundary the fix itself creates, not just at a full-retokenize
+    boundary. This is a real, generalizable limit of any prefix-reuse + fresh-suffix tokenization scheme, not a
+    bug specific to this router or model.
+
+    **Impact is bounded and the fallback already covers it, confirmed on this exact run:** after `cache_n=0`,
+    `card_prefill`'s mismatch check fired (`"sync mismatch: expected a >= 264-token cache hit after sync, got
+    cache_n=0"`) and the router paid a full, correct reprocess of all 11,759 tokens (8.1s) — the right answer, not
+    a wrong one, just not the fast path. So the remaining gap costs a wasted sync attempt's latency on an
+    already-optimization-only code path; it has never produced an incorrect completion. Documented in
+    `prompt_tokens()`'s docstring with the concrete token ids so the failure is recognizable if seen again. **Real
+    fix, not built (cost doesn't justify it for a latency-only edge case):** re-tokenize a small overlap — the
+    last few known-good characters plus the new suffix — together, and only trust the prefix reuse when that
+    overlap's tokens match `metal_tokens` exactly at the same positions; fall back to full retokenization
+    otherwise. Uncommitted-fix code and this finding both land in the same commit as this doc update.
 11. **DONE, 2026-09-18: card-only vs. Metal-only decode, measured on both sides for Qwen3.8-27B.** Metal, kit's
     own `llama-server` (the proper backend, not tinygrad's — see below), plain greedy decode: **22.68 tok/s**.
     Metal with the same MTP speculative-decode setup the card uses (`--spec-type draft-mtp`, same draft model):
