@@ -339,6 +339,69 @@ investigation (a fresh agent is reading the actual server-side restore/cache_pro
 KV-cache serialization format the earlier research confirmed symmetric, since that confirmation was evidently
 insufficient). Item 1 is not closed; do not assume reverse sync works until this is resolved.
 
+**Root-cause investigation, and the one clean hypothesis it produced, both closed 2026-09-18.** Reading
+`tools/server/server-context.cpp` directly: the restore handler does the right thing (`slot->prompt.tokens =
+std::move(restored)`, the exact field the cache-hit check reads), the cache-hit check itself
+(`get_common_prefix`) is a plain direction-agnostic loop, the serialization version marker is identical (=1)
+between the two builds (11 days apart), and the restore's own round-trip was clean (no type-validation failure).
+None of that explains the gap. The one concrete, testable difference found: every proven-working case (this
+project's own card->Metal direction, and llama.cpp's own `test_slot_save_restore`) had the *receiving* slot
+process at least one real completion before any restore touched it; the failing case restored onto the card's
+slot 0 as the very first thing that server process ever did with it. **Tested directly: sent a throwaway
+completion to warm the card's slot first, then repeated the exact same sync+restore+prefill sequence. Still
+reprocessed the full 21,343 tokens.** Hypothesis refuted. Per the investigating agent's own assessment, what's
+left needs server-side tracing added to `get_common_prefix`'s actual call site and a rebuild — a real debugging
+session against the vendored llama.cpp, not something resolvable by reading source or testing from outside.
+**Reverse sync is closed as a line of attack pending that investment; not pursued further without Antonio's
+explicit call to make it.**
+
+**Item 1's actual conclusion, taking it to its end:** honest cost-model routing (no reverse sync) correctly
+degrades to "always Metal" for a naturally-incremental chat session, which is the right behavior given the card
+can't cheaply resync — this is not a bug to keep chasing, it's the true shape of the constraint. The old
+`THRESH=512` behavior (always touch the card) remains available at its known 1.9x cost when a session is
+expected to have large enough turns to justify it. The genuinely promising path that came out of the parallel
+strategy work — seeding a shared system-prompt prefix once and broadcasting it to multiple `--parallel` slots for
+batch serving — uses ONLY the already-proven transfer direction (something prefills, something else restores)
+and does not depend on the broken reverse-sync mechanism at all; see the batching section below.
+
+## Batching, image, and video pipeline strategies, 2026-09-18 — next checklist item, ready to test
+
+A research pass grounded in this project's actual server code and existing image-gen tooling (not generic serving
+literature) answered three questions from Antonio, decisively on two of them:
+
+**Batching a shared system prompt — real, buildable, and doesn't touch the broken reverse-sync path.**
+`server-context.cpp`'s slot selection already does longest-common-prefix matching automatically, so *sequential*
+batch jobs sharing one system prompt already get free prefix reuse today — nothing to build there. The real gap
+is *parallel* batch serving: with `--parallel P` slots, each slot pays the full shared-prefix prefill
+independently the first time a job lands on it. Fix: prefill the shared prefix once (card if it's at or above the
+measured breakeven for whatever model's in use — 6,197 cold tokens for Coder-Next at `NCPUMOE=48` on `a988ec7`,
+otherwise Metal directly), save that state once, then restore the SAME file onto each of the P slots — this uses
+only the save-then-restore-elsewhere shape already proven working in production (card->Metal), not the broken
+restore-then-reuse-on-the-same-side shape reverse sync needed. Worked example: a 10,000-token system prompt
+across 8 parallel slots — one card prefill (~9-10 s) plus 8 cheap restores, vs. 8 independent Metal prefills at
+~15.2 s each (~122 s). **This is the next thing to actually test on hardware, once picked up.**
+
+**Splitting an image-generation pipeline across the card and Metal — not needed, and a genuine dead end if a
+model ever didn't fit.** Every image model already benchmarked here (SDXL-Turbo, SD 1.5, Z-Image-Turbo, see the
+"Shim vs Silicon" report) runs as one process, fully on the card — Z-Image-Turbo is already a 3-component
+pipeline (DiT + `--llm` text encoder + `--vae`) and it just runs whole. The structural reason splitting wouldn't
+help if a denoiser ever didn't fit: diffusion/video backbones are DENSE (every parameter used on every one of
+4-50 steps), unlike Coder-Next's MoE (~10 of 512 experts touched per token, saturating a fixed transfer cost fast
+— see the mechanism note above). A non-resident dense model would re-stream its entire weight set on every single
+step, strictly worse than even the worst LLM numbers here. Latent/activation transfer between stages is trivially
+small next to the ~5.46 GiB/s link either way — bandwidth was never the constraint, VRAM fit is, and splitting
+doesn't change how much has to fit.
+
+**Video pipeline splitting — dead end today for a simpler reason: no video-generation model or tooling exists
+anywhere in this project.** Checked `tools/`, `patches/`, `models/README.md`, every models directory. The same
+dense-model argument as image generation would apply (worse, since video adds a temporal dimension multiplying
+step count), but there's nothing real to test it against — contingent future work, not a strategy to pursue now.
+
+One adjacent asset worth a separate look sometime: `qwen38-mmproj-F16.gguf` (927 MB vision projector for
+Qwen3.8-27B) already exists in the models directory — a real second pipeline component (vision encoder feeding
+the main LLM) present today, unlike video. Whether llama.cpp's mmproj path can be split across devices wasn't
+checked.
+
 ## eGPU strategy review, 2026-09-18 — ranked, ahead of working through them
 
 A research pass (GGUF metadata read directly, driver/shim docs, upstream `llama.cpp` prior art) ranked strategies
