@@ -372,6 +372,17 @@ session against the vendored llama.cpp, not something resolvable by reading sour
 **Reverse sync is closed as a line of attack pending that investment; not pursued further without Antonio's
 explicit call to make it.**
 
+**Refinement, found while validating the batching fix: this is specifically a CARD/CUDA-shim-backend problem, not
+a general restore-then-extend limitation.** Isolated Metal-only (no card) with the identical request shape
+`card_prefill()` uses — a token-list prompt extending a restored slot — and it works perfectly at ANY size,
+including the exact 18,432-token extension that failed on the card. Same server code, same restore API, only the
+receiving backend differs. That reframes the open question from "why doesn't llama-server's restore wire into
+cache_prompt matching" (it does, generally) to the much narrower "why does THIS PROJECT'S OWN CUDA/shim backend
+specifically fail to reuse a restored KV-cache state for a substantial extension, when the stock Metal/CPU backend
+handles the identical request shape correctly." A fresh investigation is running against this narrower,
+better-targeted question, focused on this project's own ggml-cuda/shim integration rather than vendored
+llama.cpp internals (already cleared as correct and direction-agnostic).
+
 **Item 1's actual conclusion, taking it to its end:** honest cost-model routing (no reverse sync) correctly
 degrades to "always Metal" for a naturally-incremental chat session, which is the right behavior given the card
 can't cheaply resync — this is not a bug to keep chasing, it's the true shape of the constraint. The old
@@ -381,22 +392,37 @@ strategy work — seeding a shared system-prompt prefix once and broadcasting it
 batch serving — uses ONLY the already-proven transfer direction (something prefills, something else restores)
 and does not depend on the broken reverse-sync mechanism at all; see the batching section below.
 
-## Batching, image, and video pipeline strategies, 2026-09-18 — next checklist item, ready to test
+## Batching, image, and video pipeline strategies, 2026-09-18
 
 A research pass grounded in this project's actual server code and existing image-gen tooling (not generic serving
-literature) answered three questions from Antonio, decisively on two of them:
+literature) answered three questions from Antonio, decisively on all three:
 
-**Batching a shared system prompt — real, buildable, and doesn't touch the broken reverse-sync path.**
+**Batching a shared system prompt across parallel slots — TESTED ON REAL HARDWARE AND CONFIRMED.**
 `server-context.cpp`'s slot selection already does longest-common-prefix matching automatically, so *sequential*
 batch jobs sharing one system prompt already get free prefix reuse today — nothing to build there. The real gap
-is *parallel* batch serving: with `--parallel P` slots, each slot pays the full shared-prefix prefill
-independently the first time a job lands on it. Fix: prefill the shared prefix once (card if it's at or above the
-measured breakeven for whatever model's in use — 6,197 cold tokens for Coder-Next at `NCPUMOE=48` on `a988ec7`,
-otherwise Metal directly), save that state once, then restore the SAME file onto each of the P slots — this uses
-only the save-then-restore-elsewhere shape already proven working in production (card->Metal), not the broken
-restore-then-reuse-on-the-same-side shape reverse sync needed. Worked example: a 10,000-token system prompt
-across 8 parallel slots — one card prefill (~9-10 s) plus 8 cheap restores, vs. 8 independent Metal prefills at
-~15.2 s each (~122 s). **This is the next thing to actually test on hardware, once picked up.**
+was *parallel* batch serving: with `--parallel P` slots, each slot pays the full shared-prefix prefill
+independently the first time a job lands on it.
+
+Landed: prefilled an 11,461-token shared prompt once on the card (11.5 s, 994 tok/s), saved it (0.4 s), restored
+the SAME file onto 4 parallel Metal slots (0.02 s each), then sent 4 different job-specific completions (16-21
+tokens each) as **token-list requests** (see the reverse-sync postmortem below for why token-list, not string,
+matters here). All four correctly showed `cache_n: 11461` — the full shared prefix reused — and completed in
+~1.0 s each. Total for the seeded path: 11.9 s (card prefill+save) + 0.09 s (4 restores) + 4.22 s (4 seeded
+queries) ≈ **16.2 s for all 4 jobs**, against **66.7 s** for 4 independent full prefills on fresh slots (no
+restore) — **a 4.1x win on this exact batch, and the win only grows with more jobs**, since each additional job
+past the first costs ~1 s instead of ~16 s. Card came through clean (op-verify 450/450, no re-enumeration).
+Script: `tools/gen-coding-chat.py`'s sibling test harness is not yet promoted into `disagg-serve.sh`/the router —
+this landed as a standalone validation, wiring it into reusable tooling is the next step, not a research question.
+
+**The critical detail that made this work, found investigating why the first attempt failed:** the seeded jobs
+MUST be sent as token-list prompts (pre-tokenized ids), not raw text strings. A first attempt using string prompts
+against the restored slots showed `cache_n: 0` — a full reprocess — despite the restore itself succeeding cleanly.
+Binary-searching the failure isolated it precisely: token-list extensions of a restored prefix work at ANY size
+tested (confirmed up to 18,432 new tokens, on Metal, at both `--parallel 1` and `--parallel 8`, into slot 0 and
+slot 3), but string extensions fail past a trivial length (~1-2 tokens), regardless of parallel count or slot
+number. Not yet root-caused at the code level (likely a re-tokenization/cache-comparison quirk specific to
+string-sourced prompts in the vendored server), but fully characterized and worked around: tokenize client-side,
+always send lists to a slot that was populated via restore.
 
 **Splitting an image-generation pipeline across the card and Metal — not needed, and a genuine dead end if a
 model ever didn't fit.** Every image model already benchmarked here (SDXL-Turbo, SD 1.5, Z-Image-Turbo, see the
