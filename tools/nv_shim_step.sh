@@ -1,6 +1,6 @@
 #!/bin/sh
 # nv_shim_step.sh — ONE hardware step through the CUDA shim, under the protocol in docs/HANDOFF.md §3:
-#   preflight (read-only) → gpu-lock acquire → the step, its own process, log captured → quiesce cold → release.
+#   preflight (read-only) → the step, its own process, log captured → quiesce cold. (The gpu-lock was removed 2026-09-17.)
 #
 #   sh tools/nv_shim_step.sh <A|B> opverify                      value-checked op-verify, expect 450/450
 #   sh tools/nv_shim_step.sh <A|B> bench   <model.gguf> [n=128]  llama-bench: -ngl 99 -p 256 -n <n> -r 3
@@ -22,7 +22,7 @@
 # TINYNV_CHAIN_DEPTH); the startup line that records what a run actually used is echoed back, so the report never
 # depends on what anyone remembers exporting. BIN=<dir> picks the binary set (default build/bin, the validated one);
 # the build id baked into the binary is printed BEFORE the card is touched. QUIESCE=1 quiesces cold after the step (default: idle warm);
-# DRY=1 runs on the null device with no preflight/lock/quiesce, to test this script itself.
+# DRY=1 runs on the null device with no preflight/quiesce, to test this script itself.
 # Driver test steps (gap, fault) take their binary from TREE=<worktree> (default: the main checkout) or TESTBIN=<path>.
 set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; S=$R/cuda-shim; T=${TREE:-$S}; BIN=${BIN:-$S/build/bin}; SOCK=${TINYNV_SOCKET:-${TMPDIR}tinygpu.sock}
@@ -71,13 +71,11 @@ echo "== $step  $(date '+%F %T')  binary $bin  build id $id  sdk ${sdk:-?}  log 
 case "$id" in unknown|*dirty*) echo "   WARNING: binary is not a clean build of a recent main or async-default commit"; esac
 env | grep -E '^TINYNV_' | sed 's/^/   env /' ; true
 if [ "${DRY:-0}" = 1 ]; then
-  echo "   DRY=1: null device, no preflight, no lock, no quiesce$([ "$step" = fault ] && echo '; test_hw_fault refuses to run without a socket, so this only checks the wiring')"
+  echo "   DRY=1: null device, no preflight, no quiesce$([ "$step" = fault ] && echo '; test_hw_fault refuses to run without a socket, so this only checks the wiring')"
   unset TINYNV_SOCKET
 else
   sh $R/tools/preflight.sh | tail -1 | grep -q "VERDICT: OK" || { echo "preflight ABORT — not touching the GPU"; exit 1; }
-  # the lock first (held by THIS runner's pid, refused to everyone else including this session's other runs), the server second
-  sh $R/tools/gpu-lock.sh acquire "$who" "$step $(basename "${m:-}" .gguf) $ts" "$$" || exit 1
-  sh $R/tools/tinygpu-server.sh ensure || { sh $R/tools/gpu-lock.sh release "$who" >/dev/null; exit 1; }
+  sh $R/tools/tinygpu-server.sh ensure || exit 1
   export TINYNV_SOCKET=$SOCK
 fi
 start=$(date +%s)
@@ -121,6 +119,5 @@ if [ "${DRY:-0}" != 1 ]; then
   # Default since 2026-09-14 evening: leave the firmware resident ("idle warm"). With GSP halted the AORUS box runs its fans at
   # fail-safe full speed (Antonio), and the driver resets a warm card itself on open (B). QUIESCE=1 restores the cold state.
   [ "${QUIESCE:-0}" = 1 ] && sh $R/tools/nv_quiesce.sh 2>&1 | sed 's/^/   /'
-  sh $R/tools/gpu-lock.sh release "$who" >/dev/null
 fi
 exit $rc

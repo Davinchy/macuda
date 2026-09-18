@@ -131,6 +131,5 @@ if [ -n "$s1" ]; then
 fi
 echo "-- socket / lock --"; ls -la "$TMPDIR/tinygpu.sock" "$TMPDIR/nv_usb4.lock" 2>&1 | sed 's/^/   /' | cut -c1-90
 echo "-- power --"; pmset -g 2>/dev/null | grep -E "powermode|lowpowermode" | sed 's/^/   /'
-echo "-- gpu lock --"; $R/tools/gpu-lock.sh status | sed 's/^/   /'
 [ $abort -eq 0 ] && echo "VERDICT: OK to proceed (one GPU step at a time)" || echo "VERDICT: ABORT - do not touch the GPU [$why]"
 exit $abort
