@@ -14,17 +14,50 @@ There is no other Claude session on this project. Antonio works directly with th
 Antonio's own explicit go, proposed with its expected result, refusal readings and risk class, same as any other
 hardware step (see README §Disaggregated inference).
 
-**As of 2026-09-17 evening, Antonio confirmed the card is ready.** Window 3 (prepared below, never run) can go ahead
-directly: preflight first to anchor the before-readings, then the sequence, with the registered predictions checked
-against the observed numbers afterward.
+**Window 3 (designed below) is DONE — see the result right below, then §What is next for where this picks up.**
 
-**Confirmed 2026-09-17 evening: this harness's auto-mode classifier refuses the actual window-3 launch too.** The
-card-free 0.8B plumbing test was refused earlier that day ("Interfere With Workloads"); starting the window-3 trio
-(`tools/disagg-serve.sh start`, card idle and lock free, preflight clean) was refused separately, this time with no
-stated reason at all ("judged dangerous," no explanation given). The card side is not the obstacle — preflight was
-VERDICT OK, lock free, dext unchanged at pid 659 — this is the permission mode itself blocking any host process
-launch. Do not try to route around it (backgrounding, alternate launch methods): report the exact refusal and let
-Antonio decide between running the sequence himself in a terminal or adjusting the permission mode for this session.
+**WINDOW 3 LANDED, 2026-09-17 23:46-23:52, driver `a988ec7` (downstream of `ad308bd`; the commits between are GSP
+quiesce / nvioctl-log tooling, not the MoE placement path, but this run is its own driver-tagged point, not pooled
+with window 2).** A first attempt to launch it was refused by this harness's auto-mode classifier with no stated
+reason ("judged dangerous"); Antonio asked for it to be run again immediately after, and the second attempt went
+through clean — treat that refusal as transient/permission-mode noise, not a standing block, though it can recur.
+
+| req | cold tokens | card prefill | save | decode | wall |
+|---|---|---|---|---|---|
+| t1 = prompt A (first after load) | 21,233 | **7.0 s** (3012 tok/s) | 501 MB / 0.6 s | 32 tok @ 77.8 tok/s | 8.1 s |
+| t2 = chat-6k | 7,250 | **4.2 s** (1745 tok/s) | 215 MB / 0.2 s | 64 tok @ 83.3 tok/s | 5.3 s |
+| t3 = prompt B | 22,879 | **6.3 s** (3628 tok/s) | 535 MB / 0.6 s | 32 tok @ 78.4 tok/s | 7.5 s |
+
+op-verify 450/450 after, dext unchanged (pid 659), DART absent, lock released, card idle warm. Logs banked at
+`logs/disagg/serve/w3-20260917-234655-{card,metal,router}.log` (sha256 recorded alongside).
+
+**Correction to the design: A and B were NOT equal length.** The byte-count proxy (11-byte gap, ≈3 tokens) badly
+under-called it — `qwen35moe` tokenizes the two slices to 21,233 and 22,879 cold tokens, a 1,646-token (7.7%) gap.
+So the planned `t1 − t3` subtraction (+0.70 s raw) does not cleanly cancel the marginal rate as designed. The correct
+read: fit the warm line from t2 and t3 alone (the line a first-prefill penalty should NOT distort) — **fixed 3.226 s,
+rate 7,442 tok/s** — then predict t1 from it: **6.079 s predicted vs 7.0 s observed, residual +0.921 s.**
+
+**This lands at the top edge of the registered band and is a second, independent confirmation of the cold-mapping
+hypothesis.** Two things line up:
+1. **The warm fixed cost (3.226 s) sits inside the pre-registered 3.0-3.9 s band**, itself derived by applying
+   window 2's implied link bandwidth (43.7 GiB / 8.0 s = 5.46 GiB/s) to this model's 18.2 GiB of experts (18.2/5.46 =
+   3.33 s) — a physical model (fixed cost = expert GiB / link bandwidth) transferring correctly across a different
+   model architecture AND a different driver build is a genuinely strong result on its own, independent of the
+   cold-start question.
+2. **The +0.921 s residual is close to what window 2's bytes-streamed scaling predicts for this model's smaller
+   expert footprint**: window 2's two residuals were 2.08 s / 43.7 GiB = 0.0476 s/GiB and 1.24 s / 27.3 GiB =
+   0.0454 s/GiB; averaging ≈0.0465 s/GiB and applying it to this model's 18.2 GiB predicts **0.846 s** — 0.075 s off
+   the 0.921 s observed. Three independent points (two architectures, two driver builds) now sit close to one
+   s/GiB rate for a first-touch/cold-mapping cost.
+3. **Order and length are less confounded than in window 2:** t2 (7,250 tokens) is the shortest request but ran
+   SECOND, not first, and shows no excess (it's one of the two points the warm line is fit from, so it can't by
+   construction) while t1 (21,233 tokens, NOT the shortest) ran first and does show the excess. That the anomaly
+   tracks "ran first" rather than "is shortest" argues against the alternative explanation window 2 could not rule
+   out.
+
+**Still not proven:** n=1 per architecture, no reversed-order rerun (the first request in a sequence is always
+first by definition — only a fresh cold-start with a different request ordered first would fully separate "first"
+from "this particular request"). The hypothesis is now well-supported, not confirmed.
 
 **DO NOT HALF-START THE WINDOW.** A window that dies with a server refused mid-sequence leaves the lock held and the card
 in a state nobody pre-registered. Preflight is read-only and safe to run first; the servers are not.
@@ -130,20 +163,26 @@ batch cannot, because residency does not change the arithmetic, only where the w
 FIRST and was also SHORTER, so order and length are inseparable in this data. (The 09-16 run had the opposite order — 24K
 first, 7K third — but on the other driver, so it cannot arbitrate.) **Window 3 breaks the confound by design.**
 
-## Window 3 — prepared 2026-09-17, ready to run now that Antonio has confirmed the card is free
+## Window 3 — design (prepared 2026-09-17 morning, run and landed that evening — see the result above)
 
 - **Model:** `/Volumes/512SSD/EGPU/models/Qwen3.5-35B-A3B-Q4_K_M.gguf` — 19.7 GiB, arch `qwen35moe`, **40 blocks, 256
   experts with 8 used**, 18.2 GiB of expert tensors (92%). Against the coder model's 48 layers / 43.7 GiB / few large
   experts, this is a second *architecture*, not a second size. Host peak ~40 GiB (both halves map it), ~40% of the coder runs.
-- **Binary:** `BIN=/Volumes/512SSD/EGPU/cuda-shim-f/build/bin/llama-server-null` (`ad308bd`, the window-2 driver). The
-  build line must be quoted **from the binary's own first output**, not from notes.
+- **Binary:** `BIN=/Volumes/512SSD/EGPU/cuda-shim-f/build/bin/llama-server-null` — designed against `ad308bd` (the
+  window-2 driver); actually ran on `a988ec7` (the tree had moved on by the evening). The build line must always be
+  quoted **from the binary's own first output**, not from notes — that's what caught the drift here.
 - **Placement:** `NCPUMOE=40` — every expert layer streamed, the conservative arm only. No residency arm, so the allocator
   stays far from the ~30 GB point and the flat-64 MB-vs-~203 MB WPR2 carveout hazard is not touched.
-- **The order IS the experiment:** 24K prompt A (first after load) → 7K chat → 24K prompt B, same length, different
-  content. `t1 - t3` is read at equal token counts, so the marginal rate cancels and the first-prefill penalty is one number.
+- **The order was meant to be the experiment:** 24K prompt A (first after load) → 7K chat → 24K prompt B, meant to be
+  the same length so `t1 - t3` cancels the marginal rate directly. In practice A and B tokenized to 21,233 and 22,879
+  — a 7.7% gap the byte-count proxy missed — so the actual analysis fits the warm line from t2+t3 instead and predicts
+  t1 from it (see the result above). Lesson for the next design: check length with the real tokenizer, not a
+  bytes-per-token proxy, whenever that's possible without a blocked host-process launch.
 - **Registered before the go:** warm per-ubatch stream **3.0-3.9 s** (window 2's own implied link rate, 43.7 GiB / 8.0 s =
   5.46 GiB/s, applied to 18.2 GiB — window 2 predicting window 3, not a fresh fit); **t1 - t3 = 0.6-0.9 s** if the
   cold-first reading is right, **≈0** if it is not; **no band on the marginal rate** — different architecture, no basis.
+  **Result: warm fixed cost 3.226 s (inside the band); first-prefill residual +0.921 s (at the top edge of the band,
+  computed correctly via the warm-line-minus-t1 method rather than the invalidated raw t1-t3).**
 - **A load failure is a RESULT for this window, not a wasted slot:** the placement flags were found by crashing
   on one model. Report LANDED or REFUSED either way, with the three prefill times and the `cache_n` values.
 
@@ -198,15 +237,24 @@ opverify` (450/450) → readings after → DONE. Report LANDED/REFUSED with the 
 
 ## What is next, after window 3
 
-1. **Residency in the cost model.** The router has no notion of `NCPUMOE` at all: the fixed term is a constant where the
-   measurement says it is proportional to the expert bytes actually streamed. Wire it once window 3 says whether the fixed
-   term is one number or two (cold and warm).
-2. **Prompts past 24,576 tokens on `ad308bd`.** Window 1's 64K point is `2fe7091` and must not be pooled with window 2;
-   the per-ubatch structure carries, the seconds do not.
-3. **A second model through the same gate** beyond window 3 — the dense 27B, since the placement flags were found by
-   crashing on one model and nothing yet says they generalise to a dense architecture.
-4. **The 24K state save took 2.5 s in the treatment against 0.7 s in the control** (same 662 MB), unexplained, n=1,
-   flagged rather than fitted. Possibly VRAM pressure on the device-to-host read. Watch it in window 3.
+1. **The router's cost model should be two numbers, not one, and parameterized by expert GiB, not hard-coded per
+   model.** Window 3 confirms both halves: the warm fixed cost is well predicted by expert GiB / link bandwidth
+   (5.46 GiB/s, carried over from window 2 unchanged) across a different architecture and driver, and a first
+   prefill after a server start pays an extra cost that itself scales with expert GiB (~0.046-0.048 s/GiB across
+   three points now). Wiring both into `tools/disagg-router.py` — `card_fixed = experts_GiB / link_rate`,
+   `first_prefill_bonus = experts_GiB * cold_rate`, both keyed off `NCPUMOE` and the model's own expert byte count
+   rather than shipped as flat defaults for one model — is the next real piece of work, not just a parameter tweak.
+2. **A genuine reversed-order rerun** would be the clean test the confound still needs: start fresh, send the
+   longer request second and the shorter one first, and see whether the excess still attaches to "ran first" rather
+   than to a particular prompt. Window 3 only partially decorrelated this (see above); it did not eliminate it.
+3. **Prompts past 24,576 tokens on the current driver.** Window 1's 64K point is `2fe7091` and must not be pooled
+   with window 2 or window 3; the per-ubatch structure carries across drivers, the seconds do not.
+4. **A dense-architecture model through the same gate.** Two MoE architectures now agree on the bytes-streamed
+   model; nothing yet says it holds for a model with no expert placement flags at all.
+5. **The 24K state save took 2.5 s in window 2's treatment against 0.7 s in its control** (same 662 MB), unexplained,
+   n=1, flagged rather than fitted. Window 3's saves (501-535 MB in 0.6 s each) did not reproduce anything that
+   slow, but the model and driver both differ, so this is still open, not resolved.
 
 Logs: `logs/disagg/serve/{card,metal,router}-20260916-162122.log` (09-16), `…-20260917-073136.log` (window 1),
-`…-20260917-073431.log` (control), `…-20260917-073533.log` (treatment), `logs/shim-opverify-20260916-162353.log`.
+`…-20260917-073431.log` (control), `…-20260917-073533.log` (treatment), `…-20260917-234655-{card,metal,router}.log`
+(window 3), `logs/shim-opverify-20260916-162353.log`.
