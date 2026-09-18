@@ -372,25 +372,48 @@ session against the vendored llama.cpp, not something resolvable by reading sour
 **Reverse sync is closed as a line of attack pending that investment; not pursued further without Antonio's
 explicit call to make it.**
 
-**Refinement, found while validating the batching fix: this is specifically a CARD/CUDA-shim-backend problem, not
-a general restore-then-extend limitation.** Isolated Metal-only (no card) with the identical request shape
-`card_prefill()` uses — a token-list prompt extending a restored slot — and it works perfectly at ANY size,
-including the exact 18,432-token extension that failed on the card. Same server code, same restore API, only the
-receiving backend differs. That reframes the open question from "why doesn't llama-server's restore wire into
-cache_prompt matching" (it does, generally) to the much narrower "why does THIS PROJECT'S OWN CUDA/shim backend
-specifically fail to reuse a restored KV-cache state for a substantial extension, when the stock Metal/CPU backend
-handles the identical request shape correctly." A fresh investigation is running against this narrower,
-better-targeted question, focused on this project's own ggml-cuda/shim integration rather than vendored
-llama.cpp internals (already cleared as correct and direction-agnostic).
+**RESOLVED, 2026-09-18: NOT a card/driver/shim bug at all — root cause found and confirmed directly on hardware.**
+Two things needed to be tested to close this out, and both were:
+
+1. **Is the card's own restore-then-extend actually broken?** No. Direct test with `LLAMA_SERVER_SLOTS_DEBUG=1`
+   on the card: prefill a clean prompt on Metal, save, restore onto the card, then extend on the card by 17, 300,
+   1,000, 5,000, 12,000, and 18,432 tokens (token-list, restoring fresh each time) — **every single size hit
+   cleanly** (`cache_n` matching the restored length exactly, prefill speed a normal ~987-994 tok/s). The card's
+   restore-then-extend mechanism, its CUDA/shim backend, and its MoE-placement machinery are all working
+   correctly. There is no hardware, driver, or shim performance issue here, on the card or in conjunction with
+   Metal — the underlying compute is exactly as fast as every other measurement this session.
+2. **So why did the original test fail?** Reproduced the exact failure shape directly: prefill 2,912 tokens on
+   Metal, **decode 32 real tokens** (so Metal's actual cache is 2,943 tokens — the tracked prompt plus the
+   model's own generated continuation, exactly like the original run), save, restore onto the card, then query
+   with the REAL next 18,432 tokens of actual content (which do not match whatever Metal happened to generate in
+   that decode). **Confirmed: `cache_n: 0`, full reprocess.** The restored state's untracked decoded tail didn't
+   match the new request at that position, and llama-server's cache-prefix check does not gracefully trim to the
+   last good match — it misses entirely and reprocesses the whole restored prefix, not just the mismatched part.
+   This is a real llama-server robustness gap, not a defect in this project's code, and it only bites when a
+   restored state's real content (including whatever got decoded) diverges from what the next request actually
+   contains — which the original benchmark's static, pre-written checkpoint files did by construction (they don't
+   contain what the model actually generated), but which a REAL chat client largely avoids by construction too
+   (it resends the model's own real reply as history, so the "untracked tail" usually matches anyway).
+
+`sync_metal_to_card()` and `card_prefill()` now detect this condition (compare the post-sync `cache_n` against
+what a clean hit should have been) and log it plainly instead of silently eating a slower-than-predicted prefill.
+
+**Bonus, answering Antonio's question directly: restore-then-extend also works ENTIRELY on the card, no Metal
+involved.** Same-process, two-slot test (`--parallel 2` on the card alone): prefilled 11,461 tokens into slot 0,
+saved, restored into slot 1 (same physical card, same process), then queried slot 1 with a real 17-token job
+extension — clean hit, `cache_n: 11461`, `prompt_n: 17`, wall 0.5 s. **The parallel-batching win already confirmed
+with Metal (4.1x) is available card-only too**, for any workflow that wants pure-GPU batch processing without
+routing through Metal at all.
 
 **Item 1's actual conclusion, taking it to its end:** honest cost-model routing (no reverse sync) correctly
-degrades to "always Metal" for a naturally-incremental chat session, which is the right behavior given the card
-can't cheaply resync — this is not a bug to keep chasing, it's the true shape of the constraint. The old
-`THRESH=512` behavior (always touch the card) remains available at its known 1.9x cost when a session is
-expected to have large enough turns to justify it. The genuinely promising path that came out of the parallel
-strategy work — seeding a shared system-prompt prefix once and broadcasting it to multiple `--parallel` slots for
-batch serving — uses ONLY the already-proven transfer direction (something prefills, something else restores)
-and does not depend on the broken reverse-sync mechanism at all; see the batching section below.
+degrades to "always Metal" for a naturally-incremental chat session with a real client, because the sync-then-
+extend mechanism works fine but the ROUTER's own bookkeeping only tracks the prompt tokens it sent, not what got
+decoded — so the router can't always predict in advance whether a sync will hit cleanly. Reverse sync is
+technically sound and confirmed working; it just isn't the router's default path today because the router doesn't
+yet account for the (usually harmless, occasionally not) decoded-tail gap in its own cost model. Wiring reverse
+sync into the router's actual routing decision (not just as a hand-tested mechanism) is a real next step, not
+research — see "What is next" below. The old `THRESH=512` behavior (always touch the card) remains available at
+its known 1.9x cost when a session is expected to have large enough turns to justify it regardless.
 
 ## Batching, image, and video pipeline strategies, 2026-09-18
 
@@ -493,6 +516,14 @@ parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever
 6. **Revisit the 512-token cap for incremental chat traffic**, per the 2026-09-18 benchmark above — either raise
    it toward the measured breakeven or let `--threshold 0` (pure cost-model routing) handle steady-state chat
    growth, reserving a cap for the single-giant-cold-paste case it actually protects against. Antonio's call.
+7. **Wire reverse sync into the router's actual routing decision.** It's confirmed working (2026-09-18), not just
+   hand-tested — the remaining work is making the ROUTER track enough of Metal's real state (specifically:
+   capture the actual decoded token ids via `return_tokens` on relayed requests, not just the sent prompt) so it
+   can predict whether a sync will hit cleanly, rather than only detecting a miss after paying for it.
+8. **Promote the parallel-slot batching win into reusable tooling.** Confirmed 4.1x on real hardware (both
+   Metal-hosted and card-only), but it landed as a standalone validation script, not `disagg-serve.sh`/the
+   router. Needs: a `--parallel` knob, a "seed these slots with this shared prefix" command, and the
+   token-list-only rule enforced (never relay a raw string to a slot that was populated via restore).
 
 Logs: `logs/disagg/serve/{card,metal,router}-20260916-162122.log` (09-16), `…-20260917-073136.log` (window 1),
 `…-20260917-073431.log` (control), `…-20260917-073533.log` (treatment), `…-20260917-234655-{card,metal,router}.log`

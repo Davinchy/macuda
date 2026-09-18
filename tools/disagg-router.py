@@ -39,7 +39,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ARGS = None
 LOCK = threading.Lock()            # one request at a time: one slot on each server
-STATE = {"metal_tokens": [], "card_tokens": [], "card_obs": [], "metal_obs": []}   # each side's own slot contents as last sent; observed (tokens, seconds) per side
+STATE = {"metal_tokens": [], "card_tokens": [], "card_obs": [], "metal_obs": [], "card_synced_len": 0}
+# each side's own slot contents as last sent; observed (tokens, seconds) per side; card_synced_len is what a cache
+# hit should be after the last sync_metal_to_card(), to detect a mismatched-tail miss (see its docstring)
 
 
 def log(msg):
@@ -99,7 +101,18 @@ def sync_metal_to_card():
     save/restore format is symmetric (same code compiled into both binaries, confirmed by reading
     llama-kv-cache.cpp/llama-memory-hybrid.cpp 2026-09-18 - card->metal already relies on this working one way),
     so after this the card recognizes the same shared prefix Metal does and only prefills the true delta, instead
-    of redoing the whole conversation (the 09-18 finding: a stale card redid 21,343 tokens for a 6,573-token ask)."""
+    of redoing the whole conversation (the 09-18 finding: a stale card redid 21,343 tokens for a 6,573-token ask).
+
+    Real risk, confirmed 2026-09-18, not hypothetical: Metal's actual cache is usually LONGER than the prompt
+    tokens tracked in STATE["metal_tokens"], because decoding a reply extends it too, and the identity of those
+    extra tokens isn't known here. In ordinary use this is harmless - a real client resends the model's own
+    reply as history, so the untracked tail matches whatever comes next anyway. But if it does NOT match (proven
+    directly: restore a state with an untracked decoded tail, then query with real content that diverges from
+    that tail), llama-server's cache-prefix check does not gracefully trim to the last good match - it reports
+    cache_n: 0 and reprocesses the ENTIRE restored prefix from scratch, not just the tokens past the mismatch.
+    This is a real llama-server robustness gap (confirmed on Metal, not a card-specific thing - see
+    docs/disagg-inference-state.md), not this project's bug to fix, but card_prefill() below checks for it so a
+    production run reports a much-slower-than-predicted prefill honestly instead of silently eating the cost."""
     name = "router-sync-" + hashlib.sha1(json.dumps(STATE["metal_tokens"]).encode()).hexdigest()[:16] + ".bin"
     t0 = time.perf_counter()
     s = post_json(ARGS.metal, f"/slots/{ARGS.slot}?action=save", {"filename": name}); t1 = time.perf_counter()
@@ -109,14 +122,11 @@ def sync_metal_to_card():
         except OSError: pass
     log(f"sync: metal->card {s.get('n_saved')} tok {s.get('n_written', 0)/1e6:.0f} MB, save {t1-t0:.1f} s, restore {t2-t1:.1f} s")
     if r.get("n_restored") != s.get("n_saved"):
-        # a length check against the round trip itself, not against STATE["metal_tokens"]: Metal's real cache is
-        # usually LONGER than the prompt tokens the router tracked, because decoding a reply extends it too - found
-        # 2026-09-18 (2,943 saved for a 2,912-token tracked prompt, the 31-token gap being the last reply's own
-        # decode). That's normal, not a fault; only a save/restore round trip that doesn't preserve its own count is.
+        # a length check against the round trip itself, not against STATE["metal_tokens"]: the save/restore round
+        # trip not preserving its own count is the actual fault condition (an untracked decoded tail is not).
         raise RuntimeError(f"card restore returned {r.get('n_restored')} tokens, save reported {s.get('n_saved')}")
-    STATE["card_tokens"] = list(STATE["metal_tokens"])   # the known prefix; any extra decoded tail on the card is
-    # untracked (its identity isn't known here) but harmless - cache_prompt matching on the next request will
-    # simply find the mismatch and stop at the same point this tracks
+    STATE["card_tokens"] = list(STATE["metal_tokens"])
+    STATE["card_synced_len"] = len(STATE["metal_tokens"])   # what a hit SHOULD look like; card_prefill checks this
 
 
 def card_prefill(ids, sync_needed):
@@ -129,6 +139,13 @@ def card_prefill(ids, sync_needed):
     t0 = time.perf_counter()
     r = post_json(ARGS.card, "/completion", {"prompt": head, "n_predict": 1, "temperature": 0, "cache_prompt": True, "id_slot": ARGS.slot, "return_tokens": False})
     t = r.get("timings", {}); t1 = time.perf_counter()
+    if sync_needed and t.get("cache_n", 0) < STATE.get("card_synced_len", 0):
+        # the sync's restored tail didn't match this request's real content at that position - llama-server's
+        # cache check doesn't trim to the last good match, it misses entirely (confirmed 2026-09-18, not this
+        # project's bug: see the sync_metal_to_card() docstring). Costs a full reprocess instead of the predicted
+        # delta; surfaced here so that shows up as a clear log line instead of a silent, unexplained slow prefill.
+        log(f"sync mismatch: expected a >= {STATE.get('card_synced_len', 0)}-token cache hit after sync, got "
+            f"cache_n={t.get('cache_n', 0)} - the restored tail didn't match this request, full reprocess paid")
     s = post_json(ARGS.card, f"/slots/{ARGS.slot}?action=save", {"filename": name}); t2 = time.perf_counter()
     m = post_json(ARGS.metal, f"/slots/{ARGS.slot}?action=restore", {"filename": name}); t3 = time.perf_counter()
     if ARGS.state_dir:
