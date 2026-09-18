@@ -235,6 +235,30 @@ Once he gives the go, as separate foreground commands: readings before (anchored
 OK) → `THRESH=512 sh tools/disagg-serve.sh start` → the requests → `stop` → `sh tools/nv_shim_step.sh V1
 opverify` (450/450) → readings after → DONE. Report LANDED/REFUSED with the cache_n values and the card prefill times.
 
+## Context-size scaling benchmark, 2026-09-18 — the 512-token cap costs real time on incremental chat
+
+A synthetic 13-turn pair-programming chat (`tools/gen-coding-chat.py`, deterministic, reproducible) was sent
+turn by turn through the disaggregated router (Qwen3-Coder-Next-UD-Q4_K_XL, driver `a988ec7`, `THRESH=512`) and,
+separately, the identical 9 checkpoints straight to a bare Metal server (no card, no lock) — a real head-to-head,
+not a model prediction. Context grew from 728 to 25,173 tokens.
+
+**Finding: across the 9 turns the card leg spent 72.0 s total on prefill against 37.9 s if every turn's new
+tokens had gone to Metal instead — 1.9x slower overall.** The forced-card cap only won outright on the one turn
+whose own cold delta (6,573 tokens) sat near the router's measured breakeven (~6,197 cold tokens on this driver);
+every other turn's delta was small enough that Metal alone was faster, in one case by 8.4x (729 cold tokens: 1.0 s
+on Metal, 8.4 s forced onto the card, almost entirely the fixed per-ubatch expert-stream cost). The 512 cap exists
+for a specific, real reason — keeping Metal off long sustained prefills after the 2026-09-16 re-enumerations — but
+every Metal prefill measured here, including the largest single turn, finished in 10.6 s, far under the 35-54 s
+band those incidents were tied to. That makes the cap plausibly over-conservative specifically for incremental
+chat traffic (a single giant cold paste is the different case it still protects against). Loosening it toward the
+cost model's own threshold is a real candidate, but it's Antonio's call, not made here.
+
+Full write-up, chart and per-turn table published to the "Shim vs Silicon" report:
+https://claude.ai/artifact/3FjoCozBg6ojVDMRLkfuV2 (§Disaggregated inference). Logs banked at
+`logs/disagg/serve/ctxbench-20260918-001204-{card,metal,router}.log` (card leg, sha256-hashed) and
+`logs/disagg/bench/metalonly/metal.log` (Metal-only leg); checkpoint prompts at `logs/disagg/bench/ctx-*.txt`
+(gitignored, regenerate with `python3 tools/gen-coding-chat.py`).
+
 ## What is next, after window 3
 
 1. **The router's cost model should be two numbers, not one, and parameterized by expert GiB, not hard-coded per
@@ -254,6 +278,9 @@ opverify` (450/450) → readings after → DONE. Report LANDED/REFUSED with the 
 5. **The 24K state save took 2.5 s in window 2's treatment against 0.7 s in its control** (same 662 MB), unexplained,
    n=1, flagged rather than fitted. Window 3's saves (501-535 MB in 0.6 s each) did not reproduce anything that
    slow, but the model and driver both differ, so this is still open, not resolved.
+6. **Revisit the 512-token cap for incremental chat traffic**, per the 2026-09-18 benchmark above — either raise
+   it toward the measured breakeven or let `--threshold 0` (pure cost-model routing) handle steady-state chat
+   growth, reserving a cap for the single-giant-cold-paste case it actually protects against. Antonio's call.
 
 Logs: `logs/disagg/serve/{card,metal,router}-20260916-162122.log` (09-16), `…-20260917-073136.log` (window 1),
 `…-20260917-073431.log` (control), `…-20260917-073533.log` (treatment), `…-20260917-234655-{card,metal,router}.log`
