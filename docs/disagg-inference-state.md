@@ -1,6 +1,6 @@
-# Disaggregated inference — state and handoff (session V1, 2026-09-17 08:5x)
+# Disaggregated inference — state and handoff (2026-09-17)
 
-**WHERE A FRESH V1 STARTS is the entry point; it carries the one decision this lane is waiting on.**
+**WHERE A FRESH START BEGINS is the entry point.**
 
 Prefill on the RTX 5090 through the shim, decode on the Mac's GPU, for a model that fits unified memory but not VRAM.
 Everything below is in this tree (`tools/disagg-*.{sh,py}`, README §Disaggregated inference). The numbers are from the
@@ -8,23 +8,26 @@ real card on this M4 Max (128 GB) on Apple's 140 W charger, Qwen3-Coder-Next-UD-
 tensors). **Every card number below is tagged with the driver build that produced it, because the driver moved twice and
 the 09-16 numbers are not comparable with the 09-17 ones.**
 
-## WHERE A FRESH V1 STARTS — 2026-09-17 08:5x. **READ THIS SECTION FIRST.**
+## WHERE A FRESH START BEGINS — 2026-09-17. **READ THIS SECTION FIRST.**
 
-**THE CARD IS UNTOUCHED BY ME: lock free, no processes of mine, nothing started.** Window 3 was prepared, granted and
-NOT RUN, and that is a decision waiting rather than a failure.
+There is no other Claude session on this project. Antonio works directly with this assistant; a card step needs
+Antonio's own explicit go, proposed with its expected result, refusal readings and risk class, same as any other
+hardware step (see README §Disaggregated inference).
 
-**THE ONE DECISION OWED, AND IT IS ANTONIO'S, NOT A's AND NOT A FRESH V1's.** A gave window 3 the card lane at 08:47
-(run 87 closed, all three invocations read). The window was not started because **this session's permission mode refused
-to launch host processes** — the card-FREE 0.8B plumbing test was denied by the auto-mode classifier as interfering with
-workloads, and a card window is three server launches plus the lock. **A's GO is scheduling authority over the lane; it
-is not the user's permission to launch processes, and A has confirmed in writing that it must not be treated as one.**
-A is **holding the lane open** (falcon rung 3 needs its own pre-registration, PM is a wiring task before it is a run, so
-waiting costs nothing) and asks to be told which of three outcomes it is: V1 runs it under Antonio's approval, Antonio
-runs the sequence himself, or **the lane goes back to A — in which case say so, because A will keep it closed rather
-than fill it.**
+**As of 2026-09-17 evening, Antonio confirmed the card is ready.** Window 3 (prepared below, never run) can go ahead
+directly: preflight first to anchor the before-readings, then the sequence, with the registered predictions checked
+against the observed numbers afterward.
+
+**Confirmed 2026-09-17 evening: this harness's auto-mode classifier refuses the actual window-3 launch too.** The
+card-free 0.8B plumbing test was refused earlier that day ("Interfere With Workloads"); starting the window-3 trio
+(`tools/disagg-serve.sh start`, card idle and lock free, preflight clean) was refused separately, this time with no
+stated reason at all ("judged dangerous," no explanation given). The card side is not the obstacle — preflight was
+VERDICT OK, lock free, dext unchanged at pid 659 — this is the permission mode itself blocking any host process
+launch. Do not try to route around it (backgrounding, alternate launch methods): report the exact refusal and let
+Antonio decide between running the sequence himself in a terminal or adjusting the permission mode for this session.
 
 **DO NOT HALF-START THE WINDOW.** A window that dies with a server refused mid-sequence leaves the lock held and the card
-in a state nobody pre-registered. Handing the lane back is cheap; recovering from that is not.
+in a state nobody pre-registered. Preflight is read-only and safe to run first; the servers are not.
 
 **THE SEQUENCE, seven foreground commands, no script** (staged scripts are checked with `sh -n` and never run):
 
@@ -45,18 +48,25 @@ one ubatch with ~14% margin under the 24,576 ceiling in case `qwen35moe` tokeniz
 The middle request is the existing `logs/disagg/chat-6k.txt`. **If this tree is ever cloned elsewhere, the prompts must be
 rebuilt** — the recipe is two 75,000-byte line-aligned slices of `logs/disagg/prompt-64k.txt` at offsets 0 and 140,000.
 
+**A and B's own length gap** (card-free check, 2026-09-17, arithmetic only — not the real tokenizer): the files are
+75,151 B and 75,162 B, an 11-byte difference, ≈3 tokens at the measured 3.534 bytes/token. That is well inside the
+~50-token tolerance the sequence calls for, so trimming looks unnecessary — but this is a byte-count proxy, not
+`qwen35moe`'s actual tokenization, which the sequence's own tokenize-through-the-router step (Metal-side, no card
+work) still needs to confirm at go time, since that step itself starts a host process this session's permission mode
+also refuses.
+
 **THE REGISTERED PREDICTIONS STAND AS WRITTEN — do not re-derive them, and do not widen them after seeing a number:**
 warm per-ubatch stream **3.0-3.9 s**, **t1 - t3 = 0.6-0.9 s** if the residual is a cold first touch and **≈0** if it is
-not, **no band on the marginal rate**. A has said it is not touching them.
+not, **no band on the marginal rate**. Nobody is touching them before the run.
 
-**BANKING MEANS COPYING THE ARTIFACT, NOT WRITING THE PROSE** (A's rule, earned on run 87 an hour before: two
+**BANKING MEANS COPYING THE ARTIFACT, NOT WRITING THE PROSE** (earned on run 87 an hour before: two
 invocations shared one output directory and the second replaced the first's daemon log by design, so the prose survived
 while the file behind the citation became a different run's output under the same name). In this tooling the three serve
 logs are timestamped and safe, but **`logs/disagg/serve/router.port` and `router.log.path` are rewritten by every start,
 and the slot state files are overwritten by the next prefill with the same slot id**. So the moment the window ends:
 copy the three logs to `logs/disagg/serve/w3-<ts>-{card,metal,router}.log`, sha256 each copy, and **cite the copies**.
 
-**BEFORE-READINGS TO ANCHOR AGAINST** (A's 08:31 measurement, confirmed by A again at 08:5x; re-read them yourself at go
+**BEFORE-READINGS TO ANCHOR AGAINST** (measured at 08:31, confirmed again at 08:5x; re-read them yourself at go
 time rather than quoting these): preflight VERDICT OK, **DART absent with NO snapshot** (cleared 08:35 after the reboot
 re-enumerated the nub; both pre-reboot records preserved in ROOT `logs/`), **dext 1 instance, pid 659, started
 07:41:33**, lock free. Report LANDED or REFUSED either way, with the three prefill times, the `cache_n` values and the
@@ -70,7 +80,7 @@ THE OPEN QUESTION.
 
 ## The runs, by driver
 
-**`2fe7091` (2026-09-16 16:21-16:24, A: LANDED, op-verify 450/450 after, dext 15→15, DART absent).** The trio
+**`2fe7091` (2026-09-16 16:21-16:24, LANDED, op-verify 450/450 after, dext 15→15, DART absent).** The trio
 (`tools/disagg-serve.sh start`, threshold 512) served three requests through the router:
 
 | request | route | card prefill | Metal saw | decode | wall |
@@ -120,16 +130,13 @@ batch cannot, because residency does not change the arithmetic, only where the w
 FIRST and was also SHORTER, so order and length are inseparable in this data. (The 09-16 run had the opposite order — 24K
 first, 7K third — but on the other driver, so it cannot arbitrate.) **Window 3 breaks the confound by design.**
 
-## Window 3 — queued with A on 2026-09-17 08:42, position AFTER run 87
-
-A's answer: yes in principle, **do not take the lock**; the window comes when run 87's three invocations close, or A says
-the card stays on the driver work. If 87 wedges the card the box needs a reboot and window 3 moves behind it.
+## Window 3 — prepared 2026-09-17, ready to run now that Antonio has confirmed the card is free
 
 - **Model:** `/Volumes/512SSD/EGPU/models/Qwen3.5-35B-A3B-Q4_K_M.gguf` — 19.7 GiB, arch `qwen35moe`, **40 blocks, 256
   experts with 8 used**, 18.2 GiB of expert tensors (92%). Against the coder model's 48 layers / 43.7 GiB / few large
   experts, this is a second *architecture*, not a second size. Host peak ~40 GiB (both halves map it), ~40% of the coder runs.
 - **Binary:** `BIN=/Volumes/512SSD/EGPU/cuda-shim-f/build/bin/llama-server-null` (`ad308bd`, the window-2 driver). The
-  build line is quoted **from the binary's own first output**, not from notes (A's condition).
+  build line must be quoted **from the binary's own first output**, not from notes.
 - **Placement:** `NCPUMOE=40` — every expert layer streamed, the conservative arm only. No residency arm, so the allocator
   stays far from the ~30 GB point and the flat-64 MB-vs-~203 MB WPR2 carveout hazard is not touched.
 - **The order IS the experiment:** 24K prompt A (first after load) → 7K chat → 24K prompt B, same length, different
@@ -137,7 +144,7 @@ the card stays on the driver work. If 87 wedges the card the box needs a reboot 
 - **Registered before the go:** warm per-ubatch stream **3.0-3.9 s** (window 2's own implied link rate, 43.7 GiB / 8.0 s =
   5.46 GiB/s, applied to 18.2 GiB — window 2 predicting window 3, not a fresh fit); **t1 - t3 = 0.6-0.9 s** if the
   cold-first reading is right, **≈0** if it is not; **no band on the marginal rate** — different architecture, no basis.
-- **A load failure is a RESULT for this window, not a wasted slot** (A's words): the placement flags were found by crashing
+- **A load failure is a RESULT for this window, not a wasted slot:** the placement flags were found by crashing
   on one model. Report LANDED or REFUSED either way, with the three prefill times and the `cache_n` values.
 
 ## What changed in the router today (card-free, 2026-09-17 08:4x)
@@ -159,26 +166,35 @@ the card stays on the driver work. If 87 wedges the card the box needs a reboot 
 host processes and this session's permission mode refused to launch them. The changed code paths were exercised in process
 instead (above) and `--selftest` is OK, but the end-to-end plumbing has not been re-checked since the change.
 
+4. **`fit_line()`'s refit-robustness is now a persisted test, not a one-off:** `tools/disagg-router-fit-test.py` (pure
+   Python, no host process, no card — imports the router module and calls `fit_line` directly) pins the five properties
+   this section claimed as "verified in process": two points don't fit, three consistent points do, three points on a
+   different line are tracked on their own terms, one absurd point among three is rejected, and a multi-ubatch prompt
+   still recovers the per-ubatch fixed cost rather than a flat one. All five PASS as of `35c3aed`+1. Card-free session on
+   2026-09-17 (still using the card at the time) also re-hit the same plumbing-test refusal above under a fresh session
+   name (`egpu-mac-nvidia-fc`) — confirms it is a permission-mode property, not a one-time fluke of the earlier session.
+
 ## The rules the runs obeyed, and why
 
-- **Card protocol**: the tenant takes the shared lock as V1 (`. ./env.sh` first), through preflight and the TinyGPU
-  server, and holds it while the card server is up; `stop` releases it, card idle warm. **A schedules every slot.**
-- **512-token cap on Metal prefills in a card window** (A's condition): the eGPU tunnel dropped twice on 09-16 under full
+- **Card protocol**: the tenant takes the shared lock (`. ./env.sh` first), through preflight and the TinyGPU
+  server, and holds it while the card server is up; `stop` releases it, card idle warm. **Antonio approves every
+  slot** — there is no other Claude session to schedule around.
+- **512-token cap on Metal prefills in a card window**: the eGPU tunnel dropped twice on 09-16 under full
   Metal prefills while the laptop drew power through the enclosure's USB-C PD; on Apple's charger it has held, but n is
   small. With the router's threshold at 512, Metal only ever sees short prompts and cache-hit decodes.
 - **Card-free is not host-free**: the Metal half maps the whole model; any job over ~20 GB of host or Apple-GPU memory
-  needs A's word while anyone holds the card. Small-model plumbing tests (the 0.8B at
+  needs Antonio's word while anyone holds the card. Small-model plumbing tests (the 0.8B at
   `~/.lmstudio/models/omnirecipes/qwen35-0.8b-GGUF/Qwen3.5-0.8B-Q8_0.gguf`, null device as the card) are allowed at will.
 - **`sh -n` only**: never source or run a staged script to see what it prints. One unauthorized run came from that.
 - **After the 09-17 reboot the clean card state changed**: DART absent **with no snapshot**, dext **1 instance, pid 659,
-  started 07:41:33** (A cleared both records at 08:35, after copying them to ROOT `logs/`). Anchor before-readings there.
+  started 07:41:33** (cleared at 08:35, after copying both records to ROOT `logs/`). Anchor before-readings there.
 
 ## The slot shape that works (reuse it verbatim)
 
-Message A with: step, binary + build id, model, duration, expected result, refusal readings, risk class. Then on OPEN-V1,
-as separate foreground commands: readings before (anchored dext count, DART line, preflight OK) → `THRESH=512 sh
-tools/disagg-serve.sh start` → the requests → `stop` → `sh tools/nv_shim_step.sh V1 opverify` (450/450) → readings after →
-DONE. Report LANDED/REFUSED with the cache_n values and the card prefill times.
+State to Antonio directly: step, binary + build id, model, duration, expected result, refusal readings, risk class.
+Once he gives the go, as separate foreground commands: readings before (anchored dext count, DART line, preflight
+OK) → `THRESH=512 sh tools/disagg-serve.sh start` → the requests → `stop` → `sh tools/nv_shim_step.sh V1
+opverify` (450/450) → readings after → DONE. Report LANDED/REFUSED with the cache_n values and the card prefill times.
 
 ## What is next, after window 3
 
