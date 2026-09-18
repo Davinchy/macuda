@@ -21,19 +21,26 @@ with NVIDIA's own structure definitions from `open-gpu-kernel-modules` pinned to
 
 | workload | this shim | native | notes |
 |---|---|---|---|
-| Qwen3.8-27B Q4_K_M, tg128 | **65.3 tok/s** | 75.3 | dense decode, launch-bound for what remains |
+| Qwen3.8-27B Q4_K_M, tg128 | **67.8 tok/s** | 75.3 | dense decode, launch-bound for what remains |
 | Qwen3.8-27B Q4_K_M, pp256 | ~2550 tok/s | 2447 | prefill at parity (the SASS is identical) |
 | Qwen3.8-27B + its MTP draft head, greedy | **124 tok/s** first request, 112 mean over a 62-minute soak | 124.7 | `llama-server`, `--spec-type draft-mtp` |
 | `llama-server`, 8 slots, 27B + MTP, temp 0.6 | **~207 tok/s aggregate** | — | 20-minute soaks at eight slots: 440 requests, 0 errors |
-| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **134.3 tok/s** | 245.0 | ~2000 launches a token; the purest launch-bound case |
+| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **162.6 tok/s** | 245.0 | ~2000 launches a token; the purest launch-bound case |
 | SDXL-Turbo, 4 steps, 512², cfg 1.0 | **2.72 s** | 4.11 s | stable-diffusion.cpp |
 | SD 1.5 (fp32), 20 steps, 512² | **3.72 s** | 3.86 s | |
-| Z-Image-Turbo, 8 steps, 1024² | 10.16 s | 9.46 s | Q8 DiT + Qwen3-4B encoder + FLUX VAE |
+| Z-Image-Turbo, 8 steps, 1024² | **9.67 s** | 9.46 s | Q8 DiT + Qwen3-4B encoder + FLUX VAE |
 
 Every number above was taken with the standard gate: a clean driver build whose build id is verified in each binary, `test-backend-ops`
 value-checked 450/450 at three chain depths, both decodes at the driver defaults, and a 96-token greedy text byte-compared against a
 reference file. Per-launch host cost is ~1.3 µs at chain depth 128 (the vendor's is ~1). Decode numbers move a few percent with host
 load; MoE numbers move more (see `docs/03-cuda-shim-plan.md` and the log excerpts in `docs/bench/`).
+
+**Re-verified 2026-09-18** against `main`'s tip (`a988ec7`) via `tools/wtgate.sh` (dense/MoE tg128) and three repeats of the standard
+`sd` step (Z-Image, 9.66/9.68/9.68 s): the three previously-published numbers above (65.3, 134.3, 10.16 s) had all gone stale relative
+to what the gated build actually does — MoE tg128 in particular is genuinely ~163 tok/s now (confirmed by a second, independent build),
+not 134.3, closing a meaningful chunk of what looked like a driver deficiency; Z-Image's number was also traced to having been captured
+on a pre-gate build, and a separate later reading of 16-17 s came from an uncommitted, dirty tree — neither is what `main` does. Always
+check `strings <binary> | grep -c '^<expected-id>$'` before trusting any number pulled from an old log.
 
 ## What you need
 
@@ -196,7 +203,7 @@ models/  logs/                not committed; see models/README.md
 
 ## Known limits and hazards
 
-- **MoE decode is at ~55% of native** and dense decode at ~87%: what remains is per-launch cost (~1.3 µs vs ~1) and a copy-engine ↔
+- **MoE decode is at ~66% of native** and dense decode at ~90%: what remains is per-launch cost (~1.3 µs vs ~1) and a copy-engine ↔
   compute-engine runlist switch at each token boundary (~0.35 ms a token on this enclosure), measured and documented in the design
   docs. Fewer launches and bytes per token is the next lever, not the link.
 - **Latent, untested by design:** the driver reserves a flat 64 MB at the top of VRAM for the firmware, but the firmware's
