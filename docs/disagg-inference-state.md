@@ -4,8 +4,11 @@
 
 Prefill on the RTX 5090 through the shim, decode on the Mac's GPU, for a model that fits unified memory but not VRAM.
 Everything below is in this tree (`tools/disagg-*.{sh,py}`, README §Disaggregated inference). The numbers are from the
-real card on this M4 Max (128 GB) on Apple's 140 W charger, Qwen3-Coder-Next-UD-Q4_K_XL (49.6 GB, 43.7 GiB of it expert
-tensors). **Every card number below is tagged with the driver build that produced it, because the driver moved twice and
+real card on this M4 Max (128 GB) on Apple's 140 W charger, Qwen3-Coder-Next-UD-Q4_K_XL (49.6 GB; arch `qwen3next`,
+48 blocks with a full-attention layer every 4th block — 12 full GQA-attention + 36 Gated-DeltaNet linear/SSM — 512
+experts with **10 active per token**, one shared expert, 43.50 GiB/46.7 GB of expert tensors — read directly from
+the GGUF 2026-09-18; usable card VRAM is ~31.8 GiB, so full expert residency is arithmetically impossible for this
+model). **Every card number below is tagged with the driver build that produced it, because the driver moved twice and
 the 09-16 numbers are not comparable with the 09-17 ones.**
 
 ## WHERE A FRESH START BEGINS — 2026-09-17. **READ THIS SECTION FIRST.**
@@ -253,11 +256,90 @@ band those incidents were tied to. That makes the cap plausibly over-conservativ
 chat traffic (a single giant cold paste is the different case it still protects against). Loosening it toward the
 cost model's own threshold is a real candidate, but it's Antonio's call, not made here.
 
+**Why the fixed cost didn't scale down for small turns (mechanism, confirmed 2026-09-18):** with 512 experts and
+10 active per token, `(1 - 10/512)^N` says essentially all 512 experts have been touched by ~250-300 tokens into
+any batch. Every turn in this benchmark (729-6,573 cold tokens) was already well past that point, so every one of
+them needed close to the full 43.5 GiB expert stream regardless of size — the fixed cost isn't a tuning gap, it's
+structural MoE saturation, and no amount of threshold or residency tuning changes that for a single request. This
+also means expert-hotness/LRU caching (an idea considered and set aside — see the 2026-09-18 strategy review)
+would not help prefill for this reason; upstream `llama.cpp` work (issue #20757, PR #27861) reaches the same
+conclusion independently: such caching serves decode, not prefill.
+
 Full write-up, chart and per-turn table published to the "Shim vs Silicon" report:
 https://claude.ai/artifact/3FjoCozBg6ojVDMRLkfuV2 (§Disaggregated inference). Logs banked at
 `logs/disagg/serve/ctxbench-20260918-001204-{card,metal,router}.log` (card leg, sha256-hashed) and
 `logs/disagg/bench/metalonly/metal.log` (Metal-only leg); checkpoint prompts at `logs/disagg/bench/ctx-*.txt`
 (gitignored, regenerate with `python3 tools/gen-coding-chat.py`).
+
+## Router bug found and fixed testing item 1, 2026-09-18: card cache staleness was invisible to the cost model
+
+Testing `THRESH=0` (item 1 of the strategy review below) on the real 9-turn benchmark surfaced a real bug, not
+just confirmed the projection. `predict()`/`decide()` used ONE `cold` count (tokens new since Metal's cache) for
+BOTH sides' cost estimates, but the card has its OWN independent slot cache (`cache_prompt` against
+`id_slot=ARGS.slot`) that only stays in sync if the card is used every turn. When cost-model routing correctly
+skipped the card for six small turns in a row, the card's cache fell six turns behind Metal's; the router then
+predicted turn 7 (6,573 tokens new-to-Metal) would cost the card 9.5s, chose card, and it actually cost **15.3s
+for a 21,343-token prefill — the ENTIRE conversation so far**, because the card's slot had nothing cached and had
+to redo everything since ITS last use, not just what was new to Metal.
+
+**Fixed:** `tools/disagg-router.py` now tracks `STATE["card_tokens"]` separately from `STATE["metal_tokens"]` and
+computes `cold_card` (new since the card's own last use) independently from `cold_metal` (new since Metal's).
+`predict()`/`decide()` take both; the card's predicted cost now uses its real cold count. Verified against the
+exact real observation as a permanent selftest case (`decide(6573, 21344, ...)` now correctly returns metal; the
+same request with a synced card, `decide(6573, 6573, ...)`, still correctly returns card).
+
+**Re-ran the 9-turn benchmark with the fix: the router now routes ALL 9 turns to Metal**, total wall 43.7s,
+matching the pure-Metal baseline (43.3s) almost exactly. This is the deeper finding: **once the cost model is
+honest about staleness, smart per-turn routing for a naturally-growing incremental chat degenerates to "always
+Metal," because touching the card at any point requires reprocessing the entire conversation so far, and that
+cost only grows as the conversation does.** The card's real, proven win (window 1, the original 23,692-token
+cold-start result) is specifically for a large FIRST prefill on a fresh context, not for occasional touches
+during an otherwise-incremental session. Getting real card benefit during incremental chat would need either (a)
+paying to keep the card synced every turn regardless of that turn's own economics (this is what the old
+`THRESH=512` behavior did, at the 1.9x cost already measured), or (b) some other means of amortizing the
+catch-up — an open question, not solved here.
+
+## Card re-enumeration during testing, 2026-09-18 01:20:58 — cleared, did not recur on an identical repeat
+
+During the first `THRESH=0` validation run (before the router fix, all 9 turns still correctly routed to Metal),
+preflight next came back `ABORT — a new dext instance since the record` (pid 20618, vs. the prior clean record
+pid 659 from 2026-09-17 07:41:33). Link status read "up" throughout (80-120 Gb/s, PCI link up), DART error data
+was absent — this reads as the same Thunderbolt tunnel drop/re-attach signature as the two 2026-09-16 events, not
+a wedge. Antonio looked, then said to clear and retry: `tools/dart-stale.sh --clear`, verified it landed (a
+second preflight showed the dext record updated, not still stale — this project's house rule after a clear that
+didn't take the first time on 2026-09-17). **Timing worth keeping:** the card itself did nothing this run (every
+turn routed to Metal); the re-enumeration landed right at the end of turn 6, an 8.2s sustained Metal prefill on
+5,758 cold tokens — matching the existing step-down hypothesis (a re-enumeration at the transition off sustained
+Metal compute) with **zero card activity**, a cleaner data point against "card interaction" as a contributing
+cause. **The identical 9-turn benchmark repeated immediately after did NOT reproduce it** (clean preflight,
+op-verify 450/450) — n=1 either way, so this neither confirms nor rules out the workload as a trigger, but it's
+not deterministic on this exact shape.
+
+## eGPU strategy review, 2026-09-18 — ranked, ahead of working through them
+
+A research pass (GGUF metadata read directly, driver/shim docs, upstream `llama.cpp` prior art) ranked strategies
+for getting more out of the card beyond prefill-offload + residency + threshold-tuning:
+
+**Try soon:** (1) `THRESH=0`, cost-model routes every turn — ~2x on the measured 9-turn session. (2) Reseed the
+router's shipped `--card-fixed`/`--card-rate` from real `a988ec7` observations instead of the stale `ad308bd`
+defaults. (3) Push `NCPUMOE` residency further — capped around ~70% for Coder-Next specifically (43.5 GiB of
+experts vs ~31.8 GiB VRAM), needs confirming the current driver has the gated 256 MB WPR carveout, not the flat
+64 MB one.
+
+**Real, bigger bets:** coalescing small cold-deltas only helps when their *combined* total crosses the breakeven
+(e.g. a diff arriving in chunks, not general chat); card-side hot-expert caching only helps decode, not prefill
+(see the saturation mechanism above), so it's only relevant paired with moving decode itself onto the card, which
+is real engineering against an in-flight upstream PR (`ggml-org/llama.cpp` #20757/#27861) and unproven over
+Thunderbolt; on-card MTP speculative decode has genuinely proven infrastructure in this repo (`nv_shim_step.sh
+spec`, 124 tok/s single-request / ~207 tok/s at 8 slots on Qwen3.8-27B, which fits on-card) but is blocked for
+Coder-Next until it fits on-card at all; cross-device speculative verification (draft on Metal, verify on card)
+was evaluated and killed for Coder-Next — verifying even a few tokens still pays the full fixed stream, far worse
+than just decoding on Metal — but might work for a smaller model with real residency headroom (e.g. window 3's
+qwen35moe, 18.2 GiB of experts).
+
+**Speculative:** prefetching likely-next context during decode; quantizing the activation transfer (wrong
+bottleneck — it's the weight stream, not activations); using the idle card for an unrelated side-task in
+parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever found yet).
 
 ## What is next, after window 3
 
