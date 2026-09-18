@@ -352,6 +352,20 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
   } while (tinynv_now_s() < deadline);
   // Whatever arrives now belongs to a request nobody is waiting for any more.
   g->gsp.rpc_desync = 1;
+  // A timeout on the start-up notice is the one this driver keeps hitting on a live 3060, so say enough to tell a silent
+  // death apart from a message we failed to recognise. If GSP-RM's write pointer sits exactly where our read pointer is,
+  // it stopped talking after the register sequence (a hung or browned-out core); if it moved past us, it sent something
+  // we did not act on and the bug is here.
+  tinynv_gsp_t *gsp = &g->gsp;
+  if (want == TINYNV_MSG_EVENT_GSP_INIT_DONE && gsp->stat_q.base) {
+    uint32_t rp = nv_rd32(&gsp->queues.view, gsp->stat_q.rx_off);
+    uint32_t wp = nv_rd32(&gsp->queues.view, gsp->stat_q.base + offsetof(tinynv_msgq_tx_header_t, writePtr));
+    fprintf(stderr, "tinynv: at the timeout the status queue read pointer is %u and gsp-rm's write pointer is %u (%s); "
+                    "%u register sequence(s) were handled and the firmware %s reported an error\n",
+            rp, wp, rp == wp ? "gsp-rm went silent after the register sequence - a hung or under-powered core, not a "
+                               "message this driver mishandled" : "gsp-rm sent more than this driver consumed",
+            gsp->cpu_seq_requests, gsp->err_state ? "HAS" : "has not");
+  }
   return tinynv_fail("gsp-rm never sent %s (message %u) in %.0f s", what, want, timeout_s);
 }
 
