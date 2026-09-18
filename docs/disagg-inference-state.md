@@ -434,8 +434,16 @@ matters here). All four correctly showed `cache_n: 11461` — the full shared pr
 queries) ≈ **16.2 s for all 4 jobs**, against **66.7 s** for 4 independent full prefills on fresh slots (no
 restore) — **a 4.1x win on this exact batch, and the win only grows with more jobs**, since each additional job
 past the first costs ~1 s instead of ~16 s. Card came through clean (op-verify 450/450, no re-enumeration).
-Script: `tools/gen-coding-chat.py`'s sibling test harness is not yet promoted into `disagg-serve.sh`/the router —
-this landed as a standalone validation, wiring it into reusable tooling is the next step, not a research question.
+**Promoted into reusable tooling, 2026-09-18: `tools/disagg-batch.sh`.** `start <model> <shared-file> <n-slots>
+[ncpumoe]` seeds the card and broadcasts to N Metal slots; `card-only ...` does the same entirely on the card, no
+Metal; `job <slot> <text|file> [n_predict]` runs one seeded completion and reports whether it actually hit
+(`cache_n` matching the shared count) or missed. Re-confirmed on hardware through the real tool (not just the
+validation script): 4/4 Metal slots hit cleanly (~0.7-1.1 s each) and 3/3 card-only slots hit cleanly (~1.1 s
+each) in separate runs. Building it surfaced two real bugs worth remembering: (1) curl's `-d` silently returned
+empty output for a large (~80 KB) JSON body with no error — switched to posting via `urllib` instead, which
+handles the same payload fine; (2) `command <<'HEREDOC'` IS that command's stdin (its source, when no `-c`/file is
+given), so piping data into the same command (`echo "$x" | prog <<'EOF'`) is silently swallowed — data has to go
+through argv instead, or the heredoc has to go, not both. Both are now documented in the script itself.
 
 **The critical detail that made this work, found investigating why the first attempt failed:** the seeded jobs
 MUST be sent as token-list prompts (pre-tokenized ids), not raw text strings. A first attempt using string prompts
@@ -513,17 +521,36 @@ parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever
 5. **The 24K state save took 2.5 s in window 2's treatment against 0.7 s in its control** (same 662 MB), unexplained,
    n=1, flagged rather than fitted. Window 3's saves (501-535 MB in 0.6 s each) did not reproduce anything that
    slow, but the model and driver both differ, so this is still open, not resolved.
-6. **Revisit the 512-token cap for incremental chat traffic**, per the 2026-09-18 benchmark above — either raise
-   it toward the measured breakeven or let `--threshold 0` (pure cost-model routing) handle steady-state chat
-   growth, reserving a cap for the single-giant-cold-paste case it actually protects against. Antonio's call.
+6. **Items 6 and 7 are coupled, not independent (found by a 2026-09-18 review pass): treat 7 as subsuming 6.**
+   Once the router can predict whether a reverse-sync would hit or catastrophically miss (7), the 512-cap
+   question in 6 stops being a judgment call — the router just gets it right on its own, no operator cap needed.
+   Don't spend effort deciding the cap's default separately from building 7.
 7. **Wire reverse sync into the router's actual routing decision.** It's confirmed working (2026-09-18), not just
    hand-tested — the remaining work is making the ROUTER track enough of Metal's real state (specifically:
    capture the actual decoded token ids via `return_tokens` on relayed requests, not just the sent prompt) so it
-   can predict whether a sync will hit cleanly, rather than only detecting a miss after paying for it.
-8. **Promote the parallel-slot batching win into reusable tooling.** Confirmed 4.1x on real hardware (both
-   Metal-hosted and card-only), but it landed as a standalone validation script, not `disagg-serve.sh`/the
-   router. Needs: a `--parallel` knob, a "seed these slots with this shared prefix" command, and the
-   token-list-only rule enforced (never relay a raw string to a slot that was populated via restore).
+   can predict whether a sync will hit cleanly, rather than only detecting a miss after paying for it. This also
+   retires "keep-warm scheduling" for good (an earlier pass ruled it out only because sync didn't work yet — once
+   it does, `THRESH=0` + working sync already captures the benefit with no separate keep-warm policy needed).
+8. **DONE, 2026-09-18: promoted the parallel-slot batching win into reusable tooling** — `tools/disagg-batch.sh`,
+   confirmed 4.1x on real hardware through the actual tool, both Metal-hosted and card-only. See above.
+9. **Rerun `tools/disagg-batch.sh` with `NCPUMOE=30` instead of the default 48** (config-only, no new code) —
+   residency cut prefill 24-33% in window 2, and since batching's win comes from amortizing that same one-time
+   fixed cost across jobs, cutting the fixed cost directly should push the win past 4.1x, especially for smaller
+   batches where the one-time prefill matters proportionally more.
+10. **Re-test reverse sync + NCPUMOE residency combined on hardware, sequenced AFTER item 7** — an earlier
+    research pass estimated ~26% faster than all-Metal for this combination on the 9-turn benchmark shape, never
+    actually run. Running it before item 7 lands would keep hitting the decoded-tail cache-miss artifact and
+    understate the real number, since `tools/gen-coding-chat.py`'s checkpoints are static pre-written text, not
+    live model output — the exact condition that triggers that miss.
+11. **A cheap, currently-open gap: no direct card-only vs. Metal-only decode comparison exists for a model that
+    fits both places.** Qwen3.8-27B has real on-card decode numbers (124 tok/s single-request, ~207 tok/s at 8
+    slots, via `nv_shim_step.sh spec`) but no matching Metal-only number for the same model anywhere in this
+    project — nobody has actually verified card-only is the right choice once a model fits in ~31.8 GiB rather
+    than assumed it.
+12. **The vision-projector asset** (`qwen38-mmproj-F16.gguf` for Qwen3.8-27B) is architecturally analogous to the
+    proven prefill-offload pattern (one-shot, compute-heavy, non-resident-friendly) but it's genuinely unknown
+    whether llama.cpp's server API supports routing the vision-encoder pass to a different process than the main
+    decode step — needs a short code investigation before any engineering time.
 
 Logs: `logs/disagg/serve/{card,metal,router}-20260916-162122.log` (09-16), `…-20260917-073136.log` (window 1),
 `…-20260917-073431.log` (control), `…-20260917-073533.log` (treatment), `…-20260917-234655-{card,metal,router}.log`
