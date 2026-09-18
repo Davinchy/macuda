@@ -983,7 +983,49 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   //
   // Correctness is the same argument as any other held span: emitted after the acquire that orders the batch, before
   // the launch method that reads them, flushed by the same FLUSH_ONLY the caller's tensors get.
-  if (ex->hybrid_delivery && ex->arena_dma && ex->region[AR_DESC].dirty_hi > ex->region[AR_DESC].dirty_lo &&
+  //
+  // TINYNV_DELTA_DELIVERY: the span about to be delivered, captured before any branch below clears it, so
+  // last_delivered can be brought up to date at the end regardless of which path actually did the delivering.
+  uint64_t delta_lo = ex->region[AR_DESC].dirty_lo, delta_hi = ex->region[AR_DESC].dirty_hi;
+  int delta_handled = 0;
+  if (ex->delta_delivery && ex->region[AR_DESC].last_delivered && ex->arena_dma &&
+      ex->wraps[AR_DESC] && delta_hi > delta_lo) {
+    // Trusted only past the region's first lap (wraps[AR_DESC] set): before that, last_delivered has never been
+    // compared against a real prior delivery at this address, so there is nothing yet to diff against honestly.
+    uint8_t *sh = ex->region[AR_DESC].shadow, *ld = ex->region[AR_DESC].last_delivered;
+    uint64_t diff_lo = delta_hi, diff_hi = delta_lo;
+    for (uint64_t i = delta_lo; i < delta_hi; i++)
+      if (sh[i] != ld[i]) { if (i < diff_lo) diff_lo = i; diff_hi = i + 1; }
+    if (diff_hi <= diff_lo) {
+      // Every byte in the span already matches what a past delivery left resident - a decode step can repeat a
+      // cache-hit prefix exactly. Ownership still has to move to this batch; no bytes need to.
+      tinynv_arena_mark(&ex->region[AR_DESC], delta_lo, delta_hi, chain_upto);
+      ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
+      ex->delta_skip_n++;
+      delta_handled = 1;
+    } else if (diff_hi - diff_lo <= TINYNV_INLINE_MAX && inline_pend_fits(ex, (uint32_t)(diff_hi - diff_lo))) {
+      inline_pend_push(ex, ex->region[AR_DESC].mem.va + diff_lo, sh + diff_lo, (uint32_t)(diff_hi - diff_lo));
+      tinynv_arena_mark(&ex->region[AR_DESC], delta_lo, delta_hi, chain_upto);
+      ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
+      ex->hybrid_n++;
+      ex->delta_n++;
+      ex->delta_bytes += diff_hi - diff_lo;
+      delta_handled = 1;
+    } else {
+      // The genuine diff itself does not fit inline either (an unexpectedly large change, or a chain shape that
+      // does not match what was here last lap) - fall through to the existing full-span paths below, unchanged.
+      // Conservative on purpose: this is never worse than today's behaviour, only sometimes not as good as it
+      // could be.
+      ex->delta_full_n++;
+      if (getenv("TINYNV_DELTA_VERBOSE") && ex->delta_full_n <= 20)
+        fprintf(stderr, "libtinynv: delta miss #%llu: span [%llu,%llu) len %llu, diff [%llu,%llu) len %llu\n",
+                (unsigned long long)ex->delta_full_n, (unsigned long long)delta_lo, (unsigned long long)delta_hi,
+                (unsigned long long)(delta_hi - delta_lo), (unsigned long long)diff_lo, (unsigned long long)diff_hi,
+                (unsigned long long)(diff_hi - diff_lo));
+    }
+  }
+  if (!delta_handled && ex->hybrid_delivery && ex->arena_dma &&
+      ex->region[AR_DESC].dirty_hi > ex->region[AR_DESC].dirty_lo &&
       ex->region[AR_DESC].dirty_hi - ex->region[AR_DESC].dirty_lo <= TINYNV_INLINE_MAX &&
       inline_pend_fits(ex, (uint32_t)(ex->region[AR_DESC].dirty_hi - ex->region[AR_DESC].dirty_lo))) {
     uint64_t lo = ex->region[AR_DESC].dirty_lo, len = ex->region[AR_DESC].dirty_hi - lo;
@@ -992,7 +1034,7 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
     ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
     ex->hybrid_n++;
   }
-  if (ex->arena_dma && ex->region[AR_DESC].dirty_hi > ex->region[AR_DESC].dirty_lo) {
+  if (!delta_handled && ex->arena_dma && ex->region[AR_DESC].dirty_hi > ex->region[AR_DESC].dirty_lo) {
     uint64_t lo = ex->region[AR_DESC].dirty_lo, len = ex->region[AR_DESC].dirty_hi - lo;
     // One sequential write into memory the engine can read, in place of the same bytes going out as scattered
     // four-byte register writes. Same volume, and this way the processor writes it once, in order.
@@ -1010,6 +1052,15 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
     ex->defer_ring = 0;
     if (rc) return -1;
   }
+  // Whichever path just ran (delta patch, full inline, full copy, or none because there was nothing dirty) has
+  // now made video memory match shadow across the whole originally-dirty span: the delta path patched only what
+  // differed because the rest was already correct there, and the two full-span paths always send the whole span.
+  // Bringing last_delivered up to date here, once, regardless of which branch fired, is what makes the NEXT lap's
+  // diff honest - a bug in this line, and only this line, would be the one way this feature could ever go from
+  // "sometimes not as good as it could be" to "wrong": if the recorded mirror ever drifts from the bytes actually
+  // resident, a future skip could omit an update that had to reach video memory.
+  if (ex->region[AR_DESC].last_delivered && delta_hi > delta_lo)
+    memcpy(ex->region[AR_DESC].last_delivered + delta_lo, ex->region[AR_DESC].shadow + delta_lo, delta_hi - delta_lo);
 
   uint64_t va;
   tinynv_cmdbuf_t c;
@@ -1535,6 +1586,17 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
       fprintf(stderr, "libtinynv: the first chain after a standstill carries %u launches and its descriptors ride in "
                       "the batch (was asked for)\n", ex->short_chain); }
 
+  // Measured 2026-09-18 (TINYNV_DUMP_CMD, see the diagnostic near tinynv_exec's run()): a steady-state MoE decode
+  // token's descriptor content is 2.7% different from the token before it - a handful of KV-cache offset/address
+  // dwords advancing by a fixed stride, never the launch addresses themselves (ggml-cuda's MoE dispatch expresses
+  // expert routing as small on-device buffer content, not as changed kernel addresses). The ring already reuses
+  // the same physical address a lap later; this diffs the fresh shadow content against what was last actually
+  // sent there and patches only the difference, instead of resending a structurally-fresh full chain every time.
+  { const char *e = getenv("TINYNV_DELTA_DELIVERY");
+    ex->delta_delivery = e && *e && *e != '0';
+    if (ex->delta_delivery)
+      fprintf(stderr, "libtinynv: AR_DESC delivery patches only what changed since the last lap (was asked for)\n"); }
+
   { const char *e = getenv("TINYNV_INLINE_PEND");
     ex->inline_pend_max = tinynv_exec_pend_entries(e);
     // Bytes scale with entries rather than being a second knob: the two would otherwise have to be swept together and
@@ -1634,6 +1696,10 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
     for (int r = 0; r < 2; r++)
       if (!(ex->region[r].shadow = calloc(1, (size_t)ex->region[r].size)))
         return tinynv_fail("out of memory for a %llu byte scratch shadow", (unsigned long long)ex->region[r].size);
+    if (ex->delta_delivery &&
+        !(ex->region[AR_DESC].last_delivered = calloc(1, (size_t)ex->region[AR_DESC].size)))
+      return tinynv_fail("out of memory for a %llu byte last-delivered mirror",
+                         (unsigned long long)ex->region[AR_DESC].size);
   } else {
     if (tinynv_mm_alloc_buffer(&g->mm, CMD_REGION_BYTES, 1, 1, 1, 0, 1, &ex->region[AR_CMD].mem)) return -1;
     if (tinynv_mm_alloc_buffer(&g->mm, desc_bytes, 1, 1, 1, 0, 1, &ex->region[AR_DESC].mem)) return -1;
@@ -1698,6 +1764,12 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
   if (ex->hybrid_n)
     fprintf(stderr, "libtinynv: %llu descriptor deliveries rode in the compute batch instead of crossing on the copy "
                     "engine.\n", (unsigned long long)ex->hybrid_n);
+  if (ex->delta_n || ex->delta_skip_n || ex->delta_full_n)
+    fprintf(stderr, "libtinynv: delta delivery patched %llu spans (%llu bytes total, %.1f avg), skipped %llu with "
+                    "nothing changed, and %llu fell back full because the genuine diff did not fit inline either.\n",
+            (unsigned long long)ex->delta_n, (unsigned long long)ex->delta_bytes,
+            ex->delta_n ? (double)ex->delta_bytes / (double)ex->delta_n : 0.0,
+            (unsigned long long)ex->delta_skip_n, (unsigned long long)ex->delta_full_n);
   if (ex->inline_n || ex->upload_ce_n)
     fprintf(stderr, "libtinynv: %llu host-to-device copies rode in the pushbuffer (%llu bytes) and %llu went to the "
                     "copy engine.\n           Held list (%u entries, %u bytes): %llu rode in a batch already going "
@@ -1831,6 +1903,7 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
   for (int r = 0; r < 2; r++) {
     if (ex->region[r].mem.size) tinynv_vmap_free(&ex->g->mm, &ex->region[r].mem);
     free(ex->region[r].shadow);
+    free(ex->region[r].last_delivered);
   }
   tinynv_vmap_free(&ex->g->mm, &ex->sem);
   memset(ex, 0, sizeof(*ex));

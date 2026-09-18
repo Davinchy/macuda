@@ -59,6 +59,13 @@
 typedef struct {
   tinynv_vmap_t mem;   // where the engine reads this region
   uint8_t *shadow;     // where the processor builds it, or NULL when it writes the mapping directly
+  // TINYNV_DELTA_DELIVERY only: a copy of shadow as of the last time each byte was actually sent to video memory.
+  // The ring wraps and reuses the same physical addresses, so diffing fresh shadow content against this - rather
+  // than against nothing - finds the genuine per-token delta (measured 2026-09-18: 2.7% of a steady-state MoE
+  // decode chain) instead of re-sending a structurally-fresh span in full every time. NULL when the feature is
+  // off; allocated the same size as shadow when on. Trusted only after this region has completed a full lap
+  // (exec.c's wraps[] counter), so every byte has a real prior delivery to diff against - see the delivery code.
+  uint8_t *last_delivered;
   uint64_t size, next, dirty_lo, dirty_hi;
   // What has been handed out since the last submission, which is a different question from what has yet to be
   // written to video memory. The dirty span is cleared whenever the bytes are pushed, and pushing can happen without
@@ -218,8 +225,10 @@ typedef struct {
   // take a compute timeline value in that window. See tinynv_exec_flush.
   int in_chain_flush;
   int hybrid_delivery;
+  int delta_delivery;   // TINYNV_DELTA_DELIVERY=1: diff AR_DESC against last_delivered, patch only what changed
   unsigned short_chain;
   uint64_t hybrid_n;
+  uint64_t delta_n, delta_bytes, delta_skip_n, delta_full_n;
   // Launch every descriptor from the command stream and link none of them, so nothing orders one kernel against the
   // next. THIS PRODUCES WRONG ANSWERS for any real workload - dependent kernels run side by side - and exists for one
   // measurement: whether the submission path can sustain a launch a microsecond when nothing waits on anything. The
