@@ -1016,6 +1016,17 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
       uint64_t dlo = hi, dhi = lo;
       for (uint64_t j = lo; j < hi; j++)
         if (sh[j] != ld[j]) { if (j < dlo) dlo = j; dhi = j + 1; }
+      if (dhi > dlo) {
+        // tinynv_cmd_inline_upload requires a whole number of dwords at a 4-byte-aligned destination (submit.c) -
+        // the byte-precise diff found above has neither guarantee, so it is widened to the nearest dword on each
+        // side before anything downstream sees it. Safe to widen: each launch's own [lo,hi) is itself allocated on
+        // a 256-byte boundary with a 256-byte-rounded length (tinynv_exec_run's cbuf0_bytes rounding), so rounding
+        // dlo down / dhi up can never cross into a neighbouring launch's span. This crashed on hardware once
+        // (2026-09-19, "an inline upload is a whole number of dwords, not N bytes") before this rounding existed -
+        // the single-envelope version before it had the identical latent bug, just never taken often enough to hit it.
+        dlo &= ~(uint64_t)3;
+        dhi = (dhi + 3) & ~(uint64_t)3;
+      }
       plo[i] = dlo;
       phi[i] = dhi;
       if (dhi <= dlo) continue;   // this launch is byte-identical to its last delivery - nothing to send for it
