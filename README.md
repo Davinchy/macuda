@@ -21,11 +21,11 @@ with NVIDIA's own structure definitions from `open-gpu-kernel-modules` pinned to
 
 | workload | this shim | native | notes |
 |---|---|---|---|
-| Qwen3.8-27B Q4_K_M, tg128 | **71.5 tok/s** | 75.3 | dense decode, launch-bound for what remains |
+| Qwen3.8-27B Q4_K_M, tg128 | **74.0 tok/s** | 75.3 | dense decode, kernel-bound at ~1.27 TB/s; the token boundary is what remains |
 | Qwen3.8-27B Q4_K_M, pp256 | ~2550 tok/s | 2447 | prefill at parity (the SASS is identical) |
 | Qwen3.8-27B + its MTP draft head, greedy | **124 tok/s** first request, 112 mean over a 62-minute soak | 124.7 | `llama-server`, `--spec-type draft-mtp` |
 | `llama-server`, 8 slots, 27B + MTP, temp 0.6 | **~207 tok/s aggregate** | — | 20-minute soaks at eight slots: 440 requests, 0 errors |
-| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **145 tok/s** (166 on a quiet host) | 245.0 | ~1,634 launches a token; the purest launch-bound case |
+| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **216 tok/s** | 245.0 | ~1,600 launches a token; was host-bound until the ggml-cuda host code was built at -O2 |
 | SDXL-Turbo, 4 steps, 512², cfg 1.0 | **2.72 s** | 4.11 s | stable-diffusion.cpp |
 | SD 1.5 (fp32), 20 steps, 512² | **3.72 s** | 3.86 s | |
 | Z-Image-Turbo, 8 steps, 1024² | **9.67 s** | 9.46 s | Q8 DiT + Qwen3-4B encoder + FLUX VAE |
@@ -58,8 +58,11 @@ of the copy engine), and descriptors that release nothing end without a memory b
 oracle's system-scope barrier stays on releasing descriptors, and `=sys` restores it everywhere). Interleaved against
 the morning's defaults in the same minutes at host load 4-7: MoE 140.3/140.5 -> 142.5/145.0, dense 70.9/70.6 ->
 71.7/71.3; op-verify 450/450 at three depths, both greedy texts byte-identical, all three image models byte-identical
-PNGs at equal times, a five-minute `llama-server` + MTP soak clean. The table carries these afternoon numbers; the same
-MoE code path read 166 in the morning at host load 2.5-4, which is the "quiet host" figure. Dropping the per-launch
+PNGs at equal times, a five-minute `llama-server` + MTP soak clean.
+
+**And the ggml-cuda host code at -O2 (14:35):** the build's host compile carried no `-O` flag; rebuilt at -O2 with the
+device halves unchanged, interleaved tg128 MoE 139.7/142.8 -> 214.4/217.4 and dense 71.5/70.7 -> 74.0/73.9 at host
+load 6-7, texts and images byte-identical, op-verify 450/450 x3, soak clean. The table carries these numbers. Dropping the per-launch
 cache invalidates was also measured and produces a wrong greedy text: `TINYNV_QMD_INVALIDATE` stays a diagnostic.
 
 ## What you need
@@ -223,11 +226,11 @@ models/  logs/                not committed; see models/README.md
 
 ## Known limits and hazards
 
-- **MoE decode is at ~60-68% of native** (host-load dependent) and dense decode at ~95% (2026-09-19 defaults). A per-kernel
-  profile from the card's own clock (`TINYNV_KERNEL_PROFILE`, design doc §4i) shows the MoE's kernels running at native speed
-  and the loss being the engine idle at chain seams and token boundaries: the host builds a launch in ~4.1 µs (2.4 of it in
-  ggml-cuda/llama.cpp above the runtime layer) against the engine's ~2.45 µs, so the engine drains between chains. The MoE is
-  host-bound; the dense is kernel-bound at ~1.27 TB/s effective. The ranked options are in `docs/driver/moe-next-steps.md` §8.
+- **MoE decode is at ~88% of native and dense at ~98%** (2026-09-19 afternoon). A per-kernel profile from the card's own clock
+  (`TINYNV_KERNEL_PROFILE`, design doc §4i) showed the MoE's kernels at native speed and the loss being the engine idle while the
+  host built the next chain; the host code of ggml-cuda turned out to be compiled at -O0, and rebuilding it at -O2 took the MoE
+  from 140 to 216 tok/s interleaved (§4j). What remains on both models is the token boundary (~1.2-1.4 ms of engine idle a
+  token) and the driver's ~1.7 µs a launch; the options are in `docs/driver/moe-next-steps.md` §9.
 - **The firmware's reservation is derived and checked (closed 2026-09-19).** The driver holds back 256 MB at the top of VRAM, sized
   from the sizes it hands the firmware (`libtinynv/src/fw_layout.h`, static-asserted against their sum), and at every open reads the
   chip's WPR2 registers and refuses to start if the manager's top is above the firmware's region. Measured on this card: WPR2 spans

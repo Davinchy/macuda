@@ -1095,6 +1095,16 @@ seams (1.85 ms a window) and at the boundary (1.24 ms), because the host builds 
 ggml-cuda/llama.cpp, 1.75 in `tinynv_launch`) against the engine's 2.45. The dense is kernel-bound at 1.27 TB/s
 effective. The chain-replay study's host figure of ~1.05 us a launch was the driver's share alone.
 
+### 4j. Where the MoE's host time went: the caller was at -O0 (2026-09-19 14:35-14:53)
+
+The per-kernel profile said the host builds a launch in 4.1 us of which 2.38 are above the runtime layer. The reason
+was the build, not the code: `cuda-shim/build/tinycc` host-compiles ggml-cuda with no `-O` flag. Rebuilt at -O2 with
+the device fatbins recovered from the archive's objects (byte-identical, verified): 0.42 us above the runtime layer,
+seams 1.85 -> 0.41 ms a window, MoE tg128 140 -> 216 interleaved (native 245), dense 71 -> 74; op-verify 450/450 at
+three depths, both greedy texts and all three images byte-identical, a five-minute MTP soak clean. The remaining
+per-launch host cost is the driver entry's 1.74 us (1.29 building the launch, the rest the API layer), and the
+remaining idle on both models is the token boundary.
+
 ## 5. What this needs from the humans
 
 - **The 3090's DMA is untranslated, so no kernel parameter change is needed** (Session A's finding #4, settled 2026-09-13):

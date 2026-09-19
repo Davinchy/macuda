@@ -124,3 +124,14 @@ levers, in order of what they buy the MoE:
 - **C, fusion** (fewer launches) helps both sides proportionally and stays worth doing.
 - **D, speculative decoding**: unchanged, the visible win with no code.
 - The Windows Nsight capture (B's second half) now only refines the per-kernel comparison.
+
+## 9. The host was compiled at -O0 (2026-09-19 14:35-14:53): MoE +53%, dense +4%
+
+Reading the build for the graph work: `cuda-shim/build/tinycc` host-compiled every ggml-cuda TU with no `-O` flag,
+so the dispatcher whose 2.38 us a launch section 8 measured ran unoptimised. Rebuilt at -O2 with the device halves
+recovered byte-for-byte from the archive (no Linux box needed): the caller's time between launches 2.38 -> 0.42 us,
+seams 1.85 -> 0.41 ms a window, MoE tg128 **140 -> 216** interleaved (native 245), dense 71 -> 74 (native 75.3),
+every text and image byte-identical, op-verify 450/450 x3, a five-minute MTP soak clean. B' (the CUDA-graph subset)
+shrinks to a small item: the host is now ~2.2 us a launch against the engine's 2.45. What remains on both models is
+the token boundary (~1.2-1.4 ms of engine idle a token: sampling, the ggml graph build and scheduler, the first
+chain) - compare against native's boundary in the Nsight trace - and the driver's own 1.74 us a launch.
