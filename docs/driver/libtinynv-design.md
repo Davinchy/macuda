@@ -994,6 +994,42 @@ says how many flushes took the path. And the mechanism is per flush while the st
 so the number that matters is not the flush count but the boundary instrument in §4f, read the same way as every
 lever there: interleaved with the reference in the same minutes, host state on the record.
 
+### Lap 4 on the card, and the lap after it (2026-09-19, 08:50-09:20)
+
+**Runs engage everywhere and lose.** With sub-launch runs the fast path took 1223 of 1223 dense flushes and 938 of 938
+MoE flushes, text byte-identical on both models, op-verify 450/450 at three depths - and interleaved tg128 pairs read
+MoE 145-161 off against 89-90 on (-44%), dense 66-68 against 63-65 (-4%). Each flush's runs carried ~70 KB of its
+~200 KB envelope, ~90 KB of pushbuffer with headers: ~380 µs of processor writes across the link at §4d's ~4.2 µs/KB,
+on every flush, against the ~350 µs a token of boundary handoff the whole lever was meant to remove. A gap sweep
+(0/8/32/128/512 bytes) moved patches a flush from 298 to 1504 at a near-constant ~100 KB and the speed did not move
+(83-85 t/s): the cost is bytes written, not calls made. §4f's "why there is no fifth lever" arithmetic held as
+written. **A mechanism that engages is not a mechanism that pays; the token period was the reading, as this file
+already said it would be.**
+
+**Why 35% of a launch changes when 2.7% was the premise.** The descriptor ring rewinds at a chain boundary, wherever
+the region runs out, so what was last delivered at a launch's address is a *different* launch - the same kernel from
+another layer or another point in the token, with other weight pointers and strides. The 2.7% measurement (§4h's
+first paragraph, `26b0562`) compared consecutive batches within a token. Both numbers were right; the reading that
+one implied the other was wrong, and it survived three laps because each lap measured its own granularity and
+nothing measured the alignment.
+
+**Lap 5: `TINYNV_DELTA_REWIND` (`74fcfe7`).** At the first launch after a standstill the descriptor region is
+declared full, so the next placement comes round through `arena()`'s own wrap path - the only code that knows how to
+come round safely (refuses with a chain pending, pushes, flushes, waits per piece, refuses on an unaccounted span).
+Launch k of every token then lands where launch k of the last one did, and the diff is a launch against its own
+previous-token self. Predicted before the run: under 15 KB a flush. Measured: 6.6 KB, of which ~4.5 KB was headers
+on one patch per launch - the release value every descriptor carries, which advances each token. `TINYNV_TAIL_RELEASE=1`
+(only the chain's tail releases) removes that patch: **2.1-2.8 KB a flush, ~24 patches, the genuine per-token
+parameter changes.** Interleaved tg128, the three knobs together against the defaults: **dense 27B 67.8 -> 70.7
+(+4.4%, ±0.2 both sides; 70.81 the highest this project has recorded), MoE 35B-A3B ~161 -> ~166 (+2-3%, of which tail
+release alone is ~+2%).** op-verify 450/450 at three depths with all three on; both texts byte-identical.
+
+What the win is made of, by the arithmetic: the copy engine leaves every flush (1561 of 1561 dense flushes rode in
+the compute batch), so the per-flush cross-queue acquire and the boundary handoff go with it, and the 2.5 KB of
+patches cost ~10 µs of writes a flush. The defaults were not flipped: `llama-server` with slots in flight,
+speculative decode and image generation have not run with the three knobs, and tail release costs the ability to
+locate a stalled chain from the timeline. That is the next card work, and it is Antonio's call.
+
 ## 5. What this needs from the humans
 
 - **The 3090's DMA is untranslated, so no kernel parameter change is needed** (Session A's finding #4, settled 2026-09-13):
