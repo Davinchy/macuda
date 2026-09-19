@@ -148,8 +148,8 @@ int main(void) {
 
   // The descriptor-tail measurement knobs: the oracle's choice unless asked, and only the spellings that name a mode.
   {
-    static const struct { const char *e; int want; } mb[] = {{NULL, TINYNV_QMD_MEMBAR_SYS}, {"", TINYNV_QMD_MEMBAR_SYS}, {"sys", TINYNV_QMD_MEMBAR_SYS},
-                                                             {"gpu", TINYNV_QMD_MEMBAR_GPU}, {"none", TINYNV_QMD_MEMBAR_NONE}, {"1", TINYNV_QMD_MEMBAR_SYS}, {"GPU", TINYNV_QMD_MEMBAR_SYS}};
+    static const struct { const char *e; int want; } mb[] = {{NULL, TINYNV_QMD_MEMBAR_NONE}, {"", TINYNV_QMD_MEMBAR_NONE}, {"sys", TINYNV_QMD_MEMBAR_SYS},
+                                                             {"gpu", TINYNV_QMD_MEMBAR_GPU}, {"none", TINYNV_QMD_MEMBAR_NONE}, {"1", TINYNV_QMD_MEMBAR_NONE}, {"GPU", TINYNV_QMD_MEMBAR_NONE}};
     for (size_t i = 0; i < sizeof(mb) / sizeof(*mb); i++)
       CHECK(tinynv_exec_qmd_membar(mb[i].e) == mb[i].want, "TINYNV_QMD_MEMBAR=%s gave %d, expected %d", mb[i].e ? mb[i].e : "(unset)",
             tinynv_exec_qmd_membar(mb[i].e), mb[i].want);
@@ -158,19 +158,21 @@ int main(void) {
     for (size_t i = 0; i < sizeof(inv) / sizeof(*inv); i++)
       CHECK(tinynv_exec_qmd_invalidate(inv[i].e) == inv[i].want, "TINYNV_QMD_INVALIDATE=%s gave %d, expected %d",
             inv[i].e ? inv[i].e : "(unset)", tinynv_exec_qmd_invalidate(inv[i].e), inv[i].want);
-    CHECK(tinynv_exec_qmd_membar(NULL) == TINYNV_QMD_MEMBAR_SYS && tinynv_exec_qmd_invalidate(NULL) == TINYNV_QMD_INVALIDATE_ALL,
-          "an empty environment no longer builds the oracle's descriptor tail");
+    CHECK(tinynv_exec_qmd_membar(NULL) == TINYNV_QMD_MEMBAR_NONE && tinynv_exec_qmd_invalidate(NULL) == TINYNV_QMD_INVALIDATE_ALL,
+          "the defaults moved: no barrier on non-releasing descriptors (2026-09-19, +3%% dense) and the oracle's invalidates");
   }
 
   // The inline-upload size cap: 4,096 unless asked, a dword multiple, never past the per-call ceiling.
   {
-    static const struct { const char *e; uint32_t want; } im[] = {{NULL, 4096}, {"", 4096}, {"4096", 4096}, {"8192", 8192},
-                                                                   {"8193", 8192}, {"3", 4096}, {"abc", 4096}, {"0", 4096},
+    static const struct { const char *e; uint32_t want; } im[] = {{NULL, TINYNV_INLINE_MAX}, {"", TINYNV_INLINE_MAX}, {"4096", 4096},
+                                                                   {"8192", 8192}, {"8193", 8192}, {"3", TINYNV_INLINE_MAX},
+                                                                   {"abc", TINYNV_INLINE_MAX}, {"0", TINYNV_INLINE_MAX},
                                                                    {"32764", 32764}, {"65536", TINYNV_INLINE_MAX}};
     for (size_t i = 0; i < sizeof(im) / sizeof(*im); i++)
       CHECK(tinynv_exec_inline_max(im[i].e) == im[i].want, "TINYNV_INLINE_MAX=%s gave %u, expected %u",
             im[i].e ? im[i].e : "(unset)", tinynv_exec_inline_max(im[i].e), im[i].want);
-    CHECK(tinynv_exec_inline_max(NULL) == 4096, "the inline-upload default moved from 4,096 bytes");
+    CHECK(tinynv_exec_inline_max(NULL) == TINYNV_INLINE_MAX && TINYNV_INLINE_MAX == 32764,
+          "the inline-upload default moved from the 32,764-byte per-call ceiling (2026-09-19, +2.3%% MoE)");
   }
 
   // Whether a download drains the compute on the host before issuing its copy. Off by default: it is a test of a

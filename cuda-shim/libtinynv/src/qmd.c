@@ -163,8 +163,9 @@ int tinynv_qmd_program(tinynv_qmd_t *q, const tinynv_qmd_program_t *p) {
   SET(q, SHARED_MEMORY_SIZE_SHIFTED7, p->shmem >> 7);
   SET(q, SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, p->slm_per_thread >> 4);
   SET(q, QMD_GROUP_ID, 0x3f);
-  // The invalidates and the barrier are the oracle's on every launch (ops_nv.py:289-291: the four cache invalidates,
-  // the constant-bank invalidate, L1_SYSMEMBAR). Both are measurement knobs since 2026-09-19 (exec.c): with the delta
+  // The invalidates are the oracle's on every launch (ops_nv.py:289-291: the four cache invalidates and the
+  // constant-bank one) and measured load-bearing; the barrier was the oracle's L1_SYSMEMBAR until 2026-09-19 and is
+  // now none on descriptors that release nothing (exec.c, TINYNV_QMD_MEMBAR). Both are knobs (exec.c): with the delta
   // delivery defaults the MoE decode is engine-busy 66% of a token and still a third slower than native, and what a
   // descriptor makes the engine do at its tail - a system-scope barrier over Thunderbolt per kernel, five cache
   // invalidates per launch - is the remaining per-launch cost this driver chooses. The per-chain command-stream

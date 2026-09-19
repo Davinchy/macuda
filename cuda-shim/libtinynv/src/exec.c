@@ -1761,19 +1761,27 @@ int tinynv_exec_tail_release(const char *e) { return !e || !*e || *e != '0'; }
 // (docs/handoff-2026-09-19.md). The rewind is meaningless without delivery, so it follows delivery off.
 int tinynv_exec_delta_delivery(const char *e) { return !e || !*e || *e != '0'; }
 
+// 32,764 by default since 2026-09-19 (Antonio: "no reason not to take free percentages"): the one per-token upload
+// above the old 4,096 cap - 8,192 bytes - riding the pushbuffer measured +2.3% on the MoE decode and +1.6% on the
+// dense, op-verify 450/450 and both greedy texts byte-identical. TINYNV_INLINE_MAX=4096 is the old behaviour.
 uint32_t tinynv_exec_inline_max(const char *e) {
-  if (!e || !*e) return 4096;
+  if (!e || !*e) return TINYNV_INLINE_MAX;
   long n = atol(e);
-  if (n < 4) return 4096;
+  if (n < 4) return TINYNV_INLINE_MAX;
   if (n > TINYNV_INLINE_MAX) n = TINYNV_INLINE_MAX;
   return (uint32_t)n & ~3u;
 }
 
+// "none" by default since 2026-09-19: a non-releasing descriptor's end-of-grid barrier measured +3% on the dense
+// decode and nothing on the MoE, with op-verify 450/450 at three depths, both greedy texts byte-identical and a
+// five-minute llama-server + MTP soak clean (docs/handoff-2026-09-19.md, 12:45-13:03). Releasing descriptors keep
+// the system-scope barrier regardless. TINYNV_QMD_MEMBAR=sys is the oracle's choice, "gpu" the scope that bought
+// nothing. Unrecognised spellings are the default, and the mode test pins which one that is.
 int tinynv_exec_qmd_membar(const char *e) {
-  if (!e || !*e) return TINYNV_QMD_MEMBAR_SYS;
+  if (!e || !*e) return TINYNV_QMD_MEMBAR_NONE;
+  if (!strcmp(e, "sys")) return TINYNV_QMD_MEMBAR_SYS;
   if (!strcmp(e, "gpu")) return TINYNV_QMD_MEMBAR_GPU;
-  if (!strcmp(e, "none")) return TINYNV_QMD_MEMBAR_NONE;
-  return TINYNV_QMD_MEMBAR_SYS;
+  return TINYNV_QMD_MEMBAR_NONE;
 }
 int tinynv_exec_qmd_invalidate(const char *e) {
   if (!e || !*e) return TINYNV_QMD_INVALIDATE_ALL;
@@ -1861,14 +1869,17 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   { const char *m = getenv("TINYNV_QMD_MEMBAR"), *i = getenv("TINYNV_QMD_INVALIDATE");
     ex->qmd_membar = tinynv_exec_qmd_membar(m);
     ex->qmd_invalidate = tinynv_exec_qmd_invalidate(i);
-    if (ex->qmd_membar != TINYNV_QMD_MEMBAR_SYS || ex->qmd_invalidate != TINYNV_QMD_INVALIDATE_ALL)
-      fprintf(stderr, "libtinynv: MEASUREMENT MODE: non-releasing descriptors end with a %s barrier and invalidate %s on "
-                      "entry (TINYNV_QMD_MEMBAR=%s TINYNV_QMD_INVALIDATE=%s were asked for); releasing descriptors keep the "
-                      "oracle's system-scope barrier%s\n",
-              ex->qmd_membar == TINYNV_QMD_MEMBAR_GPU ? "gpu-scope" : ex->qmd_membar == TINYNV_QMD_MEMBAR_NONE ? "NO" : "system-scope",
-              ex->qmd_invalidate == TINYNV_QMD_INVALIDATE_CB0 ? "only constant bank 0" : ex->qmd_invalidate == TINYNV_QMD_INVALIDATE_NONE ? "NOTHING" : "the oracle's five caches",
-              m && *m ? m : "(unset)", i && *i ? i : "(unset)",
-              ex->tail_release ? "" : " - and with TINYNV_TAIL_RELEASE=0 every descriptor releases, so the membar knob changes nothing"); }
+    // Named either way, with what decided it. The barrier line is the ordinary one now that "none" is the default;
+    // the invalidates are still a measurement knob (dropping them produces wrong output) and say so loudly.
+    fprintf(stderr, "libtinynv: non-releasing descriptors end with %s barrier (%s); releasing ones keep the system-scope "
+                    "barrier%s\n",
+            ex->qmd_membar == TINYNV_QMD_MEMBAR_GPU ? "a gpu-scope" : ex->qmd_membar == TINYNV_QMD_MEMBAR_NONE ? "no" : "a system-scope",
+            m && *m ? "TINYNV_QMD_MEMBAR was asked for" : "the default",
+            ex->tail_release ? "" : " - and with TINYNV_TAIL_RELEASE=0 every descriptor releases, so the barrier knob changes nothing");
+    if (ex->qmd_invalidate != TINYNV_QMD_INVALIDATE_ALL)
+      fprintf(stderr, "libtinynv: MEASUREMENT MODE: descriptors invalidate %s on entry (TINYNV_QMD_INVALIDATE=%s was asked "
+                      "for) - this produced a WRONG greedy text on 2026-09-19; a diagnostic, not a mode\n",
+              ex->qmd_invalidate == TINYNV_QMD_INVALIDATE_CB0 ? "only constant bank 0" : "NOTHING", i && *i ? i : "(unset)"); }
   ex->download_sync_first = tinynv_exec_download_sync_first(getenv("TINYNV_DOWNLOAD_SYNC_FIRST"));
   { const char *e = getenv("TINYNV_SHORT_FIRST_CHAIN");
     ex->short_chain = tinynv_exec_short_chain(e);
@@ -1914,7 +1925,9 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
     ex->inline_pend_max = tinynv_exec_pend_entries(e);
     // Bytes scale with entries rather than being a second knob: the two would otherwise have to be swept together and
     // the interesting variable is how many uploads a step makes, not how big they are.
-    ex->inline_pend_bytes_max = ex->inline_pend_max * 512u;
+    // 2 KB an entry since 2026-09-19, when the inline cap grew to 32 KB: at 512 B an entry the 8 KB upload every
+    // decode token makes filled the default list on its own and cost a batch of its own each time.
+    ex->inline_pend_bytes_max = ex->inline_pend_max * 2048u;
     if (ex->inline_pend_bytes_max > TINYNV_INLINE_PEND_CAP_BYTES)
       ex->inline_pend_bytes_max = TINYNV_INLINE_PEND_CAP_BYTES; }
 
