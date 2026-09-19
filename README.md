@@ -206,10 +206,13 @@ models/  logs/                not committed; see models/README.md
 - **MoE decode is at ~66% of native** and dense decode at ~90%: what remains is per-launch cost (~1.3 µs vs ~1) and a copy-engine ↔
   compute-engine runlist switch at each token boundary (~0.35 ms a token on this enclosure), measured and documented in the design
   docs. Fewer launches and bytes per token is the next lever, not the link.
-- **Latent, untested by design:** the driver reserves a flat 64 MB at the top of VRAM for the firmware, but the firmware's
-  write-protected region (WPR2) as read from the chip spans ~203 MB, starting ~161 MB below where the driver's allocator stops. Nothing
-  has broken because the allocator has never been half full. Do not raise `gspFwHeapSize` until the reservation is derived from the
-  firmware's own numbers (the fix in progress).
+- **The firmware's reservation is derived and checked (closed 2026-09-19).** The driver holds back 256 MB at the top of VRAM, sized
+  from the sizes it hands the firmware (`libtinynv/src/fw_layout.h`, static-asserted against their sum), and at every open reads the
+  chip's WPR2 registers and refuses to start if the manager's top is above the firmware's region. Measured on this card: WPR2 spans
+  202.9 MB starting 224.9 MB below the top, and the manager stops 29 MB below the firmware's unprotected heap. Before this the
+  hold-back was a flat 64 MB and the top 161 MB of what the allocator believed it owned was inside WPR2 - never hit only because
+  no run had filled the card. `totalGlobalMem` now reports what can actually be handed out (32,285 MB of 32,607); free space is
+  still reported as that total. Raising `gspFwHeapSize` without raising the reservation now fails the build.
 - CUDA graphs are compiled out (`GGML_CUDA_USE_GRAPHS` absent); `cudaGraph*` is stubbed. Upstream llama.cpp graphs hang on sm_120 anyway.
 - `test-backend-ops` MUL_MAT with mxfp4/nvfp4 hangs the card; probe it last in a session, if at all.
 - A llama.cpp checkout older than upstream `2f53959` corrupts its own heap in `test-backend-ops` on arm64 (ggml-cpu's rope work buffer)

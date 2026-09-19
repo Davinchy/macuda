@@ -11,9 +11,9 @@
 //
 //   TINYNV_HW=1 TINYNV_SOCKET=<socket> test_hw_fill     (sh tools/nv_shim_step.sh A probe build/shim/nv/test_hw_fill)
 //
-// Expected: the total allocated lands within a few hundred MB of the manager's size (the exec arena, the staging and
-// window pools and the page tables the mappings need take the rest), the refusal names the video memory region, every
-// pattern reads back, and the firmware answers afterwards exactly as before.
+// Expected (measured 2026-09-19): 31 pieces of 1 GiB, 31,744 MB, with the driver's own pools and tables holding the
+// other 541 MB of the manager's 32,285; every smaller piece then refused by the chunked path ("cannot be built from the
+// chunk sizes available"); every pattern reads back; GSP-RM's free-heap figure unchanged and the sensors answering.
 #include "tinynv.h"
 #include "fw_layout.h"
 #include <stdio.h>
@@ -48,6 +48,7 @@ int main(int argc, char **argv) {
 
   uint64_t heap_before = 0;
   int heap_known = !tinynv_device_gsp_free_heap(d, &heap_before);
+  if (heap_known) printf("  gsp-rm says it has %llu bytes of heap free before the fill\n", (unsigned long long)heap_before);
   tinynv_sensors_t s0, s1;
   int sens_known = tinynv_sensors(d, &s0) == TINYNV_OK;
 
@@ -71,7 +72,12 @@ int main(int argc, char **argv) {
            (unsigned long long)(steps[k] >> 20), n, (double)total / MB, refusal);
   }
   CHECK(n > 0 && n < MAX_BUFS, "%d buffers - either nothing could be allocated or the table filled before the card", n);
-  CHECK(strstr(refusal, "video memory region") != NULL, "the refusal does not name the video memory region: %s", refusal);
+  // Two wordings, one refusal: the region's own ("do not fit the ... video memory region") when a single piece is asked
+  // for, or the chunked path's ("cannot be built from the chunk sizes available") when tinynv_malloc has assembled what
+  // it could and names the remainder it could not - which is what a full card says (measured 2026-09-19: 31 GiB in 31
+  // pieces, then every smaller piece refused that way).
+  CHECK(strstr(refusal, "video memory region") != NULL || strstr(refusal, "cannot be built from the chunk sizes") != NULL,
+        "the refusal is neither the region's nor the chunked path's: %s", refusal);
   // What was allocated against what the manager says it has: the difference is what the driver itself holds (the
   // exec arena and its regions, the staging and window pools, the page tables these mappings needed).
   double held = ((double)props.total_mem - (double)total) / MB;

@@ -652,6 +652,20 @@ beside a manager that is not half full.
 **160.9 MB below where the manager stops** (measured; see §1 and `test_hw_wpr.c`). The reservation is a flat constant
 that derives from nothing, so the heap cannot grow until it does.
 
+> **Closed 2026-09-19 (`30751d1`; the plan is `wpr2-reservation-plan.md`).** The reservation is now derived: `fw_layout.h`
+> names every size handed to the firmware, sums what they could occupy (~240 MB) and static-asserts that the 256 MB
+> hold-back covers it; the boot reads `NV_PFB_PRI_MMU_WPR2_ADDR_LO/HI` after the firmware has placed itself and refuses
+> the open if the manager's top is above WPR2's base minus the non-WPR heap. **Measured, twice (cold and warm open,
+> identical):** WPR2 `0x7e7e20000..0x7f4901000`, 202.9 MB, starting 224.9 MB below the top of 32,607 MB; the manager now
+> stops at `0x7e5f00000` (32,351 MB), 31.1 MB below WPR2 and 29.0 MB below the unprotected non-WPR heap under it. The
+> old top, `0x7f1f00000`, was 161 MB inside the region - the number above, confirmed. The page-table reservation is the
+> same 64 MB for any hold-back under 351 MB on this card, so `pa.base` stayed `0x4200000` and the recorded boot replays
+> with zero divergences. `test_hw_fill` then allocated to refusal: 31 pieces of 1 GiB, 31,744 MB, the driver's own pools
+> and tables holding the other 541 MB of the manager's 32,285; every piece's first and last page written through the
+> engine and read back intact, GSP-RM's free-heap figure unchanged across the fill, sensors answering after. Raising
+> `gspFwHeapSize` is now *possible* (the static assert says by how much the reservation must follow) and still not
+> wanted: 135 MB is the vendor's formula for a 32 GB card, and this section's remedy for guest capacity stands.
+
 **So: serve guest allocations from the driver's manager.** Beyond capacity, this is the version where **we know the
 physical pages without asking.** `tinynv_c4b_ranges` needs `0x410103` today only because GSP-RM holds the memdesc; if
 the driver allocated the memory it already has the ranges, the card-dependent transport disappears, and guarantee 5's
