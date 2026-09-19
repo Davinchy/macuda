@@ -235,6 +235,7 @@ int main(void) {
     CHECK(tinynv_exec_keepalive(NULL) == 0, "the keep-alive is unmeasured and must be off unless asked");
     CHECK(tinynv_exec_ring_async(NULL) == 0 && tinynv_exec_ring_async("1") == 1 && tinynv_exec_ring_async("0") == 0,
           "the pipelined announcement is unmeasured and must be off unless asked");
+    CHECK(tinynv_exec_graph_resident(NULL) == 0 && tinynv_exec_graph_resident("1") == 1, "resident recordings are unmeasured and must be off unless asked");
   }
 
   // Whether small host-to-device copies ride in the pushbuffer. ON by default since it measured clean twice and +3%

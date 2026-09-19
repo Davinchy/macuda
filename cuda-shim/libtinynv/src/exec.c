@@ -57,6 +57,8 @@
 // When the compute engine went idle at the end of a chained batch, written by a host release that waits for idle, into
 // an address nothing else touches. Not read from the timeline's own report: see tinynv_exec_flush.
 #define SEM_TS_TAIL  768
+// Profile-only stamps for a resident token's chains: sixteen bytes each from 1024, one per chain (64 at most).
+#define SEM_TS_CHAIN(k) (1024 + 16 * (uint64_t)(k))
 // When the copy engine BEGAN a transfer, as against when it finished. Stamped as the batch's first method after its
 // acquire, so the pair brackets the transfer itself and separates "late to start" from "slow to run".
 #define SEM_TS_CSTART 896
@@ -327,6 +329,18 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
       // whatever is launched next ends an interval that holds idle time and the host's turnaround rather than a
       // kernel. Not `spun`: a wait that found the work already done leaves the engine exactly as idle, and the
       // first run of this instrument put several whole-token intervals on rope_multi and k_bin_bcast that way.
+      // The resident token's chain stamps, read once its last chain's value has been reached.
+      if (ex->profile && ex->graph_last_n && v >= ex->graph_last_at0 + (uint64_t)ex->graph_last_n - 1) {
+        uint64_t prev = 0;
+        for (int k = 0; k < ex->graph_last_n; k++) {
+          uint64_t pay = 0, clk = 0;
+          nv_rd_block(&ex->sem.dma.view, SEM_TS_CHAIN(k), &pay, sizeof(pay));
+          nv_rd_block(&ex->sem.dma.view, SEM_TS_CHAIN(k) + 8, &clk, sizeof(clk));
+          if (pay == ex->graph_last_at0 + (uint64_t)k && k && clk > prev && clk - prev < 100000000ull) { ex->graph_chain_ns[k] += clk - prev; ex->graph_chain_n[k]++; }
+          prev = clk;
+        }
+        ex->graph_last_n = 0;
+      }
       if (ex->kprof_on) {
         kprof_harvest(ex, v, 1);
         if (v >= ex->q_last[0]) ex->kboundary_pending = 1;
@@ -1525,6 +1539,144 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   return 0;
 }
 
+
+// TINYNV_GRAPH_RESIDENT - a recorded token, kept resident and run as one chain.
+//
+// Why this exists: with the delta path a decode's descriptors are byte-identical from one token to the next (every
+// chain after the first patches 29 dwords, which is none), yet each token still costs thirteen chain hand-overs, each
+// a submit with a fence read and an engine pickup of ~40 us, and the engine cannot start until the first chain of
+// 128 is built. A caller that captures its token (ggml's CUDA-graph path) says in advance which launches a token is;
+// the driver records them once into a region of their own, links all of them into one chain, and every replay is
+// one batch: the tail's release payload patched inline, an acquire on the previous work, the launch of the head.
+//
+// What a replay does not do is check that the caller's kernels still want what was recorded; that is the caller's
+// contract (CUDA's too), and ggml re-captures when a node's properties change.
+#define TINYNV_GRAPH_BYTES (16u << 20)
+
+int tinynv_exec_graph_begin(tinynv_exec_t *ex) {
+  if (!ex->graph_resident) return 1;
+  if (!ex->tail_release || ex->no_chain_deps || ex->sync) return 1;   // the chain shape a recording relies on
+  if (ex->rec) return tinynv_fail("a token is already being recorded");
+  if (tinynv_exec_flush(ex)) return -1;   // the caller's launches built before the recording are handed over first
+  tinynv_graph_rec_t *r = calloc(1, sizeof(*r));
+  if (!r) return tinynv_fail("out of memory for a recording");
+  r->size = TINYNV_GRAPH_BYTES;
+  if (ex->graph_pool_n) {
+    ex->graph_pool_n--;
+    r->mem = ex->graph_pool[ex->graph_pool_n].mem;
+    r->mirror = ex->graph_pool[ex->graph_pool_n].mirror;
+  } else {
+    // Mapped as the arena's descriptor region is: video memory, uncached, so the engine reads what the copy engine and
+    // the inline patches wrote and not a line it cached on the previous replay.
+    if (tinynv_mm_alloc_buffer(&ex->g->mm, r->size, 0, 0, 1, 1, 0, &r->mem)) { free(r); return -1; }
+    if (tinynv_mm_alloc_buffer(&ex->g->mm, r->size, 1, 1, 1, 0, 0, &r->mirror)) { tinynv_vmap_free(&ex->g->mm, &r->mem); free(r); return -1; }
+  }
+  ex->rec = r;
+  return 0;
+}
+
+void tinynv_exec_graph_free(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+  if (!r) return;
+  if (r->sealed && r->launches && !ex->torn_down) tinynv_exec_idle(ex);   // the engine may still be reading it
+  if (!ex->torn_down) {
+    if (r->mem.size && r->mirror.size && ex->graph_pool_n < 4) {
+      ex->graph_pool[ex->graph_pool_n].mem = r->mem;
+      ex->graph_pool[ex->graph_pool_n].mirror = r->mirror;
+      ex->graph_pool_n++;
+    } else {
+      if (r->mem.size) tinynv_vmap_free(&ex->g->mm, &r->mem);
+      if (r->mirror.size) tinynv_vmap_free(&ex->g->mm, &r->mirror);
+    }
+  }
+  free(r);
+}
+
+int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+  if (ex->rec) return tinynv_fail("a replay was asked for while a token is being recorded");
+  if (!r || !r->sealed) return tinynv_fail("that recording was never sealed");
+  if (tinynv_exec_flush(ex)) return -1;   // launches the caller built before this replay go first
+  uint64_t at0 = ex->reserved + 1;
+  if (at0 + (uint64_t)r->nchains > 0xffffffffull)
+    return tinynv_fail("the timeline has run past 32 bits (%llu batches)", (unsigned long long)at0);
+  // Every chain's tail releases its own value, so the chain after it can acquire on it: the tails are patched with
+  // this replay's values in a copy of each descriptor, and all of them are carried into video memory by the first
+  // batch, ahead of every launch. A releasing descriptor keeps the system-scope barrier whatever the knob asked.
+  const uint32_t qdw = (uint32_t)TINYNV_QMD_BYTES / 4u;
+  tinynv_qmd_t tails[TINYNV_GRAPH_CHAINS];
+  for (int k = 0; k < r->nchains; k++) {
+    tails[k] = r->chains[k].tail_qmd;
+    if (tinynv_qmd_release(&tails[k], ex->sem.va + SEM_SLOT(0), at0 + (uint64_t)k, ex->profile ? 1 : 0) < 0)
+      return tinynv_fail("the recording's chain %d has no free release slot", k);
+    if (ex->qmd_membar != TINYNV_QMD_MEMBAR_SYS && tinynv_qmd_membar(&tails[k], TINYNV_QMD_MEMBAR_SYS)) return -1;
+  }
+  tinynv_exec_keepalive_release(ex, 0);
+  for (int k = 0; k < r->nchains; k++) {
+    uint64_t va, at = at0 + (uint64_t)k;
+    tinynv_cmdbuf_t c;
+    // TINYNV_GRAPH_PACE: hand chain k over only once chain k-2 has released, the way the ordinary path's build
+    // time paces it - a measurement of whether batches queued far ahead cost the engine (their acquires poll host
+    // memory across the link for the whole of the chain before them). One chain of lookahead, like the host has.
+    if (ex->graph_pace && k >= 2) {
+      double t0 = now();
+      if (tinynv_submit_ring(ex->g)) return -1;   // what is staged must be announced before anything is waited for
+      while (sem_read_slot(ex, 0) < at0 + (uint64_t)k - 2) {
+        if (now() - t0 > 2.0) return tinynv_fail("the resident token's chain %d did not release in 2 s", k - 2);
+      }
+    }
+    uint32_t want = 48u + (k == 0 ? (8u + qdw) * (uint32_t)r->nchains : 0u) + (ex->profile ? 16u : 0u);
+    // All but the last chain's batch are staged: one fence read and one doorbell announce the whole token.
+    ex->defer_ring = k < r->nchains - 1;
+    if (batch_begin(ex, &ex->g->gsp.compute_q, want, &c, &va)) { ex->defer_ring = 0; return -1; }
+    if (k == 0)
+      for (int i = 0; i < r->nchains; i++)
+        if (tinynv_cmd_inline_upload(&c, r->chains[i].tail_va, tails[i].b, TINYNV_QMD_BYTES)) { ex->defer_ring = 0; return -1; }
+    if (!ex->sync && ex->q_last[0]) {
+      if (tinynv_cmd_wait(&c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) { ex->defer_ring = 0; return -1; }
+      ex->pending_acquire = ex->q_last[0];
+    }
+    if (tinynv_cmd_memory_barrier(&c)) { ex->defer_ring = 0; return -1; }
+    if (tinynv_cmd_launch(&c, r->chains[k].head_va)) { ex->defer_ring = 0; return -1; }
+    if (ex->profile && k == r->nchains - 1 && tinynv_cmd_release_clocked(&c, ex->sem.va + SEM_TS_TAIL, at)) { ex->defer_ring = 0; return -1; }
+    if (ex->profile && k < 64 && tinynv_cmd_release_clocked(&c, ex->sem.va + SEM_TS_CHAIN(k), at)) { ex->defer_ring = 0; return -1; }
+    ex->reserved = at;
+    ex->flush_lo = at;
+    ex->flush_n = (int)r->chains[k].n;
+    ex->pending_head_va = r->chains[k].head_va;
+    ex->pending_head_sum = qmd_sum(r->chains[k].head_host);
+    if (submit_batch(ex, &ex->g->gsp.compute_q, &c, va, at, (int)r->chains[k].n)) { ex->defer_ring = 0; return -1; }
+  }
+  ex->defer_ring = 0;
+  { PROF_START(ex); int bad = tinynv_gsp_poll(ex->g); PROF_END(ex, PROF_POLL);
+    if (bad) return tinynv_fail("gsp-rm reported a fault, logged above"); }
+  r->launches++;
+  ex->graph_replays++;
+  if (ex->profile) { ex->graph_last_at0 = at0; ex->graph_last_n = r->nchains < 64 ? r->nchains : 64; }
+  return 0;
+}
+
+int tinynv_exec_graph_end(tinynv_exec_t *ex, tinynv_graph_rec_t **out) {
+  tinynv_graph_rec_t *r = ex->rec;
+  *out = NULL;
+  if (!r) return tinynv_fail("no token is being recorded");
+  ex->rec = NULL;
+  int failed = r->failed, n = (int)r->n;
+  if (failed || !n) {
+    tinynv_exec_graph_free(ex, r);
+    return failed ? -1 : tinynv_fail("the recording holds no launches");
+  }
+  { tinynv_graph_chain_t *ch = &r->chains[r->nchains - 1];   // the last chain ends at the last descriptor
+    ch->tail_va = (uint64_t)(r->prev_host - (uint8_t *)r->mirror.dma.va) + r->mem.va;
+    ch->tail_qmd = r->prev_qmd; }
+  // The descriptors cross the link once, by the copy engine; every replay reads them from video memory. The first
+  // replay's batch acquires on this copy through batch_begin, which orders a compute batch after the copy queue.
+  if (tinynv_exec_copy(ex, r->mem.va, r->mirror.va, r->used)) { tinynv_exec_graph_free(ex, r); return -1; }
+  r->sealed = 1;
+  ex->graph_records++;
+  *out = r;
+  if (tinynv_exec_graph_launch(ex, r)) { *out = NULL; tinynv_exec_graph_free(ex, r); return -1; }
+  return 0;
+}
+
 // Waiting for everything means everything, including launches that are built and not yet handed over: those have
 // timeline values nothing has been told to release, so waiting without flushing first waits out the whole timeout.
 int tinynv_exec_idle(tinynv_exec_t *ex) {
@@ -1794,6 +1946,104 @@ void tinynv_exec_unload(tinynv_mm_t *mm, tinynv_exec_module_t *m) {
 
 // The whole of a launch as the caller sees it, timed as one thing. Everything else the summary reports is subtracted
 // from this, so if the parts do not add up the difference is real work nobody has named yet rather than a rounding.
+// One descriptor, as this driver builds them: the kernel's own numbers, the constant banks, the tail the measurement
+// knobs asked for. Shared by the ordinary launch and the recorder, so a recorded token's descriptors are exactly the
+// ones a plain launch would have built at that address.
+static int build_qmd(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k, const uint32_t grid[3],
+                     const uint32_t block[3], uint32_t dyn_smem, uint32_t cbuf0_bytes, uint64_t qmd_va, uint64_t slot,
+                     tinynv_qmd_t *out) {
+  tinynv_gsp_t *gsp = &ex->g->gsp;
+  tinynv_qmd_t q;
+  memset(&q, 0, sizeof(q));
+  tinynv_qmd_program_t prog = {.regs = k->regs,
+                               // What the kernel declared plus what the caller asked for at the call site. The descriptor
+                               // holds one number, so the two have to be added here: a kernel given only its static
+                               // share does not fail, it indexes past the end of what it was given.
+                               .shmem = (uint32_t)((0x400 + k->static_smem + dyn_smem + 127) & ~127u),
+                               .slm_per_thread = ex->slm_per_thread,
+                               .prog_size = (uint32_t)k->text_size,
+                               .sass_version = tinynv_sass_version(gsp->sm_version)};
+  tinynv_qmd_launch_t l = {.program_addr = m->mem.va + m->layout.text_off};
+  for (int i = 0; i < 3; i++) { l.grid[i] = grid[i]; l.block[i] = block[i]; }
+
+  // Bank 0 is the one being built here, in this allocation; the rest are sections of the image, and a kernel that reads
+  // a __device__ table finds its address in one of them.
+  prog.constbuf_used[0] = 1;
+  // The tail of every descriptor: the oracle's unless a measurement mode asked otherwise. With per-launch releases
+  // (TINYNV_TAIL_RELEASE=0) every descriptor releases and keeps the system-scope barrier, so the membar knob only
+  // reaches the non-releasing links of a tail-released chain; the flush puts the tail back to system scope.
+  prog.membar = ex->tail_release ? ex->qmd_membar : TINYNV_QMD_MEMBAR_SYS;
+  prog.invalidate = ex->qmd_invalidate;
+  // The size bound is the cubin's section, not the allocation: nvcc sizes .nv.constant0 to exactly the driver's
+  // parameters plus the kernel's, so it always covers the arguments written below, and the allocation is only larger
+  // because constant buffers are placed on 256 byte boundaries. Binding the allocation's size instead would tell the
+  // hardware a buffer is bigger than the compiler said it was.
+  prog.constbuf_size[0] = m->layout.constbuf[0].used ? (uint32_t)m->layout.constbuf[0].size : cbuf0_bytes;
+  l.constbuf_addr[0] = qmd_va + slot;
+  l.constbuf_set[0] = 1;
+  for (int i = 1; i < TINYNV_QMD_CONSTBUFS; i++) {
+    if (!m->layout.constbuf[i].used) continue;
+    prog.constbuf_used[i] = 1;
+    prog.constbuf_size[i] = (uint32_t)m->layout.constbuf[i].size;
+    l.constbuf_addr[i] = m->mem.va + m->layout.constbuf[i].off;
+    l.constbuf_set[i] = 1;
+  }
+
+  int rc = tinynv_qmd_program(&q, &prog) || tinynv_qmd_launch(&q, &l);
+  if (!rc && q.overlaps) rc = tinynv_fail("%u bits of the descriptor were claimed twice", q.overlaps);
+  if (rc) return -1;
+  *out = q;
+  return 0;
+}
+
+// TINYNV_GRAPH_RESIDENT: a launch while a token is being recorded goes into the recording's own region - the same
+// descriptor, at an address the engine will read on every replay - and is linked to the one before it. Nothing is
+// reserved on the timeline and nothing is handed over: the whole token becomes one chain, sealed and run by
+// tinynv_exec_graph_end, and run again by tinynv_exec_graph_launch.
+static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k, const uint32_t grid[3],
+                      const uint32_t block[3], uint32_t dyn_smem, const void *params, size_t params_len, uint32_t cbuf0_bytes) {
+  tinynv_graph_rec_t *r = ex->rec;
+  const uint64_t slot = TINYNV_QMD_SLOT_BYTES, need = slot + cbuf0_bytes;
+  uint64_t off = (r->used + 255) & ~255ull;
+  if (off + need > r->size) {
+    r->failed = 1;
+    return tinynv_fail("the recorded token does not fit its resident region (%llu MB, %u launches so far)",
+                       (unsigned long long)(r->size >> 20), r->n);
+  }
+  uint8_t *host = (uint8_t *)r->mirror.dma.va + off;
+  uint64_t qmd_va = r->mem.va + off;
+  tinynv_qmd_t q;
+  if (build_qmd(ex, m, k, grid, block, dyn_smem, cbuf0_bytes, qmd_va, slot, &q)) { r->failed = 1; return -1; }
+  tinynv_graph_chain_t *ch = r->nchains ? &r->chains[r->nchains - 1] : NULL;
+  if (ch && ch->n >= (uint32_t)ex->chain_max) {
+    // this chain is full: it ends at the previous descriptor and the next one starts here
+    ch->tail_va = r->used ? (uint64_t)(r->prev_host - (uint8_t *)r->mirror.dma.va) + r->mem.va : 0;
+    ch->tail_qmd = r->prev_qmd;
+    ch = NULL;
+  }
+  if (ch) {
+    // the previous descriptor schedules this one; its bytes are written again with the link in them
+    if (tinynv_qmd_chain(&r->prev_qmd, qmd_va, ex->chain_prefetch)) { r->failed = 1; return -1; }
+    memcpy(r->prev_host, r->prev_qmd.b, TINYNV_QMD_BYTES);
+  } else {
+    if (r->nchains == TINYNV_GRAPH_CHAINS) { r->failed = 1; return tinynv_fail("the recorded token has more than %d chains", TINYNV_GRAPH_CHAINS); }
+    ch = &r->chains[r->nchains++];
+    memset(ch, 0, sizeof(*ch));
+    ch->head_va = qmd_va;
+    ch->head_host = host;
+  }
+  ch->n++;
+  memcpy(host, q.b, TINYNV_QMD_BYTES);
+  memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
+  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
+  if (params_len) memcpy(host + slot + k->param_base, params, params_len);
+  r->prev_qmd = q;
+  r->prev_host = host;
+  r->n++;
+  r->used = off + need;
+  return 0;
+}
+
 int tinynv_exec_run(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k, const uint32_t grid[3],
                     const uint32_t block[3], uint32_t dyn_smem, const void *params, size_t params_len) {
   int tinynv_exec_run_inner(tinynv_exec_t *, tinynv_exec_module_t *, const tinynv_kernel_desc_t *, const uint32_t[3],
@@ -1807,7 +2057,6 @@ int tinynv_exec_run(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_ker
 int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k,
                           const uint32_t grid[3], const uint32_t block[3], uint32_t dyn_smem, const void *params,
                           size_t params_len) {
-  tinynv_gsp_t *gsp = &ex->g->gsp;
 
   // A kernel's stack, plus what the driver reserves below it. This is per thread; the die multiplies it out.
   if (tinynv_exec_ensure_local_memory(ex, k->min_stack + 0x240)) return -1;
@@ -1821,6 +2070,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   if (cbuf0_bytes < TINYNV_QMD_CBUF0_MIN_DWORDS * 4) cbuf0_bytes = TINYNV_QMD_CBUF0_MIN_DWORDS * 4;
   cbuf0_bytes = (cbuf0_bytes + 0xff) & ~0xffu;                 // constant buffers start and end 256 aligned
   uint64_t slot = TINYNV_QMD_SLOT_BYTES;
+  if (ex->rec) return rec_launch(ex, m, k, grid, block, dyn_smem, params, params_len, cbuf0_bytes);
 
   // Two reasons to hand the chain over before building into it: it is full, or the arena has no room left and is about
   // to start again from the bottom, which would give these descriptors' bytes to something else. Both are checked here
@@ -1869,44 +2119,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   if (!host) return -1;
 
   tinynv_qmd_t q;
-  memset(&q, 0, sizeof(q));
-  tinynv_qmd_program_t prog = {.regs = k->regs,
-                               // What the kernel declared plus what the caller asked for at the call site. The descriptor
-                               // holds one number, so the two have to be added here: a kernel given only its static
-                               // share does not fail, it indexes past the end of what it was given.
-                               .shmem = (uint32_t)((0x400 + k->static_smem + dyn_smem + 127) & ~127u),
-                               .slm_per_thread = ex->slm_per_thread,
-                               .prog_size = (uint32_t)k->text_size,
-                               .sass_version = tinynv_sass_version(gsp->sm_version)};
-  tinynv_qmd_launch_t l = {.program_addr = m->mem.va + m->layout.text_off};
-  for (int i = 0; i < 3; i++) { l.grid[i] = grid[i]; l.block[i] = block[i]; }
-
-  // Bank 0 is the one being built here, in this allocation; the rest are sections of the image, and a kernel that reads
-  // a __device__ table finds its address in one of them.
-  prog.constbuf_used[0] = 1;
-  // The tail of every descriptor: the oracle's unless a measurement mode asked otherwise. With per-launch releases
-  // (TINYNV_TAIL_RELEASE=0) every descriptor releases and keeps the system-scope barrier, so the membar knob only
-  // reaches the non-releasing links of a tail-released chain; the flush puts the tail back to system scope.
-  prog.membar = ex->tail_release ? ex->qmd_membar : TINYNV_QMD_MEMBAR_SYS;
-  prog.invalidate = ex->qmd_invalidate;
-  // The size bound is the cubin's section, not the allocation: nvcc sizes .nv.constant0 to exactly the driver's
-  // parameters plus the kernel's, so it always covers the arguments written below, and the allocation is only larger
-  // because constant buffers are placed on 256 byte boundaries. Binding the allocation's size instead would tell the
-  // hardware a buffer is bigger than the compiler said it was.
-  prog.constbuf_size[0] = m->layout.constbuf[0].used ? (uint32_t)m->layout.constbuf[0].size : cbuf0_bytes;
-  l.constbuf_addr[0] = qmd_va + slot;
-  l.constbuf_set[0] = 1;
-  for (int i = 1; i < TINYNV_QMD_CONSTBUFS; i++) {
-    if (!m->layout.constbuf[i].used) continue;
-    prog.constbuf_used[i] = 1;
-    prog.constbuf_size[i] = (uint32_t)m->layout.constbuf[i].size;
-    l.constbuf_addr[i] = m->mem.va + m->layout.constbuf[i].off;
-    l.constbuf_set[i] = 1;
-  }
-
-  int rc = tinynv_qmd_program(&q, &prog) || tinynv_qmd_launch(&q, &l);
-  if (!rc && q.overlaps) rc = tinynv_fail("%u bits of the descriptor were claimed twice", q.overlaps);
-  if (rc) return -1;
+  if (build_qmd(ex, m, k, grid, block, dyn_smem, cbuf0_bytes, qmd_va, slot, &q)) return -1;
 
   // The kernel reports its own completion rather than the command stream reporting it. That is what removes the
   // wait-for-idle between launches: a release in the command stream has to wait for the engine to go quiet before it
@@ -1961,8 +2174,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
       tinynv_qmd_chain(&ex->chain[ex->nchain - 1].qmd, qmd_va, ex->chain_prefetch)) return -1;
 
   memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
-  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW,
-                   l.grid, l.block);
+  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
   if (params_len) memcpy(host + slot + k->param_base, params, params_len);
 
   // Held, not handed over: the next launch still has to be able to write its address into this descriptor. The bytes
@@ -2021,6 +2233,8 @@ int tinynv_exec_kernel_profile(const char *e) { return e && *e && *e != '0'; }
 // spin's ceiling (the watchdog), 2,000 us unless asked, never under 50 or over 20,000.
 // TINYNV_RING_ASYNC: off until measured on both decodes and soaked.
 int tinynv_exec_ring_async(const char *e) { return e && *e && *e != '0'; }
+// TINYNV_GRAPH_RESIDENT: off until measured on both decodes and soaked.
+int tinynv_exec_graph_resident(const char *e) { return e && *e && *e != '0'; }
 int tinynv_exec_keepalive(const char *e) { return e && *e && *e != '0'; }
 unsigned tinynv_exec_keepalive_us(const char *e) {
   if (!e || !*e) return 2000;
@@ -2338,6 +2552,10 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   { const char *e5 = getenv("TINYNV_LAUNCH_PROFILE"); ex->profile = e5 && *e5 && *e5 != '0'; }
   ex->kprof = tinynv_exec_kernel_profile(getenv("TINYNV_KERNEL_PROFILE"));
   ex->ring_async = tinynv_exec_ring_async(getenv("TINYNV_RING_ASYNC"));
+  ex->graph_resident = tinynv_exec_graph_resident(getenv("TINYNV_GRAPH_RESIDENT"));
+  { const char *e = getenv("TINYNV_GRAPH_PACE"); ex->graph_pace = e && *e && *e != '0'; }
+  if (ex->graph_resident)
+    fprintf(stderr, "libtinynv: recorded tokens are kept resident and run as one chain (TINYNV_GRAPH_RESIDENT was asked for)\n");
   if (ex->ring_async)
     fprintf(stderr, "libtinynv: announcements are pipelined (TINYNV_RING_ASYNC was asked for): the fence read is sent with the "
                     "batch and the doorbell rung sixteen launches into the next chain\n");
@@ -2522,6 +2740,17 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
     }
     fprintf(stderr, "\n");
   }
+  if (ex->graph_records)
+    fprintf(stderr, "libtinynv: %llu tokens recorded as resident chains, replayed %llu times under one announcement each\n",
+            (unsigned long long)ex->graph_records, (unsigned long long)ex->graph_replays);
+  if (ex->profile && ex->graph_records) {
+    fprintf(stderr, "libtinynv:   resident chains, engine clock, chain k's end minus chain k-1's (the hand-over plus the chain):");
+    for (int k = 1; k < TINYNV_GRAPH_CHAINS; k++)
+      if (ex->graph_chain_n[k]) fprintf(stderr, "%s%d: %.0f us (%llu)", k % 6 == 1 ? "\nlibtinynv:     " : "  ", k,
+                                        (double)ex->graph_chain_ns[k] / 1e3 / (double)ex->graph_chain_n[k], (unsigned long long)ex->graph_chain_n[k]);
+    fprintf(stderr, "\n");
+  }
+  if (ex->rec) { ex->rec->failed = 1; tinynv_graph_rec_t *r = ex->rec; ex->rec = NULL; tinynv_exec_graph_free(ex, r); }
   if (ex->nsubmit)
     fprintf(stderr, "libtinynv: %llu batches submitted: %llu launch chains, %llu other compute batches, %llu copy-engine batches\n",
             (unsigned long long)ex->nsubmit, (unsigned long long)ex->nsubmit_kind[0], (unsigned long long)ex->nsubmit_kind[1],
@@ -2694,6 +2923,7 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
   }
   tinynv_vmap_free(&ex->g->mm, &ex->sem);
   if (ex->kring.size) tinynv_vmap_free(&ex->g->mm, &ex->kring);
+  for (int i = 0; i < ex->graph_pool_n; i++) { tinynv_vmap_free(&ex->g->mm, &ex->graph_pool[i].mem); tinynv_vmap_free(&ex->g->mm, &ex->graph_pool[i].mirror); }
   if (ex->ka_flag.size) tinynv_vmap_free(&ex->g->mm, &ex->ka_flag);
   free(ex->kslot);
   free(ex->krow);

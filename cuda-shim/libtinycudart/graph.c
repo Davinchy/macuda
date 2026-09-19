@@ -45,10 +45,10 @@ typedef struct {
 } gnode_t;
 
 struct CUgraph_st { gnode_t *nodes; size_t n, cap; };
-struct CUgraphExec_st { gnode_t *nodes; size_t n; unsigned long launched; };
+struct CUgraphExec_st { gnode_t *nodes; size_t n; unsigned long launched; tinynv_graph_t drv; int drv_refused; };
 
 static struct { int active, invalid; tinynv_stream_t nvs; struct CUgraph_st *g; } cap;
-static unsigned long g_captures, g_graph_launches, g_nodes_replayed, g_nodes_recorded;
+static unsigned long g_captures, g_graph_launches, g_nodes_replayed, g_nodes_recorded, g_resident_replays, g_resident_records;
 
 static tinynv_stream_t nvs_of(cudaStream_t s) { return (uintptr_t)s > 2 ? (tinynv_stream_t)s : tinycudart_default_stream(); }
 static cudaError_t E(cudaError_t e) { tinycudart_set_error(e); return e; }
@@ -156,10 +156,15 @@ cudaError_t cudaGraphInstantiate(cudaGraphExec_t *pExec, cudaGraph_t graph, unsi
   *pExec = (cudaGraphExec_t)e;
   return E(cudaSuccess);
 }
+static void drop_resident(struct CUgraphExec_st *e) {
+  if (e->drv) { tinynv_graph_free(tinycudart_default_stream(), e->drv); e->drv = NULL; }
+  e->drv_refused = 0;
+}
 cudaError_t cudaGraphExecUpdate(cudaGraphExec_t exec, cudaGraph_t graph, cudaGraphExecUpdateResultInfo *info) {
   struct CUgraphExec_st *e = (struct CUgraphExec_st *)exec;
   struct CUgraph_st *g = (struct CUgraph_st *)graph;
   if (!e || !g) return E(cudaErrorInvalidValue);
+  drop_resident(e);   // the new recording is a different token
   gnode_t *fresh = clone_nodes(g->nodes, g->n);
   if (!fresh) return E(cudaErrorMemoryAllocation);
   free_nodes(e->nodes, e->n);
@@ -168,21 +173,54 @@ cudaError_t cudaGraphExecUpdate(cudaGraphExec_t exec, cudaGraph_t graph, cudaGra
   if (info) { memset(info, 0, sizeof(*info)); info->result = cudaGraphExecUpdateSuccess; }
   return E(cudaSuccess);
 }
+// One replay of the recording. With the driver keeping the token resident (TINYNV_GRAPH_RESIDENT), the first replay
+// records it there - the copies run, the launches are recorded rather than run, and sealing runs the whole token as
+// one chain - and every replay after that is the copies followed by one batch. The driver's recording needs every
+// copy and fill to come before the first launch (they run on the copy queue ahead of the chain); a recording where
+// they do not is replayed launch by launch, as is one the driver declines.
+static cudaError_t replay_launch(gnode_t *nd, tinynv_stream_t nvs, size_t i) {
+  tinycudart_count_launch(nd->name);
+  double t0 = tinycudart_now_ns();
+  tinynv_status_t st = tinynv_launch(nvs, nd->k, nd->g[0], nd->g[1], nd->g[2], nd->b[0], nd->b[1], nd->b[2], nd->smem, nd->params, nd->plen);
+  tinycudart_time_launch(nd->name, tinycudart_now_ns() - t0);
+  if (st != TINYNV_OK) {
+    fprintf(stderr, "[tinycudart] graph launch: node %zu (%s) failed: %s (%s)\n", i, nd->name, tinynv_status_str(st), tinynv_last_error());
+    return E(cudaErrorUnknown);
+  }
+  return cudaSuccess;
+}
 cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t s) {
   struct CUgraphExec_st *e = (struct CUgraphExec_st *)exec;
   if (!e) return E(cudaErrorInvalidValue);
   tinynv_stream_t nvs = nvs_of(s);
+  if (e->drv) {
+    for (size_t i = 0; i < e->n; i++) {
+      gnode_t *nd = &e->nodes[i];
+      cudaError_t r = nd->kind == 1 ? cudaMemcpyAsync(nd->dst, nd->src, nd->n, (enum cudaMemcpyKind)nd->mkind, s)
+                    : nd->kind == 2 ? cudaMemsetAsync(nd->dst, nd->value, nd->n, s) : cudaSuccess;
+      if (r != cudaSuccess) return r;
+    }
+    tinynv_status_t st = tinynv_graph_launch(nvs, e->drv);
+    if (st != TINYNV_OK) {
+      fprintf(stderr, "[tinycudart] the resident token could not be replayed (%s)\n", tinynv_last_error());
+      return E(cudaErrorUnknown);
+    }
+    e->launched++; g_graph_launches++; g_nodes_replayed += e->n; g_resident_replays++;
+    return E(cudaSuccess);
+  }
+  int recording = 0;
+  if (!e->drv_refused) {
+    int launches_seen = 0, ordered = 1;
+    for (size_t i = 0; i < e->n; i++) { if (e->nodes[i].kind == 0) launches_seen = 1; else if (launches_seen) ordered = 0; }
+    tinynv_status_t st = ordered ? tinynv_graph_begin(nvs) : TINYNV_ERR_UNSUPPORTED;
+    if (st == TINYNV_OK) recording = 1;
+    else { e->drv_refused = 1; if (st != TINYNV_ERR_UNSUPPORTED) fprintf(stderr, "[tinycudart] the token will not be kept resident (%s); replaying launch by launch\n", tinynv_last_error()); }
+  }
   for (size_t i = 0; i < e->n; i++) {
     gnode_t *nd = &e->nodes[i];
     if (nd->kind == 0) {
-      tinycudart_count_launch(nd->name);
-      double t0 = tinycudart_now_ns();
-      tinynv_status_t st = tinynv_launch(nvs, nd->k, nd->g[0], nd->g[1], nd->g[2], nd->b[0], nd->b[1], nd->b[2], nd->smem, nd->params, nd->plen);
-      tinycudart_time_launch(nd->name, tinycudart_now_ns() - t0);
-      if (st != TINYNV_OK) {
-        fprintf(stderr, "[tinycudart] graph launch: node %zu (%s) failed: %s (%s)\n", i, nd->name, tinynv_status_str(st), tinynv_last_error());
-        return E(cudaErrorUnknown);
-      }
+      cudaError_t r = replay_launch(nd, nvs, i);
+      if (r != cudaSuccess) return r;
     } else if (nd->kind == 1) {
       cudaError_t r = cudaMemcpyAsync(nd->dst, nd->src, nd->n, (enum cudaMemcpyKind)nd->mkind, s);
       if (r != cudaSuccess) return r;
@@ -190,6 +228,15 @@ cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t s) {
       cudaError_t r = cudaMemsetAsync(nd->dst, nd->value, nd->n, s);
       if (r != cudaSuccess) return r;
     }
+  }
+  if (recording) {
+    tinynv_status_t st = tinynv_graph_end(nvs, &e->drv);
+    if (st != TINYNV_OK || !e->drv) {
+      // the recorded launches did not run: run them now, and never record this one again
+      e->drv = NULL; e->drv_refused = 1;
+      fprintf(stderr, "[tinycudart] the token could not be kept resident (%s); replaying launch by launch\n", tinynv_last_error());
+      for (size_t i = 0; i < e->n; i++) if (e->nodes[i].kind == 0) { cudaError_t r = replay_launch(&e->nodes[i], nvs, i); if (r != cudaSuccess) return r; }
+    } else g_resident_records++;
   }
   e->launched++;
   g_graph_launches++;
@@ -203,13 +250,14 @@ cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
 }
 cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
   struct CUgraphExec_st *e = (struct CUgraphExec_st *)exec;
-  if (e) { free_nodes(e->nodes, e->n); free(e); }
+  if (e) { drop_resident(e); free_nodes(e->nodes, e->n); free(e); }
   return E(cudaSuccess);
 }
 // At exit, whenever a capture happened: how much of the run was replayed rather than issued by the caller.
 void tinycudart_graph_stats(void) {
   if (!g_captures) return;
-  fprintf(stderr, "[tinycudart] graphs: %lu captures recorded %lu nodes; %lu graph launches replayed %lu nodes (%.1f a launch)\n",
+  fprintf(stderr, "[tinycudart] graphs: %lu captures recorded %lu nodes; %lu graph launches replayed %lu nodes (%.1f a launch); "
+                  "%lu tokens kept resident by the driver, %lu replays as one batch\n",
           g_captures, g_nodes_recorded, g_graph_launches, g_nodes_replayed,
-          g_graph_launches ? (double)g_nodes_replayed / (double)g_graph_launches : 0.0);
+          g_graph_launches ? (double)g_nodes_replayed / (double)g_graph_launches : 0.0, g_resident_records, g_resident_replays);
 }

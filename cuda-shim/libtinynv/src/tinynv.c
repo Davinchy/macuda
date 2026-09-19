@@ -106,6 +106,7 @@ static void put_the_card_down(void) {
                     "acknowledged their invalidate. The card was not asked for memory again after that.\n",
             (unsigned long long)g_dev.gpu.mm.leaked_bytes, (unsigned long long)g_dev.gpu.mm.leaked_n);
   tinynv_exec_idle(&g_dev.exec);   // let what was submitted finish before the mappings under it go away
+  g_dev.exec.torn_down = 1;
   g_dev.booted = 0;
   g_dev.torn_down = 1;
   tinynv_exec_fini(&g_dev.exec);
@@ -665,6 +666,32 @@ static void keepalive_launch(tinynv_stream_t s) {
   }
 }
 
+tinynv_status_t tinynv_graph_begin(tinynv_stream_t s) {
+  if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
+  NEED_GPU(s);
+  int rc = WITH_LOCK(tinynv_exec_graph_begin(&s->dev->exec));
+  return rc == 1 ? TINYNV_ERR_UNSUPPORTED : rc ? TINYNV_ERR_DRIVER : TINYNV_OK;
+}
+tinynv_status_t tinynv_graph_end(tinynv_stream_t s, tinynv_graph_t *out) {
+  if (out) *out = NULL;
+  if (!ON_GPU(s) || !out) return TINYNV_ERR_UNSUPPORTED;
+  tinynv_graph_rec_t *r = NULL;
+  int rc = WITH_LOCK(tinynv_exec_graph_end(&s->dev->exec, &r));
+  *out = (tinynv_graph_t)r;
+  return rc ? TINYNV_ERR_DRIVER : TINYNV_OK;
+}
+tinynv_status_t tinynv_graph_launch(tinynv_stream_t s, tinynv_graph_t g) {
+  if (!ON_GPU(s) || !g) return TINYNV_ERR_INVALID;
+  NEED_GPU(s);
+  s->submitted++;
+  return WITH_LOCK(tinynv_exec_graph_launch(&s->dev->exec, (tinynv_graph_rec_t *)g)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+}
+void tinynv_graph_free(tinynv_stream_t s, tinynv_graph_t g) {
+  if (!g || !s) return;
+  s->dev->exec.torn_down = s->dev->torn_down;
+  WITH_LOCK((tinynv_exec_graph_free(&s->dev->exec, (tinynv_graph_rec_t *)g), 0));
+}
+
 tinynv_status_t tinynv_memcpy_dtoh(tinynv_stream_t s, void *dst, tinynv_devptr_t src, size_t n) {
   if (ON_GPU(s)) {
     NEED_GPU(s);
@@ -1044,6 +1071,7 @@ const char *tinynv_status_str(tinynv_status_t s) {
     case TINYNV_ERR_LAUNCH: return "bad launch";
     case TINYNV_ERR_INVALID: return "invalid argument";
     case TINYNV_ERR_DRIVER: return "the driver could not do it: tinynv_last_error() says what went wrong";
+    case TINYNV_ERR_UNSUPPORTED: return "not supported here";
   }
   return "unknown";
 }

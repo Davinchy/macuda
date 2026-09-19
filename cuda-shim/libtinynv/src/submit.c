@@ -377,7 +377,12 @@ int tinynv_submit_ring_complete(tinynv_gpu_t *g) {
     fprintf(stderr, "tinynv: the write pointer reads back as written, so the read before the doorbell reaches the "
             "device\n");
   }
-  for (int i = 0; i < g->ring_n; i++) tinynv_wr32(&g->dev, TINYNV_DOORBELL, g->ring_q[i]->token);
+  // one doorbell per queue, however many of its batches were staged: the doorbell says "look", not "how many"
+  for (int i = 0; i < g->ring_n; i++) {
+    int seen = 0;
+    for (int j = 0; j < i; j++) if (g->ring_q[j] == g->ring_q[i]) { seen = 1; break; }
+    if (!seen) tinynv_wr32(&g->dev, TINYNV_DOORBELL, g->ring_q[i]->token);
+  }
   g->ring_n = 0;
   g->ring_pending = 0;
   return 0;

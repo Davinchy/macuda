@@ -17,7 +17,7 @@ typedef struct tinynv_stream* tinynv_stream_t;   // in-order queue (GPFIFO sub-q
 typedef struct tinynv_event*  tinynv_event_t;    // timeline value
 typedef uint64_t tinynv_devptr_t;                // device VA
 
-typedef enum { TINYNV_OK=0, TINYNV_ERR_NODEV, TINYNV_ERR_OOM, TINYNV_ERR_LAUNCH, TINYNV_ERR_INVALID, TINYNV_ERR_DRIVER } tinynv_status_t;
+typedef enum { TINYNV_OK=0, TINYNV_ERR_NODEV, TINYNV_ERR_OOM, TINYNV_ERR_LAUNCH, TINYNV_ERR_INVALID, TINYNV_ERR_DRIVER, TINYNV_ERR_UNSUPPORTED } tinynv_status_t;
 
 // Why the last call failed, in a sentence, for the thread that made it. A status says which kind of thing went wrong;
 // this says which thing. Without it a launch refused for asking 131,200 bytes of shared memory when the driver has
@@ -115,6 +115,16 @@ tinynv_status_t tinynv_set_download_kernel(tinynv_device_t, tinynv_kernel_t,
 // the next batch, where a mid-token seam costs ~40 us. Two parameters, both 8 bytes: the flag's address and the
 // cycle budget. Registration alone changes nothing; the knob does, and names itself at start-up.
 tinynv_status_t tinynv_set_keepalive_kernel(tinynv_device_t, tinynv_kernel_t);
+// A recorded token (TINYNV_GRAPH_RESIDENT=1): between begin and end every launch on the stream is recorded into a
+// resident chain instead of run; end seals the recording and runs it once; launch runs it again as one batch. Copies
+// issued between begin and end run as usual, so a caller replaying a CUDA graph issues its copy nodes first, then
+// the launch nodes. begin answers TINYNV_ERR_UNSUPPORTED when the driver will not record (the knob is off, the null
+// device, a chain shape a recording cannot rely on): the caller then replays launch by launch.
+typedef struct tinynv_graph *tinynv_graph_t;
+tinynv_status_t tinynv_graph_begin(tinynv_stream_t);
+tinynv_status_t tinynv_graph_end(tinynv_stream_t, tinynv_graph_t *out);
+tinynv_status_t tinynv_graph_launch(tinynv_stream_t, tinynv_graph_t);
+void tinynv_graph_free(tinynv_stream_t, tinynv_graph_t);
 tinynv_status_t tinynv_event_create(tinynv_device_t, tinynv_event_t* out);
 tinynv_status_t tinynv_event_record(tinynv_event_t, tinynv_stream_t);
 tinynv_status_t tinynv_event_sync(tinynv_event_t);

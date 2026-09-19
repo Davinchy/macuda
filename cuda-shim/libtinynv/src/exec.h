@@ -75,6 +75,24 @@ typedef struct {
   uint8_t tail;       // the last launch of its chain: stamped by the command stream, after the timeline release
   uint8_t broken;     // a launch before this one went unstamped, so the interval ending here spans two kernels
 } tinynv_kprof_slot_t;
+// TINYNV_GRAPH_RESIDENT: a recorded token. See tinynv_exec_graph_begin in exec.c.
+// A recorded token is its chains, each of at most chain_max descriptors: one long chain measured slower than
+// thirteen of 128 (2026-09-19 16:42, -6.5%), so a replay issues the chains as consecutive batches under one
+// announcement, each acquiring on the previous one's tail release.
+#define TINYNV_GRAPH_CHAINS 128
+typedef struct { uint64_t head_va, tail_va; uint8_t *head_host; tinynv_qmd_t tail_qmd; uint32_t n; } tinynv_graph_chain_t;
+typedef struct tinynv_graph_rec {
+  tinynv_vmap_t mem;       // video memory: what the engine reads on every replay
+  tinynv_vmap_t mirror;    // host memory the engine can read: built here, copied across once when sealed
+  uint64_t size, used;
+  uint8_t *prev_host;      // the previous descriptor of the chain being recorded, to write its link into
+  tinynv_qmd_t prev_qmd;
+  tinynv_graph_chain_t chains[TINYNV_GRAPH_CHAINS];
+  int nchains;
+  uint32_t n;              // launches in total
+  int sealed, failed;
+  uint64_t launches;
+} tinynv_graph_rec_t;
 typedef struct {
   const void *key;    // the kernel descriptor's address: one row per instantiation
   char name[112];     // readable (tinynv_kernel_short_name), copied at the launch while the module is certainly loaded
@@ -366,6 +384,20 @@ typedef struct {
   // - sixteen launches into the next chain, or at the next wait or announcement, whichever comes first. The round
   // trip (~25 us to the server process) then overlaps descriptor building instead of blocking it.
   int ring_async;
+  int graph_resident;           // TINYNV_GRAPH_RESIDENT: record a caller's token and replay it as one chain
+  int graph_pace;               // TINYNV_GRAPH_PACE: a measurement knob, hand chains over one ahead instead of all at once
+  // Under the launch profile, every resident chain's batch ends with a clocked release into a slot of its own, and the
+  // next wait reads them back: chain k's stamp minus chain k-1's is that chain plus the hand-over before it.
+  uint64_t graph_last_at0;
+  int graph_last_n;
+  uint64_t graph_chain_ns[TINYNV_GRAPH_CHAINS], graph_chain_n[TINYNV_GRAPH_CHAINS];
+  tinynv_graph_rec_t *rec;      // the token being recorded, while one is
+  // Regions of recordings that were let go, kept for the next recording: mapping 16 MB of host memory for the engine
+  // and the same of video memory costs tens of milliseconds, which a bench that re-captures every run paid five times.
+  struct { tinynv_vmap_t mem, mirror; } graph_pool[4];
+  int graph_pool_n;
+  uint64_t graph_records, graph_replays;
+  int torn_down;                // set by the owner before the card is put down: recordings freed after that touch nothing
   int keepalive;                // asked for (TINYNV_KEEPALIVE)
   unsigned keepalive_us;        // TINYNV_KEEPALIVE_US: the spin's ceiling, the watchdog
   unsigned keepalive_min_kb;    // TINYNV_KEEPALIVE_MIN_KB: only a download at least this large is a token boundary
@@ -455,6 +487,13 @@ int tinynv_exec_download_sync_first(const char *e);
 int tinynv_exec_kernel_profile(const char *e);
 // TINYNV_KEEPALIVE and TINYNV_KEEPALIVE_US: off unless asked; 2,000 us of spin at most unless asked.
 int tinynv_exec_ring_async(const char *e);
+int tinynv_exec_graph_resident(const char *e);
+// Record a token (1 = the driver will not record: the knob is off or the chain shape is wrong), seal and run it
+// once, run it again, let it go.
+int tinynv_exec_graph_begin(tinynv_exec_t *ex);
+int tinynv_exec_graph_end(tinynv_exec_t *ex, tinynv_graph_rec_t **out);
+int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r);
+void tinynv_exec_graph_free(tinynv_exec_t *ex, tinynv_graph_rec_t *r);
 int tinynv_exec_keepalive(const char *e);
 unsigned tinynv_exec_keepalive_us(const char *e);
 // TINYNV_KEEPALIVE_MIN_KB: the download size from which the keep-alive is launched; 64 unless asked. A decode reads
