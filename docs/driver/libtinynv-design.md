@@ -1044,6 +1044,17 @@ patches cost ~10 µs of writes a flush. The defaults were not flipped: `llama-se
 speculative decode and image generation have not run with the three knobs, and tail release costs the ability to
 locate a stalled chain from the timeline. That is the next card work, and it is Antonio's call.
 
+### Four reads for the replay question, and where the MoE time actually is (2026-09-19 12:15-12:38)
+
+Done on the new defaults at Antonio's go, written up in `chain-replay-plan.md`'s last section. In one breath: a
+decode token's descriptors are byte-identical to the previous token's except the tail release once ggml's allocator
+has settled (~4 tokens); a short first chain changes nothing; **chain depth 128 is the optimum** (1024 costs 14-17%,
+32 costs the MoE 10%) because the engine cannot start a chain before the host has built all of it, so seams hide
+under the next chain's build; and with the sensor publisher finally running during a decode (it only ran on waiting
+syncs, which a decode never does), the card reads pstate 1 at 2,860 MHz, 154 W MoE / 306 W dense, no throttling,
+**gpu busy 66% (MoE) / 78% (dense)**. So replay is not worth building, and the MoE gap is inside busy time: kernels
+plus the per-QMD tail (§4h's next lever: the five invalidates and the L1_SYSMEMBAR membar every descriptor carries).
+
 ## 5. What this needs from the humans
 
 - **The 3090's DMA is untranslated, so no kernel parameter change is needed** (Session A's finding #4, settled 2026-09-13):

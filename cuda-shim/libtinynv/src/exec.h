@@ -37,7 +37,18 @@
 // billion launches of headroom, which is half an hour at the rate decode reaches, and a region wrap comes round every
 // few thousand launches. So the restart is always taken in time and is almost never taken at all.
 #define TINYNV_EXEC_REBASE_AT 0xF0000000ull
-#define TINYNV_EXEC_CHAIN_MAX 128
+// The deepest chain the array below can hold. 128 until 2026-09-19; raised to 1024 for the depth sweep that measures
+// what a chain handover (~15-22 us of engine idleness between chains, exec.c) still costs a token at the delta
+// delivery defaults, and to enter the long-dependent-chain regime deliberately, with op-verify at each depth, before
+// any launch-chain replay (docs/driver/chain-replay-plan.md SS7) would put ~2,000 links in one chain. The DEFAULT
+// depth is unchanged at TINYNV_EXEC_CHAIN_DEFAULT; TINYNV_CHAIN_DEPTH asks for more. A chain's descriptors must fit
+// the descriptor region in one piece (1024 x ~1.5 KB = 1.5 MB of 64 MB), and the delta span list holds one slot per
+// launch (asserted below). The sweep's answer (interleaved tg128, both models, 2026-09-19 12:30-12:38): 128 IS the
+// optimum - 1024 costs the MoE 14% and the dense 17%, 512/256 in between, 32 costs the MoE 10%, 64 is within noise
+// below - because the engine cannot start a chain until the host has built all of it, so seams were already hidden
+// under the next chain's build and a deeper chain only makes the engine wait longer for its first descriptor.
+// op-verify passed 450/450 at 256, 512 and 1024: a thousand-link dependent chain completes correctly on this card.
+#define TINYNV_EXEC_CHAIN_MAX 1024
 
 // TINYNV_DELTA_DELIVERY patches a launch's descriptor span as the runs of dwords that actually differ from what was
 // last delivered there, not as one envelope from its first differing byte to its last (tinynv_delta_runs, and the check

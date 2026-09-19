@@ -67,3 +67,38 @@ In the vendored ggml (`llama.cpp` at b906d25): graphs are on by default (`llama.
 ## 7. Ordering against the knob flip
 
 Flip the three knobs first — the pre-flip list is complete (`handoff…:291-339`) and every step above should be measured on the new defaults, not against them. Then one card session for reads (1)–(4); they are the go/no-go for replay and, if no-go, they name the next lever: the busy counters split the MoE gap between "dry engine" (short first chain, depth) and "kernel-executing" (per-QMD choices — `L1_SYSMEMBAR` on non-releasing descriptors, the five invalidates — each an A/B with op-verify and a byte-compare, none needing new mechanism).
+
+---
+
+## The four reads, done 2026-09-19 12:15-12:38 (Antonio's go), and the verdict
+
+All on the new defaults, driver `4714f86`+diagnostics (`745fcd4`), interleaved in the same minutes, host load 4.4-7.3
+(the MoE numbers of this hour sit ~15% under the morning's at load 2.5-4 on both paths; ratios, not levels, are what
+the reads compare). Logs `logs/gate-steps/step33-*` to `step39-*`.
+
+1. **The fields (`TINYNV_DELTA_VERBOSE`, 64-token decodes, both models).** For the first ~4 decode tokens after the
+   prompt every flush changes 40-77 KB: whole QMDs (dwords 4-19, 32-59, 96-127) and driver-parameter bytes of cbuf0 in
+   every launch - ggml's allocator still moving buffers, so each token's launch sequence differs from the last and every
+   later launch shifts. From then on **every full-depth flush rounds to 0 KB: only the tail release payload differs
+   token to token** (the 2.0-2.7 KB per-flush averages of the day are those early tokens amortised). There is no
+   per-token kernel parameter in the descriptors; positions and KV lengths live in tensor data. A replay template would
+   patch the release alone - tinygrad's answer - and would have to re-record through the settling tokens, as ggml
+   re-captures.
+2. **Short first chain (`TINYNV_SHORT_FIRST_CHAIN=8`)**: MoE 140.0 / 140.1 vs 140.7 / 141.0, dense 67.9 / 68.3 vs 68.5 /
+   68.6. **No change** - the boundary-build term is not there.
+3. **Chain depth (ceiling raised to 1024, default 128 kept, `TINYNV_CHAIN_DEPTH`)**: op-verify 450/450 at 256, 512 and
+   1024. tg128, two rounds: MoE 128: 139.6/137.2, 256: 133.2/141.3, 512: 128.6/133.6, **1024: 119.0/120.1**; dense 128:
+   68.3/69.2, 256: 66.3/67.1, 512: 62.8/63.3, **1024: 57.2/57.2**; downward, MoE 32: 123.7/119.4, 64: 135.0/128.7, 128:
+   132.1/135.1; dense 32: 67.2/66.9, 64: 67.7/67.8, 128: 68.0/67.6. **Deeper is monotonically slower**: the engine
+   cannot start a chain until the host has built all of it, so at 1024 it waits ~1 ms per chain where at 128 the next
+   chain's build already hides the seam. The seam term is not on the critical path. The long-chain regime is safe.
+4. **Busy counters through tg256 (publisher now on the flush path)**: MoE gpu busy 66%, mem busy 6%, 2862 MHz, 154 W
+   mean / 223 peak, pstate 1, no throttling; dense busy 78%, mem 35%, 306 W mean / 459 peak. The card boosts fully.
+
+**Verdict: do not build launch-chain replay.** Both terms it could recover are already absent or hidden (reads 2 and 3),
+and the descriptor traffic it would remove was removed by the delta defaults. The MoE gap (~32% to native) sits inside
+"busy" time - kernel execution plus what each descriptor makes the engine do at its tail (five invalidates and
+`CWD_MEMBAR_TYPE=L1_SYSMEMBAR` on every QMD, `qmd.c:170-183`, a system-scope barrier over Thunderbolt per kernel) -
+and the 34% dry fraction is the ~1 us inter-kernel dispatch gap native has too. **The next lever is the per-QMD tail:**
+an A/B of the invalidates and the membar scope on non-releasing descriptors, each with op-verify at three depths and
+the byte-compare, none needing new mechanism.
