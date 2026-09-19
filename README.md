@@ -21,11 +21,11 @@ with NVIDIA's own structure definitions from `open-gpu-kernel-modules` pinned to
 
 | workload | this shim | native | notes |
 |---|---|---|---|
-| Qwen3.8-27B Q4_K_M, tg128 | **67.8 tok/s** | 75.3 | dense decode, launch-bound for what remains |
+| Qwen3.8-27B Q4_K_M, tg128 | **70.7 tok/s** | 75.3 | dense decode, launch-bound for what remains |
 | Qwen3.8-27B Q4_K_M, pp256 | ~2550 tok/s | 2447 | prefill at parity (the SASS is identical) |
 | Qwen3.8-27B + its MTP draft head, greedy | **124 tok/s** first request, 112 mean over a 62-minute soak | 124.7 | `llama-server`, `--spec-type draft-mtp` |
 | `llama-server`, 8 slots, 27B + MTP, temp 0.6 | **~207 tok/s aggregate** | — | 20-minute soaks at eight slots: 440 requests, 0 errors |
-| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **162.6 tok/s** | 245.0 | ~2000 launches a token; the purest launch-bound case |
+| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **~166 tok/s** | 245.0 | ~2000 launches a token; the purest launch-bound case |
 | SDXL-Turbo, 4 steps, 512², cfg 1.0 | **2.72 s** | 4.11 s | stable-diffusion.cpp |
 | SD 1.5 (fp32), 20 steps, 512² | **3.72 s** | 3.86 s | |
 | Z-Image-Turbo, 8 steps, 1024² | **9.67 s** | 9.46 s | Q8 DiT + Qwen3-4B encoder + FLUX VAE |
@@ -41,6 +41,16 @@ to what the gated build actually does — MoE tg128 in particular is genuinely ~
 not 134.3, closing a meaningful chunk of what looked like a driver deficiency; Z-Image's number was also traced to having been captured
 on a pre-gate build, and a separate later reading of 16-17 s came from an uncommitted, dirty tree — neither is what `main` does. Always
 check `strings <binary> | grep -c '^<expected-id>$'` before trusting any number pulled from an old log.
+
+**Defaults changed 2026-09-19 (`4714f86`):** descriptors are now delivered as delta patches against a token-aligned copy of the
+previous token's descriptors, and the timeline is released once per chain (`TINYNV_DELTA_DELIVERY`, `TINYNV_DELTA_REWIND`,
+`TINYNV_TAIL_RELEASE`, each off with `=0`). The copy engine no longer delivers descriptors at all, which removes the token-boundary
+runlist switch named under "Known limits". Measured on the day, interleaved off/on in the same minutes at driver `74fcfe7`: dense
+27B 67.8 → 70.6-70.8, MoE 35B-A3B 160-165 → 165-168; byte-identical output on both, a five-minute `llama-server` + MTP soak, two
+slots under load and all three image models clean (`docs/handoff-2026-09-19.md`, `docs/driver/libtinynv-design.md` §4h). The
+re-gate of the flipped defaults at `4714f86` read op-verify 450/450 and the text byte-identical, but tg128 68.5-68.8 / 138.9-141.7
+with the opt-out path in the same minutes at 135-136: the whole card was ~16% slower on the MoE than an hour earlier on the same
+code paths, unexplained at the time of writing (see the handoff) - the numbers in the table are the interleaved measurement above.
 
 ## What you need
 
@@ -203,9 +213,10 @@ models/  logs/                not committed; see models/README.md
 
 ## Known limits and hazards
 
-- **MoE decode is at ~66% of native** and dense decode at ~90%: what remains is per-launch cost (~1.3 µs vs ~1) and a copy-engine ↔
-  compute-engine runlist switch at each token boundary (~0.35 ms a token on this enclosure), measured and documented in the design
-  docs. Fewer launches and bytes per token is the next lever, not the link.
+- **MoE decode is at ~68% of native** and dense decode at ~94% (2026-09-19 defaults): what remains is per-launch cost (~1.3 µs
+  vs ~1). The copy-engine ↔ compute-engine runlist switch at each token boundary (~0.35 ms a token on this enclosure) is gone with
+  the delta delivery defaults; the design docs (§4f, §4h) carry the measurements. Fewer launches per token is the next lever - see
+  `docs/driver/` for the launch-chain replay study.
 - **The firmware's reservation is derived and checked (closed 2026-09-19).** The driver holds back 256 MB at the top of VRAM, sized
   from the sizes it hands the firmware (`libtinynv/src/fw_layout.h`, static-asserted against their sum), and at every open reads the
   chip's WPR2 registers and refuses to start if the manager's top is above the firmware's region. Measured on this card: WPR2 spans
