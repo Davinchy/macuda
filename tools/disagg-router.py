@@ -34,12 +34,15 @@ The card server holds the card for as long as it is up: it is a scheduled tenant
 lock, exactly like tools/serve.sh, and starting it is a card step. The Metal server maps the whole model: under the
 host rule in the README that is a card-affecting job while anyone holds the card.
 """
-import argparse, hashlib, http.client, json, os, sys, threading, time, urllib.parse
+import argparse, hashlib, http.client, importlib.util, json, os, struct, sys, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ARGS = None
 LOCK = threading.Lock()            # one request at a time: one slot on each server
-STATE = {"metal_tokens": [], "metal_text": "", "card_tokens": [], "card_obs": [], "metal_obs": [], "card_synced_len": 0}
+STATE = {"metal_tokens": [], "metal_text": "", "card_tokens": [], "card_obs": [], "metal_obs": [], "card_synced_len": 0,
+         "card_prefills": 0, "card_first": None}
+# card_prefills counts every card prefill since this router started; card_first is the first one's (tokens, seconds),
+# kept out of the warm fit because a first prefill after a start pays a cold-mapping cost the later ones do not.
 # each side's own slot contents as last sent; observed (tokens, seconds) per side; card_synced_len is what a cache
 # hit should be after the last sync_metal_to_card(), to detect a mismatched-tail miss (see its docstring).
 # metal_text is the exact text (prompt + Metal's own real decoded content) that produced metal_tokens - used by
@@ -191,6 +194,70 @@ def card_prefill(ids, sync_needed):
     STATE["metal_tokens"] = list(head)
     STATE["card_tokens"] = list(head)
     if t.get("prompt_n") and t.get("prompt_ms"): observe_card(int(t["prompt_n"]), t["prompt_ms"] / 1000.0, (t2 - t1) + (t3 - t2))
+    STATE["card_prefills"] += 1
+
+
+def gguf_constants():
+    """llama.cpp's own table of bytes per block for every tensor type, loaded from the vendored gguf-py's constants
+    file directly rather than through the package: its __init__ pulls in numpy and yaml, which the venv's python
+    does not have, and the table is the only thing needed here."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "llama.cpp", "gguf-py", "gguf", "constants.py")
+    spec = importlib.util.spec_from_file_location("gguf_constants", path)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod
+
+
+def expert_layout(path):
+    """What a GGUF's MoE expert tensors weigh, block by block, read from the file's header alone - the key/value
+    table and the tensor directory at the front of the file; no weight is mapped or read, so a 50 GB model costs a
+    few MB of reads. These bytes are what the card's fixed cost is made of: with --n-cpu-moe N the first N MoE
+    layers' expert tensors (blk.N.ffn_{gate,up,down}_exps, the ones llama.cpp's override places on the host) stream
+    across the link once per ubatch. Returns {"arch", "n_expert", "n_expert_used", "blocks": [(blk, bytes), ...] in
+    block order, "total"}. Checked against the recorded models by tools/disagg-router-model-test.py."""
+    C = gguf_constants()
+    sizes = {int(k): v for k, v in C.GGML_QUANT_SIZES.items()}
+    scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+    with open(path, "rb") as f:
+        def rd(n):
+            b = f.read(n)
+            if len(b) != n: raise ValueError(f"{path}: header ends early")
+            return b
+        u32 = lambda: struct.unpack("<I", rd(4))[0]
+        u64 = lambda: struct.unpack("<Q", rd(8))[0]
+        def string(): return rd(u64()).decode("utf-8", "replace")
+        def value(vt):
+            if vt == 8: return string()
+            if vt == 9:
+                et = u32(); n = u64()
+                if et == 8: return [string() for _ in range(n)]
+                if et == 9: return [value(9) for _ in range(n)]
+                fmt = scalar[et]; return list(struct.unpack("<" + fmt * n, rd(struct.calcsize(fmt) * n)))
+            fmt = scalar[vt]; return struct.unpack("<" + fmt, rd(struct.calcsize(fmt)))[0]
+        if rd(4) != b"GGUF": raise ValueError(f"{path} is not a GGUF file")
+        u32()   # version
+        n_tensors = u64(); n_kv = u64()
+        kv = {}
+        for _ in range(n_kv):
+            k = string(); vt = u32(); kv[k] = value(vt)
+        arch = kv.get("general.architecture", "?")
+        blocks = {}
+        for _ in range(n_tensors):
+            name = string(); nd = u32(); dims = [u64() for _ in range(nd)]; ttype = u32(); u64()   # offset, unused
+            if "_exps." in name:
+                bs, ts = sizes[ttype]; ne = 1
+                for d in dims: ne *= d
+                blk = int(name.split(".")[1])
+                blocks[blk] = blocks.get(blk, 0) + ne // bs * ts
+    order = sorted(blocks)
+    return {"arch": arch, "n_expert": kv.get(f"{arch}.expert_count"), "n_expert_used": kv.get(f"{arch}.expert_used_count"),
+            "blocks": [(b, blocks[b]) for b in order], "total": sum(blocks.values())}
+
+
+def streamed_gib(layout, ncpumoe):
+    """GiB of experts the card streams per ubatch with --n-cpu-moe ncpumoe (-1 = every MoE layer on the host)."""
+    n = len(layout["blocks"]); k = n if ncpumoe < 0 else max(0, min(ncpumoe, n))
+    return sum(b for _, b in layout["blocks"][:k]) / float(1 << 30)
 
 
 def ubatches(cold):
@@ -224,22 +291,38 @@ def fit_line(obs):
 
 
 def observe_card(tokens, seconds, handoff_seconds):
-    """A card prefill happened: refit the fixed cost and rate from the last 8, and the handoff per token."""
+    """A card prefill happened: refit the fixed cost and rate from the last 8 WARM ones, and the handoff per token.
+    The first prefill after a start is kept aside: it pays a cold-mapping cost the later ones do not (2026-09-17
+    window 2's 7K prefills ran 2.08 s and 1.24 s over the line fitted on its 24K pair, window 3's first request
+    0.92 s over its warm line, all three near 0.046 s per streamed GiB), so fitting it with the warm points would
+    bend the line, and once a warm line exists it is what the cold rate is read from instead."""
     if not ARGS.learn or tokens < 256: return
-    if not STATE["card_obs"]:
-        log(f"first card prefill since start: {tokens} tok in {seconds:.1f} s - a first prefill may pay a cost the later "
-            "ones do not (unresolved: 2026-09-17 window 2's 7K prefills ran 2.08 s and 1.24 s over the model fitted on "
-            "its 24K pair, and those residuals scale with expert bytes streamed)")
-    STATE["card_obs"] = (STATE["card_obs"] + [(tokens, seconds)])[-8:]
-    fit = fit_line(STATE["card_obs"])
     hp = handoff_seconds / tokens
     changed = abs(hp - ARGS.handoff_per_token) > 0.1 * ARGS.handoff_per_token
     ARGS.handoff_per_token = 0.5 * ARGS.handoff_per_token + 0.5 * hp
-    if fit:
-        fixed, rate = fit
-        changed |= abs(fixed - ARGS.card_fixed) > 0.05 * ARGS.card_fixed or abs(rate - ARGS.card_rate) > 0.05 * ARGS.card_rate
-        ARGS.card_fixed, ARGS.card_rate = fixed, rate
-    if changed: log(f"calibration: card fixed {ARGS.card_fixed:.1f} s + {ARGS.card_rate:.0f} tok/s, handoff {ARGS.handoff_per_token*1e6:.0f} us/token ({len(STATE['card_obs'])} observations)")
+    if STATE["card_first"] is None:
+        STATE["card_first"] = (tokens, seconds)
+        warm = ubatches(tokens) * ARGS.card_fixed + tokens / ARGS.card_rate
+        log(f"first card prefill since start: {tokens} tok in {seconds:.1f} s, {seconds - warm:+.1f} s over the warm model's "
+            f"{warm:.1f} s (the model's own first-prefill term was {ARGS.streamed_gib * ARGS.cold_rate:.1f} s)")
+    else:
+        STATE["card_obs"] = (STATE["card_obs"] + [(tokens, seconds)])[-8:]
+        fit = fit_line(STATE["card_obs"])
+        if fit:
+            fixed, rate = fit
+            changed |= abs(fixed - ARGS.card_fixed) > 0.05 * ARGS.card_fixed or abs(rate - ARGS.card_rate) > 0.05 * ARGS.card_rate
+            ARGS.card_fixed, ARGS.card_rate = fixed, rate
+            if ARGS.streamed_gib:
+                # The physical numbers the fixed cost is made of, so that a change of --n-cpu-moe carries the
+                # calibration with it instead of starting over from the shipped defaults.
+                ARGS.link_rate = ARGS.streamed_gib / fixed
+                ft, fs = STATE["card_first"]
+                resid = fs - (ubatches(ft) * fixed + ft / rate)
+                if resid > 0: ARGS.cold_rate = resid / ARGS.streamed_gib
+    if changed:
+        log(f"calibration: card fixed {ARGS.card_fixed:.1f} s + {ARGS.card_rate:.0f} tok/s, handoff {ARGS.handoff_per_token*1e6:.0f} us/token "
+            f"({len(STATE['card_obs'])} warm observations"
+            + (f"; link {ARGS.link_rate:.2f} GiB/s, first-prefill {ARGS.cold_rate * 1000:.0f} ms/GiB" if ARGS.streamed_gib else "") + ")")
 
 
 def observe_metal(tokens, seconds):
@@ -268,6 +351,9 @@ def predict(cold_metal, cold_card, sync_tokens):
     metal = cold_metal / ARGS.metal_rate
     card = ubatches(cold_card) * ARGS.card_fixed + cold_card / ARGS.card_rate + cold_card * ARGS.handoff_per_token
     card += sync_tokens * ARGS.handoff_per_token
+    # The first prefill after a start pays a cold-mapping cost proportional to the expert bytes streamed (windows 2
+    # and 3, three points across two models near 0.046 s/GiB); known only when the model's layout was given.
+    if not STATE["card_prefills"] and ARGS.streamed_gib: card += ARGS.streamed_gib * ARGS.cold_rate
     return metal, card
 
 
@@ -295,12 +381,14 @@ def decide(cold_metal, cold_card, sync_tokens, n_total, card_up):
 
 def selftest():
     """The cost model at a few sizes, the break-even, and the two properties the rule must have."""
+    STATE["card_prefills"] = 1   # everything below is the warm model; the first-prefill term is printed separately
     lo, hi = 1, 200000
     while hi - lo > 1:
         mid = (lo + hi) // 2; m, c = predict(mid, mid, 0)
         if c < m: hi = mid
         else: lo = mid
-    print(f"cost model: metal {ARGS.metal_rate:.0f} tok/s; card {ARGS.card_fixed:.1f} s per ubatch of {ARGS.card_ubatch} + {ARGS.card_rate:.0f} tok/s + handoff {ARGS.handoff_per_token*1e6:.0f} us/token; break-even {hi} cold tokens (card already in sync)")
+    print(f"cost model: metal {ARGS.metal_rate:.0f} tok/s; card {ARGS.card_fixed:.1f} s per ubatch of {ARGS.card_ubatch} + {ARGS.card_rate:.0f} tok/s + handoff {ARGS.handoff_per_token*1e6:.0f} us/token; break-even {hi} cold tokens (card already in sync)"
+          + (f"; the first prefill after a start pays +{ARGS.streamed_gib * ARGS.cold_rate:.2f} s ({ARGS.streamed_gib:.2f} GiB streamed x {ARGS.cold_rate * 1000:.0f} ms/GiB)" if ARGS.streamed_gib else ""))
     ok = True
     for cold in (512, 2000, 5000, 8000, 24000, 64000):
         m, c = predict(cold, cold, 0); want, why = decide(cold, cold, 0, cold + 1, lambda: True)
@@ -311,7 +399,9 @@ def selftest():
     # a sync that is NOT confirmed safe must fall back to the card's own raw mismatch, never to cold_metal - this
     # is the exact 2026-09-18 catastrophic-miss shape (6,573 cold to Metal, but the card's own real history is
     # 21,344 behind): decide() must be told cold_card=21344, sync=0 in this case, and correctly prefer metal
-    ok &= decide(6573, 21344, 0, 21345, lambda: True)[0] == "metal"
+    m_raw, c_raw = predict(6573, 21344, 0)
+    ok &= c_raw > predict(6573, 6573, 0)[1]                            # the raw mismatch costs more than being in sync...
+    ok &= decide(6573, 21344, 0, 21345, lambda: True)[0] == ("card" if c_raw < m_raw else "metal")   # ...and is what decides
     ok &= decide(6573, 6573, 0, 6574, lambda: True)[0] == "card"      # same request, card confirmed in sync: card wins
     # a CONFIRMED-safe sync still isn't free: it costs more than being already in sync, but far less than the
     # card's raw-mismatch fallback for the same underlying gap (both properties must hold)
@@ -323,8 +413,13 @@ def selftest():
     known = [(6974, 8.0 + 6974 / 5150), (23691, 8.0 + 23691 / 5150), (64577, 3 * 8.0 + 64577 / 5150)]
     fit = fit_line(known)                                             # the estimator recovers a line it was given
     ok &= fit is not None and abs(fit[0] - 8.0) < 0.05 and abs(fit[1] - 5150) < 25
-    obs24 = 12.588                                                    # the control prefill the constants were fitted on
-    ok &= abs((1 * ARGS.card_fixed + 23691 / ARGS.card_rate) - obs24) < 0.3
+    # The constants against the 23,691-token prefill they came from, at the residency the model was given: window
+    # 2's control (NCPUMOE=48, 12.588 s) or its treatment (NCPUMOE=30, 9.6 s); any other residency has no recorded
+    # point to hold them against, and says so rather than passing on nothing.
+    k = len(ARGS.layout["blocks"]) if ARGS.layout and ARGS.ncpumoe < 0 else getattr(ARGS, "ncpumoe", 48)
+    obs24 = 12.588 if not ARGS.streamed_gib or k >= 48 else (9.6 if k == 30 else None)
+    if obs24 is not None: ok &= abs((1 * ARGS.card_fixed + 23691 / ARGS.card_rate) - obs24) < 0.3
+    else: print(f"(no recorded 24K prefill at --n-cpu-moe {k} to hold the constants against)")
     ok &= ubatches(24576) == 1 and ubatches(24577) == 2 and ubatches(62031) == 3      # the stream is per ubatch
     m3, c3 = predict(62031, 62031, 0)                                 # and a 3-ubatch prompt pays it three times
     ok &= abs(c3 - (3 * ARGS.card_fixed + 62031 / ARGS.card_rate + 62031 * ARGS.handoff_per_token)) < 0.01
@@ -333,8 +428,9 @@ def selftest():
     ok &= fit_line([(6974, 11.433), (23691, 12.588)]) is None         # the real pair that returned 14,471 tok/s
     ok &= fit_line(known[:2] + [(64577, 36.5 * 2)]) is None           # one point no line through the others explains
     print(f"estimator on a known 8.00 s + 5150 tok/s line: fixed {fit[0]:.2f} s, {fit[1]:.0f} tok/s" if fit else "fit: FAILED")
-    print(f"shipped constants against the 23,691-token control prefill they came from: "
-          f"{1 * ARGS.card_fixed + 23691 / ARGS.card_rate:.2f} s predicted, {obs24:.2f} s observed")
+    if obs24 is not None:
+        print(f"constants against the 23,691-token prefill they came from (--n-cpu-moe {k}): "
+              f"{1 * ARGS.card_fixed + 23691 / ARGS.card_rate:.2f} s predicted, {obs24:.2f} s observed")
     print("selftest:", "OK" if ok else "FAIL"); return 0 if ok else 1
 
 
@@ -434,13 +530,27 @@ def main():
     ap.add_argument("--no-auto", dest="auto", action="store_false", help="disable the cost model (then only --threshold routes to the card)")
     ap.add_argument("--metal-rate", type=float, default=660.0, help="Metal prefill tok/s for this model (measured 664 on the M4 Max, Qwen3-Coder-Next)")
     ap.add_argument("--card-rate", type=float, default=5150.0, help="card marginal prefill tok/s (driver ad308bd, NCPUMOE=48, 2026-09-17 window 2; the pre-ad308bd fit was 2460 and is superseded)")
-    ap.add_argument("--card-fixed", type=float, default=8.0, help="card seconds per UBATCH: 43.7 GiB of experts across the link at 5.46 GiB/s (same window, the two 24K prefills under the byte-fraction model). The first prefill after a load looks MORE expensive than this; window 3 measures it")
+    ap.add_argument("--card-fixed", type=float, default=8.0, help="card seconds per UBATCH when no --model is given: 43.7 GiB of experts across the link at 5.46 GiB/s (window 2, NCPUMOE=48). With --model it is DERIVED: streamed expert GiB / --link-rate")
+    ap.add_argument("--model", default=None, help="the GGUF both servers serve: the card's fixed cost is derived from its expert bytes (only the file's header is read, never a weight)")
+    ap.add_argument("--ncpumoe", type=int, default=-1, help="the card server's --n-cpu-moe: how many MoE layers' experts stay on the host and stream per ubatch (-1 = every one)")
+    ap.add_argument("--link-rate", type=float, default=5.46, help="GiB/s the expert stream crosses the link at: 43.7 GiB in 8.0 s (window 2), reproduced on a second model by window 3 (18.2 GiB predicted 3.33 s, fitted 3.23)")
+    ap.add_argument("--cold-rate", type=float, default=0.0465, help="extra seconds per streamed GiB the FIRST card prefill after a start pays (three points, two models, 2026-09-17: 0.0454-0.0476)")
     ap.add_argument("--card-ubatch", type=int, default=24576, help="the card server's -ub: the expert stream is paid once per ubatch, so this shapes the prediction for prompts past it")
     ap.add_argument("--handoff-per-token", type=float, default=3e-5, help="seconds per token to save and restore the state (662 MB / 23,691 tok in 0.8 s)")
     ap.add_argument("--no-learn", dest="learn", action="store_false", help="freeze the cost model: do not refit it from observed prefills")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--state-dir", default=None, help="the --slot-save-path both servers share, to delete handed-over files"); ap.add_argument("--slot", type=int, default=0)
     ARGS = ap.parse_args()
+    ARGS.streamed_gib = 0.0; ARGS.layout = None
+    if ARGS.model:
+        ARGS.layout = expert_layout(ARGS.model)
+        n = len(ARGS.layout["blocks"]); k = n if ARGS.ncpumoe < 0 else max(0, min(ARGS.ncpumoe, n))
+        ARGS.streamed_gib = streamed_gib(ARGS.layout, ARGS.ncpumoe)
+        ARGS.card_fixed = ARGS.streamed_gib / ARGS.link_rate
+        log(f"model {os.path.basename(ARGS.model)}: {ARGS.layout['arch']}, {n} MoE layers, {ARGS.layout['n_expert']} experts "
+            f"({ARGS.layout['n_expert_used']} used), {ARGS.layout['total'] / 2**30:.2f} GiB of experts; --n-cpu-moe {k} streams "
+            f"{ARGS.streamed_gib:.2f} GiB per ubatch = {ARGS.card_fixed:.2f} s at {ARGS.link_rate:.2f} GiB/s; the first prefill "
+            f"after a start pays +{ARGS.streamed_gib * ARGS.cold_rate:.2f} s")
     if ARGS.selftest: sys.exit(selftest())
     if not healthy(ARGS.metal, 5): log(f"Metal server at {ARGS.metal} is not healthy; refusing to start"); sys.exit(1)
     log(f"metal {ARGS.metal} up; card {ARGS.card} {'up' if healthy(ARGS.card) else 'down (metal-only until it appears)'}; cap {ARGS.threshold or 'off'}; cost model {'on' if ARGS.auto else 'off'} (metal {ARGS.metal_rate:.0f} tok/s, card {ARGS.card_fixed:.1f} s + {ARGS.card_rate:.0f} tok/s); listening on 127.0.0.1:{ARGS.listen}")

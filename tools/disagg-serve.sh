@@ -51,7 +51,7 @@ case "$cmd" in
     "$METAL_BIN" -m "$M" -ngl 999 -c "$CTX" -b 4096 -ub 512 -fa on --parallel 1 --no-warmup --host 127.0.0.1 --port "$METAL_PORT" --slot-save-path "$ST/" > "$ML" 2>&1 & mpid=$!
     echo "metal=$mpid" >> "$PIDF"
     wait_health "$METAL_PORT" "$mpid" "$ML" || { sh "$0" stop; exit 1; }
-    python3 tools/disagg-router.py --listen "$PORT" --metal "http://127.0.0.1:$METAL_PORT" --card "http://127.0.0.1:$CARD_PORT" --threshold "$THRESH" --state-dir "$ST" > "$RL" 2>&1 & rpid=$!
+    python3 tools/disagg-router.py --listen "$PORT" --metal "http://127.0.0.1:$METAL_PORT" --card "http://127.0.0.1:$CARD_PORT" --threshold "$THRESH" --state-dir "$ST" --model "$M" --ncpumoe "$NCPUMOE" > "$RL" 2>&1 & rpid=$!
     echo "router=$rpid" >> "$PIDF"; echo "$RL" > "$ST/router.log.path"; echo "$PORT" > "$ST/router.port"
     wait_health "$PORT" "$rpid" "$RL" || { sh "$0" stop; exit 1; }
     echo "   UP: http://127.0.0.1:$PORT (router), cap ${THRESH}${THRESH:+ cold tokens}$([ "$THRESH" = 0 ] && echo " (off: cost model routes)"); $(sh tools/gpu-lock.sh status)" ;;
