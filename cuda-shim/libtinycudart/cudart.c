@@ -144,6 +144,7 @@ void tinycudart_count_copy(int kind, unsigned long long n){ g_copies++; g_last_w
 static int cmp_kstat(const void* a, const void* b){ double x=((const kstat_t*)a)->ns, y=((const kstat_t*)b)->ns; if (x!=y) return x<y?1:-1;
   unsigned long lx=((const kstat_t*)a)->launches, ly=((const kstat_t*)b)->launches; return lx<ly?1:lx>ly?-1:0; }
 static void stats_dump(void){
+  { extern void tinycudart_graph_stats(void); tinycudart_graph_stats(); }
   if (g_syncs_flushed) fprintf(stderr,"[tinycudart] %lu synchronizations were answered without a wait - the driver said nothing outstanding needed one (inline uploads only), so they flushed and returned\n", g_syncs_flushed);
   if (!stats_on()) return;
   fprintf(stderr,"[tinycudart] stats: %lu launches, %lu copies/fills: h2d %.1f MB, d2h %.1f MB, d2d %.1f MB, memset %.1f MB\n", g_launches, g_copies,
@@ -226,6 +227,8 @@ cudaError_t cudaLaunch(const void* func){
   if (!k){ const char* nm=f?f->name:"(never registered)";
     fprintf(stderr,"[tinycudart] cudaLaunch: kernel '%s' (%p) was registered but not found in its module\n",nm,func); return g_lasterr=cudaErrorUnknown; }
   if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%u) block=(%u,%u,%u) smem=%zu params=%zu\n", f->name, g_grid.x,g_grid.y,g_grid.z, g_block.x,g_block.y,g_block.z, g_shmem, g_params_len);
+  { extern int tinycudart_capturing_nv(tinynv_stream_t); extern cudaError_t tinycudart_capture_launch(tinynv_kernel_t, const char*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, const void*, size_t);
+    if (tinycudart_capturing_nv(g_stream)) return g_lasterr=tinycudart_capture_launch(k, f->name, g_grid.x,g_grid.y,g_grid.z, g_block.x,g_block.y,g_block.z, (unsigned)g_shmem, g_params, g_params_len); }
   tinycudart_count_launch(f->name);
   double t0=stats_on()?tinycudart_now_ns():0;
   tinynv_status_t s=tinynv_launch(g_stream,k, g_grid.x,g_grid.y,g_grid.z, g_block.x,g_block.y,g_block.z,

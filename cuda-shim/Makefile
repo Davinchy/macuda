@@ -30,7 +30,7 @@ all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke
 $(NV_LIB): FORCE
 	@$(MAKE) --no-print-directory -C libtinynv BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
 
-$(CUDART): $(BUILD)/cudart.o $(BUILD)/fatbin.o $(BUILD)/hostpool.o $(BUILD)/cudart_api.o $(BUILD)/demangle.o $(BUILD)/copy2d_cubin.o $(BUILD)/copy1d_cubin.o $(BUILD)/keepalive_cubin.o
+$(CUDART): $(BUILD)/cudart.o $(BUILD)/fatbin.o $(BUILD)/hostpool.o $(BUILD)/cudart_api.o $(BUILD)/graph.o $(BUILD)/demangle.o $(BUILD)/copy2d_cubin.o $(BUILD)/copy1d_cubin.o $(BUILD)/keepalive_cubin.o
 	ar rcs $@ $^
 # the strided-copy kernel travels inside the runtime the same way (libtinycudart/copy2d.cu, built by the remote nvcc)
 $(BUILD)/copy2d_cubin.c: libtinycudart/copy2d.cubin
@@ -60,6 +60,9 @@ $(BUILD)/demangle.o: libtinycudart/demangle.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(SYSROOT) -std=c++17 -O2 -fPIC -I$(LLVM_INC) -c $< -o $@
 $(BUILD)/cudart_api.o: libtinycudart/cudart_api.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -I$(CUDA_INC) -c $< -o $@
+$(BUILD)/graph.o: libtinycudart/graph.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) -c $< -o $@
 $(BUILD)/cublas.o: libtinycublas/cublas.c

@@ -86,7 +86,21 @@ int main(void) {
   struct cudaDeviceProp prop; CHECK(cudaGetDeviceProperties(&prop, 0) == cudaSuccess && prop.warpSize == 32 && prop.maxThreadsPerBlock >= 1024, "device props (%s, warp %d)", prop.name, prop.warpSize);
   int coop = 1; CHECK(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, 0) == cudaSuccess && coop == 0, "cooperative launch attr must be 0");
   size_t fr = 0, tot = 0; CHECK(cudaMemGetInfo(&fr, &tot) == cudaSuccess, "memgetinfo");
-  CHECK(cudaStreamBeginCapture(NULL, cudaStreamCaptureModeGlobal) == cudaErrorNotSupported && cudaGetLastError() == cudaErrorNotSupported, "graph capture refused");
+  // the graph subset: a capture records instead of running, an instance replays it, an update replaces it, and the
+  // stream reports its state; a synchronise inside a capture is refused and spoils it, as CUDA does
+  { cudaGraph_t gr = NULL; cudaGraphExec_t ge = NULL; enum cudaStreamCaptureStatus cs = cudaStreamCaptureStatusActive; cudaGraphExecUpdateResultInfo ui;
+    CHECK(cudaStreamBeginCapture(NULL, cudaStreamCaptureModeRelaxed) == cudaSuccess, "graph capture begins");
+    CHECK(cudaStreamIsCapturing(NULL, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusActive, "the stream says it is capturing");
+    CHECK(cudaMemsetAsync(C, 0, 64, NULL) == cudaSuccess && cudaMemcpyAsync(C, A, 64, cudaMemcpyDeviceToDevice, NULL) == cudaSuccess, "nodes record");
+    CHECK(cudaStreamEndCapture(NULL, &gr) == cudaSuccess && gr != NULL, "graph capture ends with a graph");
+    CHECK(cudaStreamIsCapturing(NULL, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone, "the stream is no longer capturing");
+    CHECK(cudaGraphInstantiate(&ge, gr, 0) == cudaSuccess && ge != NULL, "graph instantiates");
+    CHECK(cudaGraphLaunch(ge, NULL) == cudaSuccess && cudaStreamSynchronize(NULL) == cudaSuccess, "graph launches and completes");
+    CHECK(cudaGraphExecUpdate(ge, gr, &ui) == cudaSuccess && ui.result == cudaGraphExecUpdateSuccess, "graph exec updates");
+    CHECK(cudaStreamBeginCapture(NULL, cudaStreamCaptureModeRelaxed) == cudaSuccess && cudaStreamSynchronize(NULL) == cudaErrorStreamCaptureUnsupported &&
+          cudaStreamEndCapture(NULL, &gr) == cudaErrorStreamCaptureInvalidated, "a synchronise inside a capture is refused and spoils it");
+    (void)cudaGetLastError();
+    CHECK(cudaGraphExecDestroy(ge) == cudaSuccess, "graph exec destroys"); }
   CHECK(cudaGetLastError() == cudaSuccess && cudaPeekAtLastError() == cudaSuccess, "error state clean");
   printf("runtime surface: streams, events, async copies, fills, props, attrs exercised on the null device\n");
   tinycudart_hostpool_stats(&st);
