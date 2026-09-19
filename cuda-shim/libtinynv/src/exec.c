@@ -915,6 +915,17 @@ static int chain_is_sound(tinynv_exec_t *ex, int n) {
   return 0;
 }
 
+// TINYNV_DELTA_DELIVERY's per-launch diffs, once they clear the per-launch TINYNV_INLINE_MAX check, are also
+// capped as a whole flush against this. Deliberately not TINYNV_INLINE_MAX itself: that number prices ONE small
+// copy against the copy engine moving it instead; the real alternative on a miss here is the FULL envelope
+// fallback, ~800us of copy-engine time for the whole flush's dirty span (libtinynv-design.md SS4f, "writing a
+// full chain's ~192 KB across the link instead is ~800 us"). Processor writes cost ~4.2us/KB (measured: 1.5KB at
+// a launch's descriptor is 6.3us of ~7 - libtinynv-design.md SS4d), so this many KB of inline patches costs a few
+// tens of us against an ~800us fallback either way - the aggregate can be generous without the trade flipping.
+// 16 KB is a first estimate, not a swept default: unlike TINYNV_INLINE_PEND's 16, it has not been measured
+// against smaller or larger values yet. Treat it as provisional until it is.
+#define TINYNV_DELTA_AGGREGATE_MAX (64u * 1024u)
+
 int tinynv_exec_flush(tinynv_exec_t *ex) {
   if (!ex->nchain) return 0;
   PROF_START(ex);
@@ -988,6 +999,11 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // last_delivered can be brought up to date at the end regardless of which path actually did the delivering.
   uint64_t delta_lo = ex->region[AR_DESC].dirty_lo, delta_hi = ex->region[AR_DESC].dirty_hi;
   int delta_handled = 0;
+  // Per-launch diff bounds and how much of it there is, hoisted out of the block below because the actual write
+  // happens after batch_begin() further down - see the comment there for why it moved.
+  uint64_t plo[TINYNV_EXEC_CHAIN_MAX], phi[TINYNV_EXEC_CHAIN_MAX];
+  unsigned delta_pend_n = 0;
+  uint32_t delta_pend_bytes = 0;
   if (ex->delta_delivery && ex->region[AR_DESC].last_delivered && ex->arena_dma &&
       ex->wraps[AR_DESC] && delta_hi > delta_lo) {
     // Trusted only past the region's first lap (wraps[AR_DESC] set): before that, last_delivered has never been
@@ -1007,15 +1023,18 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
     // not a slower correct answer - which is why the check pass below commits nothing until it has looked at
     // every launch in the chain.
     uint8_t *sh = ex->region[AR_DESC].shadow, *ld = ex->region[AR_DESC].last_delivered;
-    uint64_t plo[TINYNV_EXEC_CHAIN_MAX], phi[TINYNV_EXEC_CHAIN_MAX];
     unsigned need_n = 0;
     uint32_t need_bytes = 0;
     int all_fit = 1;
     for (int i = 0; i < n; i++) {
       uint64_t lo = ex->chain[i].va - ex->region[AR_DESC].mem.va, hi = lo + ex->chain[i].len;
       uint64_t dlo = hi, dhi = lo;
+      uint64_t genuine = 0;   // DIAGNOSTIC ONLY, TINYNV_DELTA_VERBOSE: bytes that actually differ within [dlo,dhi)
       for (uint64_t j = lo; j < hi; j++)
-        if (sh[j] != ld[j]) { if (j < dlo) dlo = j; dhi = j + 1; }
+        if (sh[j] != ld[j]) { if (j < dlo) dlo = j; dhi = j + 1; genuine++; }
+      if (dhi > dlo && getenv("TINYNV_DELTA_VERBOSE") && ex->delta_full_n < 3)
+        fprintf(stderr, "libtinynv: delta envelope check: launch %d span-width %llu genuine-diff-bytes %llu (%.0f%% of span)\n",
+                i, (unsigned long long)(dhi - dlo), (unsigned long long)genuine, 100.0 * (double)genuine / (double)(dhi - dlo));
       if (dhi > dlo) {
         // tinynv_cmd_inline_upload requires a whole number of dwords at a 4-byte-aligned destination (submit.c) -
         // the byte-precise diff found above has neither guarantee, so it is widened to the nearest dword on each
@@ -1031,9 +1050,13 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
       phi[i] = dhi;
       if (dhi <= dlo) continue;   // this launch is byte-identical to its last delivery - nothing to send for it
       uint32_t dlen = (uint32_t)(dhi - dlo);
-      unsigned remaining_n = ex->inline_pend_max - ex->inline_pend_n;
-      uint32_t remaining_bytes = ex->inline_pend_bytes_max - ex->inline_pend_bytes;
-      if (dlen > TINYNV_INLINE_MAX || need_n + 1 > remaining_n || need_bytes + dlen > remaining_bytes) {
+      // Capped against its own budget (TINYNV_DELTA_AGGREGATE_MAX, defined above tinynv_exec_flush), not the shared
+      // inline_pend one: these patches are written straight into the chain's own delivery batch after batch_begin()
+      // (see below), not queued through inline_pend. Measured on hardware 2026-09-19: sharing inline_pend's budget
+      // with TINYNV_INLINE_UPLOAD was why this fired on only 5 of 1223 flushes in a 96-token decode, even with that
+      // shared budget maxed at its ceiling (TINYNV_INLINE_PEND=128) - see the constant's own comment for why the
+      // aggregate cap here is deliberately not TINYNV_INLINE_MAX itself.
+      if (dlen > TINYNV_INLINE_MAX || need_bytes + dlen > TINYNV_DELTA_AGGREGATE_MAX) {
         all_fit = 0;
         if (getenv("TINYNV_DELTA_VERBOSE") && ex->delta_full_n <= 20)
           fprintf(stderr, "libtinynv: per-launch delta miss #%llu: launch %d of %d, span [%llu,%llu) len %llu\n",
@@ -1045,10 +1068,11 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
       need_bytes += dlen;
     }
     if (all_fit) {
-      // Nothing above touched inline_pend or arena state - safe to commit now that every launch has been checked.
-      for (int i = 0; i < n; i++)
-        if (phi[i] > plo[i])
-          inline_pend_push(ex, ex->region[AR_DESC].mem.va + plo[i], sh + plo[i], (uint32_t)(phi[i] - plo[i]));
+      // Nothing above touched arena state - safe to commit now that every launch has been checked. The actual
+      // tinynv_cmd_inline_upload calls happen after batch_begin() below, once the chain's own command buffer
+      // exists to write them into; plo[]/phi[]/delta_pend_n (set here) are what that later code reads.
+      delta_pend_n = need_n;
+      delta_pend_bytes = need_bytes;
       // Ownership moves over the whole originally-dirty span regardless of how many launches actually had bytes to
       // send, same as the full-span paths below: every launch in the chain read consistently as of this delivery,
       // not just the ones that changed.
@@ -1115,8 +1139,23 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // Four dwords per launch method, and in the unlinked mode every descriptor needs its own rather than the head
   // alone carrying the rest.
   // Eight more under the profile for the tail stamp appended below.
-  uint32_t want_dwords = (ex->no_chain_deps ? 48 + 4 * (uint32_t)n : 48) + (ex->profile ? 8u : 0u);
+  // Room for this flush's own delta patches, on top of batch_begin()'s own reservation for whatever TINYNV_INLINE_UPLOAD
+  // has pending: TINYNV_INLINE_DWORDS(len) per call, 8 + len/4, summed - exact since every plo[]/phi[] span was
+  // widened to a dword multiple above, so delta_pend_bytes/4 has no remainder to lose.
+  uint32_t want_dwords = (ex->no_chain_deps ? 48 + 4 * (uint32_t)n : 48) + (ex->profile ? 8u : 0u) +
+                          (delta_pend_n ? 8u * delta_pend_n + delta_pend_bytes / 4u : 0u);
   if (batch_begin(ex, &ex->g->gsp.compute_q, want_dwords, &c, &va)) return -1;
+  // Written here, not queued through inline_pend: batch_begin() has already reserved the room want_dwords asked
+  // for and drained whatever TINYNV_INLINE_UPLOAD had pending into this same c, in that order, ahead of this -
+  // same "after the acquire, before anything the caller appends" placement inline_pend's own drain relies on
+  // (see batch_begin), just written directly since these were never held anywhere else to begin with.
+  if (delta_pend_n) {
+    uint8_t *sh = ex->region[AR_DESC].shadow;
+    for (int i = 0; i < n; i++)
+      if (phi[i] > plo[i] &&
+          tinynv_cmd_inline_upload(&c, ex->region[AR_DESC].mem.va + plo[i], sh + plo[i], (uint32_t)(phi[i] - plo[i])))
+        return -1;
+  }
 
   // Wait for the chain before this one. A chain orders the kernels inside it - each descriptor schedules the next - but
   // nothing ordered one chain against the next, because the thing that used to do that was the wait-for-idle release
