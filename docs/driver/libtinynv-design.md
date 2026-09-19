@@ -1067,6 +1067,16 @@ five-minute MTP soak; flipping it is Antonio's call. With that, every per-launch
 descriptor and the delivery has been measured; the MoE's remaining third against native is inside kernel-executing
 time and the inter-kernel dispatch gap, not in anything measured here.
 
+### Two more defaults, and the image models checked (2026-09-19 13:30-13:47)
+
+Antonio: "no reason not to take free percentages." `f7a65d6`: the inline-upload cap defaults to the method's 32,764-byte
+ceiling with a 16 x 2 KB held list (the 8 KB upload every token makes rides the pushbuffer: +2.3% MoE / +1.6% dense
+when measured alone), and non-releasing descriptors end without a barrier (+3% dense alone). Together, interleaved
+against the morning's defaults: MoE 140.3/140.5 -> 142.5/145.0, dense 70.9/70.6 -> 71.7/71.3; op-verify 450/450 at
+three depths, both greedy texts byte-identical, SDXL Turbo / SD 1.5 / Z-Image PNGs byte-identical at equal sampling
+times (image generation is indifferent to both), a five-minute MTP soak clean. The logits download served by the
+compute engine instead of the copy engine measured nothing and stays a knob.
+
 ## 5. What this needs from the humans
 
 - **The 3090's DMA is untranslated, so no kernel parameter change is needed** (Session A's finding #4, settled 2026-09-13):
