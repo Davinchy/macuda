@@ -102,7 +102,13 @@ static int stats_on(void){ if (g_stats<0){ const char* v=getenv("TINYCUDART_STAT
 typedef struct { const char* name; unsigned long launches; double ns; } kstat_t;
 static unsigned long g_syncs;   // stream/device/event waits and synchronous copies: each one breaks the launch chain
 static kstat_t* g_kstats; static size_t g_nkstats, g_kcap; static unsigned long g_launches, g_copies; static unsigned long long g_bytes_h2d, g_bytes_d2h, g_bytes_d2d, g_bytes_set;
+// The caller's own time between one launch returning and the next arriving (ggml-cuda's dispatch and llama.cpp above it),
+// against the time inside tinynv_launch. Paired only when the previous CUDA call was also a launch, so a wait or a copy
+// between them is not counted as the caller thinking. The stats' own name loops run outside both brackets.
+double tinycudart_now_ns(void);
+static double g_last_ret, g_between_ns; static int g_last_was_launch; static unsigned long g_between_n;
 void tinycudart_count_launch(const char* name){ g_launches++; if (!stats_on()) return;
+  { double now=tinycudart_now_ns(); if (g_last_was_launch && g_last_ret>0) { g_between_ns+=now-g_last_ret; g_between_n++; } }
   for (size_t i=0;i<g_nkstats;i++) if (g_kstats[i].name==name){ g_kstats[i].launches++; return; }
   if (g_nkstats==g_kcap){ g_kcap=g_kcap?g_kcap*2:256; g_kstats=realloc(g_kstats,g_kcap*sizeof(*g_kstats)); }
   g_kstats[g_nkstats].name=name; g_kstats[g_nkstats].launches=1; g_nkstats++; }
@@ -110,14 +116,15 @@ void tinycudart_count_launch(const char* name){ g_launches++; if (!stats_on()) r
 // the call returns, so this is the kernel's execution time plus a fixed round trip; in the default async mode it is only the
 // submission cost. The dump says which mode it was.
 void tinycudart_time_launch(const char* name, double ns){ if (!stats_on()) return;
-  for (size_t i=0;i<g_nkstats;i++) if (g_kstats[i].name==name){ g_kstats[i].ns+=ns; return; } }
-void tinycudart_count_sync(void){ g_syncs++; }
+  for (size_t i=0;i<g_nkstats;i++) if (g_kstats[i].name==name){ g_kstats[i].ns+=ns; break; }
+  g_last_ret=tinycudart_now_ns(); g_last_was_launch=1; }
+void tinycudart_count_sync(void){ g_syncs++; g_last_was_launch=0; }
 static unsigned long g_syncs_flushed;   // answered without waiting: the driver said nothing outstanding needed it (inline uploads only)
 void tinycudart_count_sync_flushed(void){ g_syncs_flushed++; }
 static double g_api_ns[8]; static unsigned long g_api_n[8];
-void tinycudart_time_api(int kind, double ns){ if (!stats_on()||kind<0||kind>7) return; g_api_ns[kind]+=ns; g_api_n[kind]++; }
+void tinycudart_time_api(int kind, double ns){ g_last_was_launch=0; if (!stats_on()||kind<0||kind>7) return; g_api_ns[kind]+=ns; g_api_n[kind]++; }
 double tinycudart_now_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1e9+ts.tv_nsec; }
-void tinycudart_count_copy(int kind, unsigned long long n){ g_copies++; if (kind==1) g_bytes_h2d+=n; else if (kind==2) g_bytes_d2h+=n; else if (kind==3) g_bytes_d2d+=n; else g_bytes_set+=n; }
+void tinycudart_count_copy(int kind, unsigned long long n){ g_copies++; g_last_was_launch=0; if (kind==1) g_bytes_h2d+=n; else if (kind==2) g_bytes_d2h+=n; else if (kind==3) g_bytes_d2d+=n; else g_bytes_set+=n; }
 static int cmp_kstat(const void* a, const void* b){ double x=((const kstat_t*)a)->ns, y=((const kstat_t*)b)->ns; if (x!=y) return x<y?1:-1;
   unsigned long lx=((const kstat_t*)a)->launches, ly=((const kstat_t*)b)->launches; return lx<ly?1:lx>ly?-1:0; }
 static void stats_dump(void){
@@ -132,6 +139,9 @@ static void stats_dump(void){
                                                   : "async: this is submission cost only, NOT execution time");
   { static const char* kinds[8]={"memcpyAsync","memcpy","memsetAsync","streamSynchronize","eventRecord","streamWaitEvent","eventSynchronize","?"};
     for (int i=0;i<8;i++) if (g_api_n[i]) fprintf(stderr,"[tinycudart]   api %-18s %8lu calls  %9.1f ms  %7.1f us/call\n", kinds[i], g_api_n[i], g_api_ns[i]/1e6, g_api_ns[i]/1e3/g_api_n[i]); }
+  if (g_between_n) fprintf(stderr,"[tinycudart] stats: between consecutive launches the caller spent %.2f us a launch (%lu pairs: ggml-cuda's dispatch and "
+                           "llama.cpp above it); inside tinynv_launch %.2f us a launch - the host's cost per launch is their sum\n",
+                           g_between_ns/1e3/g_between_n, g_between_n, g_launches?total/1e3/g_launches:0.0);
   qsort(g_kstats,g_nkstats,sizeof(*g_kstats),cmp_kstat);
   for (size_t i=0;i<g_nkstats && i<40;i++) fprintf(stderr,"[tinycudart]   %8lu  %9.1f ms  %7.1f us/launch  %s\n", g_kstats[i].launches, g_kstats[i].ns/1e6,
           g_kstats[i].launches ? g_kstats[i].ns/1e3/g_kstats[i].launches : 0.0, g_kstats[i].name);
