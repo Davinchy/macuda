@@ -1055,6 +1055,18 @@ syncs, which a decode never does), the card reads pstate 1 at 2,860 MHz, 154 W M
 **gpu busy 66% (MoE) / 78% (dense)**. So replay is not worth building, and the MoE gap is inside busy time: kernels
 plus the per-QMD tail (§4h's next lever: the five invalidates and the L1_SYSMEMBAR membar every descriptor carries).
 
+### The per-QMD tail, measured (2026-09-19 12:45-13:03)
+
+Two knobs, `TINYNV_QMD_MEMBAR` and `TINYNV_QMD_INVALIDATE` (`f96ac28`, the oracle's choice by default). The five
+per-launch cache invalidates are **load-bearing**: without them (or with only the constant-bank one) op-verify still
+reads 450/450 and the 96-token greedy text **differs** - a chained decode reads what the previous kernel wrote through
+the texture path, and only the byte-compare sees it. The system-scope barrier at the end of every non-releasing
+descriptor costs the **dense decode 3%** (68.1/68.7 -> 70.7/70.3 tg128, interleaved) and the MoE nothing; gpu scope
+buys nothing, so it is the barrier itself. `membar=none` passed op-verify at three depths, both texts and a
+five-minute MTP soak; flipping it is Antonio's call. With that, every per-launch choice this driver makes at the
+descriptor and the delivery has been measured; the MoE's remaining third against native is inside kernel-executing
+time and the inter-kernel dispatch gap, not in anything measured here.
+
 ## 5. What this needs from the humans
 
 - **The 3090's DMA is untranslated, so no kernel parameter change is needed** (Session A's finding #4, settled 2026-09-13):
