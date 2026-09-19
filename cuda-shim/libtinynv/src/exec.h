@@ -342,6 +342,7 @@ typedef struct {
   uint32_t kwrite, kharvest;    // ring cursors: the next slot to give out, the oldest not yet read
   uint64_t kprev_clock;         // the previous stamp read, which the next interval starts from
   int kprev_valid, kgap_break;  // whether it is one; whether a launch since went unstamped
+  int kboundary_pending;        // a wait returned with the compute queue fully retired: the next launch is a boundary
   uint64_t kwindows;            // host waits that retired stamped work; the first kprof_skip are not counted
   uint64_t kstamped, kmissing, klost, kskipped, kbackwards;
   uint64_t kboundary_ns, kboundary_n, kfirst_n, kattr_ns, kattr_n, kunnamed_ns, kunnamed_n;

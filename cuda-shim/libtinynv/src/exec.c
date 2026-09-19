@@ -297,7 +297,14 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
       // Everything the engine has passed is no longer interesting, and dropping it here is what keeps room for the
       // oldest thing that is still outstanding - which is the one a stall needs to show.
       uint64_t reached = v < vcopy ? vcopy : v;
-      if (ex->kprof_on) kprof_harvest(ex, v, 1);
+      // The engine is idle at this instant if nothing submitted on the compute queue is still outstanding, and then
+      // whatever is launched next ends an interval that holds idle time and the host's turnaround rather than a
+      // kernel. Not `spun`: a wait that found the work already done leaves the engine exactly as idle, and the
+      // first run of this instrument put several whole-token intervals on rope_multi and k_bin_bcast that way.
+      if (ex->kprof_on) {
+        kprof_harvest(ex, v, 1);
+        if (v >= ex->q_last[0]) ex->kboundary_pending = 1;
+      }
       int keep = 0;
       for (int i = 0; i < ex->ntrail; i++)
         if (ex->trail[i].upto > reached) ex->trail[keep++] = ex->trail[i];
@@ -1132,6 +1139,12 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // wait-for-idle into the same ring slot instead, appended below after the launch. Nothing depends on the second
   // release slot of a descriptor, whose behaviour nobody has established (the retraction further down).
   uint32_t ktail = ex->kprof_on ? ex->chain[n - 1].kslot : TINYNV_KPROF_SLOTS;
+  // A chain that was built before a wait and is handed over after it runs after the idle the wait saw: its first
+  // launch is the boundary, not the next one built. Normally nothing is pending across a wait and this is idle.
+  if (ex->kprof_on && ex->kboundary_pending && ex->chain[0].kslot < TINYNV_KPROF_SLOTS) {
+    ex->kslot[ex->chain[0].kslot].boundary = 1;
+    ex->kboundary_pending = 0;
+  }
   if (ktail < TINYNV_KPROF_SLOTS) {
     if (tinynv_qmd_release_clear(&ex->chain[n - 1].qmd)) return -1;
     ex->kslot[ktail].tail = 1;
@@ -1803,8 +1816,9 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   // The wait that ended the standstill left the last chain's tail unread (its stamp follows the timeline release);
   // by now the host has been away sampling a token, so it is read here, and if a stamp has not landed after all the
   // payload check counts it missing rather than believing it.
-  int kboundary = ex->kprof_on && ex->after_stall && !ex->nchain;
+  int kboundary = ex->kprof_on && ex->kboundary_pending;
   if (kboundary) {
+    ex->kboundary_pending = 0;
     if (ex->kharvest != ex->kwrite) kprof_harvest(ex, sem_read_slot(ex, 0), 2);
     if (ex->kharvest == ex->kwrite) ex->kwrite = ex->kharvest = 0;
   }
