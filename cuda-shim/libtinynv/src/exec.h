@@ -256,6 +256,11 @@ typedef struct {
   // Sub-launch accounting: patches (inline-upload calls) made, their pushbuffer footprint headers included, and
   // launches whose runs cost more than their one envelope - or overflowed their room - and went out as that instead.
   uint64_t delta_span_n, delta_pb_bytes, delta_collapse_n;
+  // TINYNV_DELTA_REWIND=1 (with delta delivery): start the descriptor region from the bottom at the first launch after
+  // a standstill, so each token's launches land where the previous token's did and the diff is a launch against its
+  // own previous-token self. See tinynv_exec_run.
+  int delta_rewind;
+  uint64_t delta_rewind_n;
   // Launch every descriptor from the command stream and link none of them, so nothing orders one kernel against the
   // next. THIS PRODUCES WRONG ANSWERS for any real workload - dependent kernels run side by side - and exists for one
   // measurement: whether the submission path can sustain a launch a microsecond when nothing waits on anything. The

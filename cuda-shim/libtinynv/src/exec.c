@@ -1583,6 +1583,25 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   // chain's overhead (~22 us) once a token, and what it buys is the delivery handoff moving off the critical path.
   unsigned cap = (ex->hybrid_delivery && ex->after_stall) ? ex->short_chain : (unsigned)ex->chain_max;
   if (ex->nchain >= (int)cap && tinynv_exec_flush(ex)) return -1;
+  // TINYNV_DELTA_REWIND: come round now, at the first launch after a standstill, rather than wherever the region
+  // happens to run out. Measured 2026-09-19 with sub-launch runs engaging on every flush: each launch's span still
+  // differed from what was last delivered at its address by ~35% (70 KB of a 200 KB flush, dword-precise), and the
+  // pushbuffer that carried it cost the MoE decode 44% - because the ring rewinds at a chain boundary, not a token
+  // boundary, so the launch last delivered at an address is a DIFFERENT launch of the same kernel from another
+  // layer or another point in the token, and the diff is between two layers' pointers and strides rather than
+  // between one launch and its own previous-token self. Starting each token from the bottom makes launch k of every
+  // token land where launch k of the last one did. Then what differs is what actually changes a token: a release
+  // value, a KV position, an offset - a few dwords a launch.
+  //
+  // Done by declaring the region full so the next placement comes round through arena()'s own wrap path, which is
+  // the only path that knows how: it refuses if a chain is pending (none is - the standstill flushed it), pushes and
+  // flushes, waits per piece for whatever still owns the bytes, and refuses if any span is unaccounted for. Nothing
+  // here reasons about ownership; that is deliberate. The region has to hold a whole token between rewinds (a dense
+  // 27B decode token is ~2.5 MB of descriptors, the region 64 MB); a token that does not fit simply wraps as before.
+  if (ex->delta_rewind && ex->after_stall && !ex->nchain && ex->region[AR_DESC].next) {
+    ex->region[AR_DESC].next = ex->region[AR_DESC].size;
+    ex->delta_rewind_n++;
+  }
   if (!arena_fits(ex, AR_DESC, slot + cbuf0_bytes, 256) && tinynv_exec_flush(ex)) return -1;
 
   uint64_t qmd_va;
@@ -1781,6 +1800,11 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
     const char *g = getenv("TINYNV_DELTA_GAP"), *a = getenv("TINYNV_DELTA_AGGREGATE_KB");
     ex->delta_gap = tinynv_exec_delta_gap(g);
     ex->delta_aggregate_max = tinynv_exec_delta_aggregate(a);
+    { const char *r = getenv("TINYNV_DELTA_REWIND");
+      ex->delta_rewind = ex->delta_delivery && r && *r && *r != '0';
+      if (ex->delta_rewind)
+        fprintf(stderr, "libtinynv: the descriptor region starts from the bottom at every standstill, so the delta is "
+                        "a launch against its own previous token (TINYNV_DELTA_REWIND was asked for)\n"); }
     // Both knobs named with what decided them, the way every other line here is: a sweep is read off these lines,
     // never off what anyone remembers exporting.
     if (ex->delta_delivery)
@@ -1972,6 +1996,9 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
             ex->delta_n ? (double)ex->delta_pb_bytes / 1024.0 / (double)ex->delta_n : 0.0,
             (unsigned long long)ex->delta_collapse_n, (unsigned long long)ex->delta_skip_n,
             (unsigned long long)ex->delta_full_n);
+  if (ex->delta_rewind_n)
+    fprintf(stderr, "libtinynv: the descriptor region was started from the bottom at %llu standstills "
+                    "(TINYNV_DELTA_REWIND).\n", (unsigned long long)ex->delta_rewind_n);
   if (ex->inline_n || ex->upload_ce_n)
     fprintf(stderr, "libtinynv: %llu host-to-device copies rode in the pushbuffer (%llu bytes) and %llu went to the "
                     "copy engine.\n           Held list (%u entries, %u bytes): %llu rode in a batch already going "
