@@ -228,6 +228,10 @@ typedef struct {
   // identical token to token, which is what the delta path lives on. Both diagnostics say loudly that they are
   // degraded rather than quietly saying less, and TINYNV_TAIL_RELEASE=0 brings them back.
   int tail_release;
+  // TINYNV_QMD_MEMBAR=sys|gpu|none and TINYNV_QMD_INVALIDATE=all|cb0|none: what every NON-releasing descriptor makes
+  // the engine do at its tail (qmd.c). Measurement knobs, the oracle's choice by default; a descriptor that releases
+  // the timeline keeps the system-scope barrier whatever these say (tinynv_exec_flush, tinynv_exec_run).
+  int qmd_membar, qmd_invalidate;
   int download_sync_first;
   int inline_upload;
   // How many uploads took each path. Without these, "the knob did nothing" and "the knob was never in effect" are the
@@ -363,6 +367,10 @@ int tinynv_exec_tail_release(const char *e);
 // the second following the first off. Resolved here so test_exec_mode pins what an empty environment gets.
 int tinynv_exec_delta_delivery(const char *e);
 int tinynv_exec_delta_rewind(int delivery, const char *e);
+// TINYNV_QMD_MEMBAR: "sys" (the default) = TINYNV_QMD_MEMBAR_SYS, "gpu" = _GPU, "none" = _NONE; anything else is the
+// default. TINYNV_QMD_INVALIDATE: "all" (the default), "cb0", "none". Resolved here so test_exec_mode pins them.
+int tinynv_exec_qmd_membar(const char *e);
+int tinynv_exec_qmd_invalidate(const char *e);
 // 0 = a download issues its copy immediately and the card waits (the default); 1 = the host waits for compute first,
 // so the copy's acquire is satisfied before the channel is ever looked at.
 int tinynv_exec_download_sync_first(const char *e);

@@ -163,15 +163,22 @@ int tinynv_qmd_program(tinynv_qmd_t *q, const tinynv_qmd_program_t *p) {
   SET(q, SHARED_MEMORY_SIZE_SHIFTED7, p->shmem >> 7);
   SET(q, SHADER_LOCAL_MEMORY_HIGH_SIZE_SHIFTED4, p->slm_per_thread >> 4);
   SET(q, QMD_GROUP_ID, 0x3f);
-  SET(q, INVALIDATE_TEXTURE_HEADER_CACHE, 1);
-  SET(q, INVALIDATE_TEXTURE_SAMPLER_CACHE, 1);
-  SET(q, INVALIDATE_TEXTURE_DATA_CACHE, 1);
-  SET(q, INVALIDATE_SHADER_DATA_CACHE, 1);
+  // The invalidates and the barrier are the oracle's on every launch (ops_nv.py:289-291: the four cache invalidates,
+  // the constant-bank invalidate, L1_SYSMEMBAR). Both are measurement knobs since 2026-09-19 (exec.c): with the delta
+  // delivery defaults the MoE decode is engine-busy 66% of a token and still a third slower than native, and what a
+  // descriptor makes the engine do at its tail - a system-scope barrier over Thunderbolt per kernel, five cache
+  // invalidates per launch - is the remaining per-launch cost this driver chooses. The per-chain command-stream
+  // invalidate (submit.c, INVALIDATE_SHADER_CACHES_NO_WFI) stays whatever these say.
+  int inv_all = p->invalidate == TINYNV_QMD_INVALIDATE_ALL, inv_cb0 = p->invalidate != TINYNV_QMD_INVALIDATE_NONE;
+  SET(q, INVALIDATE_TEXTURE_HEADER_CACHE, inv_all);
+  SET(q, INVALIDATE_TEXTURE_SAMPLER_CACHE, inv_all);
+  SET(q, INVALIDATE_TEXTURE_DATA_CACHE, inv_all);
+  SET(q, INVALIDATE_SHADER_DATA_CACHE, inv_all);
   SET(q, API_VISIBLE_CALL_LIMIT, 1);
   SET(q, SAMPLER_INDEX, 1);
   SET(q, BARRIER_COUNT, 1);
-  SET(q, CWD_MEMBAR_TYPE, TINYNV_QMDV_CWD_MEMBAR_TYPE_L1_SYSMEMBAR);
-  SET(q, CONSTANT_BUFFER_INVALIDATE_0, 1);
+  if (tinynv_qmd_membar(q, p->membar)) return -1;
+  SET(q, CONSTANT_BUFFER_INVALIDATE_0, inv_cb0);
   SET(q, MIN_SM_CONFIG_SHARED_MEM_SIZE, smem_cfg);
   SET(q, TARGET_SM_CONFIG_SHARED_MEM_SIZE, smem_cfg);
   SET(q, MAX_SM_CONFIG_SHARED_MEM_SIZE, max_cfg);
@@ -186,6 +193,14 @@ int tinynv_qmd_program(tinynv_qmd_t *q, const tinynv_qmd_program_t *p) {
     SETF(q, cb_size[i], p->constbuf_size[i]);
     SETF(q, cb_valid[i], 1);
   }
+  return 0;
+}
+
+int tinynv_qmd_membar(tinynv_qmd_t *q, int membar) {
+  uint64_t v = membar == TINYNV_QMD_MEMBAR_GPU ? TINYNV_QMDV_CWD_MEMBAR_TYPE_L1_MEMBAR
+             : membar == TINYNV_QMD_MEMBAR_NONE ? TINYNV_QMDV_CWD_MEMBAR_TYPE_L1_NONE
+                                                : TINYNV_QMDV_CWD_MEMBAR_TYPE_L1_SYSMEMBAR;
+  SET(q, CWD_MEMBAR_TYPE, v);
   return 0;
 }
 

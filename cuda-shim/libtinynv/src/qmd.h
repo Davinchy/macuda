@@ -61,7 +61,14 @@ typedef struct {
   uint32_t sass_version;     // tinynv_sass_version() of the device's sm_version
   uint32_t constbuf_size[TINYNV_QMD_CONSTBUFS]; // 0 for a bank the program does not use
   int constbuf_used[TINYNV_QMD_CONSTBUFS];
+  // What the descriptor makes the engine do at the kernel's tail, both the oracle's choice unless a measurement mode
+  // asks otherwise (exec.c, TINYNV_QMD_MEMBAR / TINYNV_QMD_INVALIDATE): the scope of the memory barrier at the end
+  // of the grid (TINYNV_QMD_MEMBAR_* below), and which caches the launch invalidates on entry.
+  int membar;       // TINYNV_QMD_MEMBAR_SYS (the oracle's L1_SYSMEMBAR), _GPU (L1_MEMBAR) or _NONE
+  int invalidate;   // TINYNV_QMD_INVALIDATE_ALL (the oracle's five), _CB0 (only constant bank 0) or _NONE
 } tinynv_qmd_program_t;
+enum { TINYNV_QMD_MEMBAR_SYS = 0, TINYNV_QMD_MEMBAR_GPU = 1, TINYNV_QMD_MEMBAR_NONE = 2 };
+enum { TINYNV_QMD_INVALIDATE_ALL = 0, TINYNV_QMD_INVALIDATE_CB0 = 1, TINYNV_QMD_INVALIDATE_NONE = 2 };
 
 // What changes per launch: the shape, and the addresses that are only known once memory is allocated.
 typedef struct {
@@ -78,6 +85,9 @@ int tinynv_qmd_launch(tinynv_qmd_t *q, const tinynv_qmd_launch_t *l);
 // Releases a semaphore when the kernel finishes. There are two slots; this takes the first free one and returns which,
 // or -1 when both are taken and the caller has to fall back on a release in the command stream.
 int tinynv_qmd_release(tinynv_qmd_t *q, uint64_t addr, uint64_t payload, int timestamp);
+// Set the scope of the barrier at the end of the grid after the fact (TINYNV_QMD_MEMBAR_*): a descriptor that
+// releases the timeline must publish its writes system-wide whatever the measurement mode asked of the others.
+int tinynv_qmd_membar(tinynv_qmd_t *q, int membar);
 // Check one link of a chain: that it releases `want_payload`, and that it schedules the descriptor at `next_va` - or
 // nothing at all, when next_va is zero and this is the last link. Returns 0, or -1 with *why set to a reason.
 // `releases` says which shape this chain is in: 1 for the shipping one, where every link reports its own completion,

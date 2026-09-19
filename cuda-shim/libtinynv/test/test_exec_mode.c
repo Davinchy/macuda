@@ -146,6 +146,22 @@ int main(void) {
           "the three knobs that measured as a win together are no longer all on by default");
   }
 
+  // The descriptor-tail measurement knobs: the oracle's choice unless asked, and only the spellings that name a mode.
+  {
+    static const struct { const char *e; int want; } mb[] = {{NULL, TINYNV_QMD_MEMBAR_SYS}, {"", TINYNV_QMD_MEMBAR_SYS}, {"sys", TINYNV_QMD_MEMBAR_SYS},
+                                                             {"gpu", TINYNV_QMD_MEMBAR_GPU}, {"none", TINYNV_QMD_MEMBAR_NONE}, {"1", TINYNV_QMD_MEMBAR_SYS}, {"GPU", TINYNV_QMD_MEMBAR_SYS}};
+    for (size_t i = 0; i < sizeof(mb) / sizeof(*mb); i++)
+      CHECK(tinynv_exec_qmd_membar(mb[i].e) == mb[i].want, "TINYNV_QMD_MEMBAR=%s gave %d, expected %d", mb[i].e ? mb[i].e : "(unset)",
+            tinynv_exec_qmd_membar(mb[i].e), mb[i].want);
+    static const struct { const char *e; int want; } inv[] = {{NULL, TINYNV_QMD_INVALIDATE_ALL}, {"", TINYNV_QMD_INVALIDATE_ALL}, {"all", TINYNV_QMD_INVALIDATE_ALL},
+                                                              {"cb0", TINYNV_QMD_INVALIDATE_CB0}, {"none", TINYNV_QMD_INVALIDATE_NONE}, {"0", TINYNV_QMD_INVALIDATE_ALL}};
+    for (size_t i = 0; i < sizeof(inv) / sizeof(*inv); i++)
+      CHECK(tinynv_exec_qmd_invalidate(inv[i].e) == inv[i].want, "TINYNV_QMD_INVALIDATE=%s gave %d, expected %d",
+            inv[i].e ? inv[i].e : "(unset)", tinynv_exec_qmd_invalidate(inv[i].e), inv[i].want);
+    CHECK(tinynv_exec_qmd_membar(NULL) == TINYNV_QMD_MEMBAR_SYS && tinynv_exec_qmd_invalidate(NULL) == TINYNV_QMD_INVALIDATE_ALL,
+          "an empty environment no longer builds the oracle's descriptor tail");
+  }
+
   // Whether a download drains the compute on the host before issuing its copy. Off by default: it is a test of a
   // mechanism, not yet a fix, and the two arms want measuring against each other rather than one being assumed.
   {

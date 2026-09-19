@@ -978,6 +978,12 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // Under the profile the tail's release carries the gpu clock as well as the value: a four word report instead of
   // two, payload at +0 where the timeline has always been read and the clock at +8. Nothing else changes - same slot,
   // same address, same moment, eight more bytes into a 128 byte stride.
+  // A descriptor that releases the timeline publishes its writes system-wide whatever TINYNV_QMD_MEMBAR asked of the
+  // others: the release is what the host, the copy engine and the next chain's acquire trust, and a release carries no
+  // barrier of its own (tinynv_qmd_release sets address, payload and size only).
+  if (ex->tail_release && !ex->no_chain_deps && ex->qmd_membar != TINYNV_QMD_MEMBAR_SYS &&
+      tinynv_qmd_membar(&ex->chain[n - 1].qmd, TINYNV_QMD_MEMBAR_SYS))
+    return -1;
   if (ex->tail_release && !ex->no_chain_deps &&
       tinynv_qmd_release(&ex->chain[n - 1].qmd, ex->sem.va + SEM_SLOT(0), ex->reserved, ex->profile ? 1 : 0) < 0)
     return tinynv_fail("the last descriptor has no free release slot");
@@ -1654,6 +1660,11 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   // Bank 0 is the one being built here, in this allocation; the rest are sections of the image, and a kernel that reads
   // a __device__ table finds its address in one of them.
   prog.constbuf_used[0] = 1;
+  // The tail of every descriptor: the oracle's unless a measurement mode asked otherwise. With per-launch releases
+  // (TINYNV_TAIL_RELEASE=0) every descriptor releases and keeps the system-scope barrier, so the membar knob only
+  // reaches the non-releasing links of a tail-released chain; the flush puts the tail back to system scope.
+  prog.membar = ex->tail_release ? ex->qmd_membar : TINYNV_QMD_MEMBAR_SYS;
+  prog.invalidate = ex->qmd_invalidate;
   // The size bound is the cubin's section, not the allocation: nvcc sizes .nv.constant0 to exactly the driver's
   // parameters plus the kernel's, so it always covers the arguments written below, and the allocation is only larger
   // because constant buffers are placed on 256 byte boundaries. Binding the allocation's size instead would tell the
@@ -1749,6 +1760,19 @@ int tinynv_exec_tail_release(const char *e) { return !e || !*e || *e != '0'; }
 // 27B 67.8 -> 70.7 tg128, MoE 35B-A3B ~161 -> ~166), byte-identical output, server and image paths clean
 // (docs/handoff-2026-09-19.md). The rewind is meaningless without delivery, so it follows delivery off.
 int tinynv_exec_delta_delivery(const char *e) { return !e || !*e || *e != '0'; }
+
+int tinynv_exec_qmd_membar(const char *e) {
+  if (!e || !*e) return TINYNV_QMD_MEMBAR_SYS;
+  if (!strcmp(e, "gpu")) return TINYNV_QMD_MEMBAR_GPU;
+  if (!strcmp(e, "none")) return TINYNV_QMD_MEMBAR_NONE;
+  return TINYNV_QMD_MEMBAR_SYS;
+}
+int tinynv_exec_qmd_invalidate(const char *e) {
+  if (!e || !*e) return TINYNV_QMD_INVALIDATE_ALL;
+  if (!strcmp(e, "cb0")) return TINYNV_QMD_INVALIDATE_CB0;
+  if (!strcmp(e, "none")) return TINYNV_QMD_INVALIDATE_NONE;
+  return TINYNV_QMD_INVALIDATE_ALL;
+}
 int tinynv_exec_delta_rewind(int delivery, const char *e) { return delivery && (!e || !*e || *e != '0'); }
 
 // Whether a download waits for the compute to finish on the HOST before issuing its copy, instead of issuing the copy
@@ -1826,6 +1850,17 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   // prefetched descriptor's resources are reserved before its predecessor has released them.
   { const char *e2 = getenv("TINYNV_CHAIN_PREFETCH"); ex->chain_prefetch = !(e2 && *e2 == '0'); }
   ex->tail_release = tinynv_exec_tail_release(getenv("TINYNV_TAIL_RELEASE"));
+  { const char *m = getenv("TINYNV_QMD_MEMBAR"), *i = getenv("TINYNV_QMD_INVALIDATE");
+    ex->qmd_membar = tinynv_exec_qmd_membar(m);
+    ex->qmd_invalidate = tinynv_exec_qmd_invalidate(i);
+    if (ex->qmd_membar != TINYNV_QMD_MEMBAR_SYS || ex->qmd_invalidate != TINYNV_QMD_INVALIDATE_ALL)
+      fprintf(stderr, "libtinynv: MEASUREMENT MODE: non-releasing descriptors end with a %s barrier and invalidate %s on "
+                      "entry (TINYNV_QMD_MEMBAR=%s TINYNV_QMD_INVALIDATE=%s were asked for); releasing descriptors keep the "
+                      "oracle's system-scope barrier%s\n",
+              ex->qmd_membar == TINYNV_QMD_MEMBAR_GPU ? "gpu-scope" : ex->qmd_membar == TINYNV_QMD_MEMBAR_NONE ? "NO" : "system-scope",
+              ex->qmd_invalidate == TINYNV_QMD_INVALIDATE_CB0 ? "only constant bank 0" : ex->qmd_invalidate == TINYNV_QMD_INVALIDATE_NONE ? "NOTHING" : "the oracle's five caches",
+              m && *m ? m : "(unset)", i && *i ? i : "(unset)",
+              ex->tail_release ? "" : " - and with TINYNV_TAIL_RELEASE=0 every descriptor releases, so the membar knob changes nothing"); }
   ex->download_sync_first = tinynv_exec_download_sync_first(getenv("TINYNV_DOWNLOAD_SYNC_FIRST"));
   { const char *e = getenv("TINYNV_SHORT_FIRST_CHAIN");
     ex->short_chain = tinynv_exec_short_chain(e);
