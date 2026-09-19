@@ -56,7 +56,7 @@ case "$cmd" in
     [ -f "$PIDF" ] || { echo "not running (no pidfile)"; }
     if [ -f "$PIDF" ]; then pid=$(cat "$PIDF"); if kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid"; i=0; while kill -0 "$pid" 2>/dev/null && [ $i -lt 60 ]; do i=$((i+1)); sleep 0.5; done
         kill -0 "$pid" 2>/dev/null && { echo "still alive after 30 s, sending KILL"; kill -KILL "$pid"; }; echo "stopped pid $pid"; else echo "pid $pid was not running"; fi; rm -f "$PIDF" "$URLF"; fi
-    if grep -q "session=A " $R/.gpu-lock 2>/dev/null; then [ "${QUIESCE:-0}" = 1 ] && sh $R/tools/nv_quiesce.sh 2>&1 | sed 's/^/   /'; sh $R/tools/gpu-lock.sh release A >/dev/null; echo "   card $([ "${QUIESCE:-0}" = 1 ] && echo "quiesced cold" || echo "left idle warm (GSP resident)"), lock released"; fi ;;
+    if grep -q "session=A " "${GPU_LOCK:-$R/.gpu-lock}" 2>/dev/null; then [ "${QUIESCE:-0}" = 1 ] && sh $R/tools/nv_quiesce.sh 2>&1 | sed 's/^/   /'; sh $R/tools/gpu-lock.sh release A >/dev/null; echo "   card $([ "${QUIESCE:-0}" = 1 ] && echo "quiesced cold" || echo "left idle warm (GSP resident)"), lock released"; fi ;;
   restart)
     test -f $R/logs/serve.args || { echo "nothing to restart from (no logs/serve.args)"; exit 1; }
     M=$(sed -n 1p $R/logs/serve.args); PORT=$(sed -n 2p $R/logs/serve.args); sh "$0" stop; exec sh "$0" start "$M" "$PORT" ;;
