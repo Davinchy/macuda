@@ -871,6 +871,13 @@ int tinynv_stream_needs_wait(tinynv_stream_t s) {
 tinynv_status_t tinynv_stream_flush(tinynv_stream_t s) {
   if (!ON_GPU(s)) return TINYNV_OK;
   NEED_GPU(s);
+  // Published from here as well as from the waiting sync, since 2026-09-19: a decode's synchronisations are answered
+  // without a wait (the shim flushes and returns when nothing outstanding needs the engine - 15,431 of 15,431 in a
+  // tg256 run), so with the publisher only on the waiting path every reading of clocks, power and busy this driver
+  // had ever produced was from an idle moment between steps. Antonio's ear caught it: the fans never spin up under a
+  // model. The rate limit inside publish_sensors (four a second) bounds the cost to one read of the firmware's own
+  // utilisation block; it is not a control call.
+  publish_sensors(s->dev);
   return WITH_LOCK(tinynv_exec_flush(&s->dev->exec)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
 }
 

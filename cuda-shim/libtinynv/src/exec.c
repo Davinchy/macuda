@@ -1070,7 +1070,16 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
     // Each pass through this block ends in exactly one of delta_n, delta_skip_n and delta_full_n, so their sum is
     // how many came before this one.
     int verbose = getenv("TINYNV_DELTA_VERBOSE") != NULL;
-    int diag = verbose && ex->delta_n + ex->delta_skip_n + ex->delta_full_n < 3;
+    // Full-depth flushes only: the first flushes after a rewind are one-launch chains from the prompt phase, and
+    // diagnosing those (as this did until 2026-09-19 12:2x) says nothing about the decode chains the delta path lives
+    // on. Three of at least 64 launches, then only the misses.
+    // ...and not the first ones of those either: the first decode token's chains are diffed against the PROMPT's
+    // prefill chains at the same addresses (different kernels, different shapes), the one token the rewind cannot
+    // help - 44-65 KB of genuine change a flush, measured 2026-09-19 - where the steady state is ~2 KB. Flushes 31-33
+    // are three tokens into the decode.
+    static int seen;
+    if (verbose && n >= 64) seen++;
+    int diag = verbose && n >= 64 && seen > 30 && seen <= 33;
     unsigned ns = 0, changed = 0;   // patches recorded so far across every launch checked, and launches that had any
     uint32_t need_dwords = 0, need_bytes = 0, env_bytes = 0;
     int all_fit = 1;
@@ -1103,9 +1112,24 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
         run_bytes = env.hi - env.lo;
         ex->delta_collapse_n++;
       }
-      if (diag)
+      if (diag) {
         fprintf(stderr, "libtinynv: delta runs: launch %d envelope %u B (%u dw) -> %d run%s %u B (%u dw)\n", i,
                 env.hi - env.lo, env_dwords, k, k == 1 ? "" : "s", run_bytes, run_dwords);
+        // And WHERE, for the first eight launches of the flush: which dwords of the descriptor slot or which bytes of
+        // the constant buffer changed since the previous token. This is the ground truth a chain-replay field
+        // classifier would be built from (docs/driver/chain-replay-plan.md SS2, "one thing the logs cannot tell me"):
+        // a release payload sits in the QMD, a per-token parameter in cbuf0 past the driver's own 0x380 bytes.
+        if (i < 8)
+          for (int r = 0; r < k; r++) {
+            uint32_t off = ex->delta_span[ns + r].lo - lo, len = ex->delta_span[ns + r].hi - ex->delta_span[ns + r].lo;
+            if (off < TINYNV_QMD_SLOT_BYTES)
+              fprintf(stderr, "libtinynv:   launch %d run %d: QMD dwords %u..%u\n", i, r, off / 4, (off + len) / 4 - 1);
+            else
+              fprintf(stderr, "libtinynv:   launch %d run %d: cbuf0 +%u..+%u (%s)\n", i, r, off - TINYNV_QMD_SLOT_BYTES,
+                      off - TINYNV_QMD_SLOT_BYTES + len - 1,
+                      off - TINYNV_QMD_SLOT_BYTES < 0x380 ? "driver parameters" : "kernel parameters");
+          }
+      }
       // Capped as a whole flush by pushbuffer footprint, headers included - see delta_span_dwords and the comment
       // above tinynv_exec_flush for why that and not TINYNV_INLINE_MAX. This is the only way the pass falls back now:
       // a run longer than one call carries is split at emit time, and the list always has room for an envelope.
@@ -1128,6 +1152,12 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
       fprintf(stderr, "libtinynv: delta flush: %d launches, %u changed, envelope %u B, genuine %u B in %u patches, "
                       "pushbuffer %u B with headers%s\n", n, changed, env_bytes, need_bytes, ns, need_dwords * 4u,
               all_fit ? "" : " - DID NOT FIT");
+    // One line per full-depth flush for the whole run, so alignment can be read as a trace rather than sampled: a
+    // token whose launch sequence differs from the previous token's (a kernel variant or split count chosen from the
+    // KV length, one launch more or fewer) shifts every later launch and reads as tens of KB; an aligned one as ~2.
+    else if (verbose && n >= 64)
+      fprintf(stderr, "libtinynv: delta flush #%d: %d launches, %u changed, genuine %u B, %u patches\n", seen, n, changed,
+              need_bytes, ns);
     if (all_fit) {
       // Nothing above touched arena state - safe to commit now that every launch has been checked. The actual
       // tinynv_cmd_inline_upload calls happen after batch_begin() below, once the chain's own command buffer
