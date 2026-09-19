@@ -62,6 +62,24 @@
 #define TINYNV_DELTA_SPANS_MAX       4096
 #define TINYNV_DELTA_LAUNCH_RUNS_MAX 64
 typedef struct { uint32_t lo, hi; } tinynv_delta_span_t;   // [lo,hi) as offsets into AR_DESC, both dword multiples
+
+// TINYNV_KERNEL_PROFILE: the engine's clock at every kernel's completion, by kernel. See the fields in tinynv_exec_t.
+#define TINYNV_KPROF_SLOTS 16384                 // a token is ~1,000-2,000 launches; the ring holds several
+#define TINYNV_KPROF_ROWS 1024                   // distinct kernel instantiations a run may name
+#define TINYNV_KPROF_INDEX (TINYNV_KPROF_ROWS * 4)
+typedef struct {
+  uint64_t at;        // the timeline value this launch reserved, which is also the payload its stamp carries
+  int32_t row;        // which kernel, or -1 once the rows ran out
+  uint8_t first;      // the first launch of its chain: the interval ending here also carries the chain seam
+  uint8_t boundary;   // the first launch after a standstill: the interval ending here is the token boundary
+  uint8_t tail;       // the last launch of its chain: stamped by the command stream, after the timeline release
+  uint8_t broken;     // a launch before this one went unstamped, so the interval ending here spans two kernels
+} tinynv_kprof_slot_t;
+typedef struct {
+  const void *key;    // the kernel descriptor's address: one row per instantiation
+  char name[112];     // readable (tinynv_kernel_short_name), copied at the launch while the module is certainly loaded
+  uint64_t n, ns, max_ns;
+} tinynv_kprof_row_t;
 // The check pass holds one slot back for every launch still to come, so every launch always has room for at least its
 // envelope - which needs the list to be at least as long as a chain.
 _Static_assert(TINYNV_DELTA_SPANS_MAX >= TINYNV_EXEC_CHAIN_MAX, "every launch in a chain needs a delta slot");
@@ -169,6 +187,7 @@ typedef struct {
     // parameter count) - TINYNV_DELTA_DELIVERY diffs this span alone against last_delivered, rather than one
     // envelope over every launch in the flush. See tinynv_exec_flush.
     uint32_t len;
+    uint32_t kslot;      // TINYNV_KERNEL_PROFILE: the ring slot this launch stamps, or TINYNV_KPROF_SLOTS for none
   } chain[TINYNV_EXEC_CHAIN_MAX];
   int nchain;
   int chain_max;   // how deep a chain may get before it is handed over; TINYNV_EXEC_CHAIN_MAX unless asked otherwise
@@ -307,6 +326,28 @@ typedef struct {
   tinynv_vmap_t mirror;
   int profile;
   uint64_t prof_ns[7], prof_n[7];
+  // TINYNV_KERNEL_PROFILE: the engine's clock at every kernel's completion, by kernel. Each descriptor releases a
+  // four-word report - its timeline value, then the clock - into a slot of its own in `kring`, host memory the engine
+  // writes and the processor reads. The chain's tail is stamped by a command-stream release with wait-for-idle into
+  // its slot instead, so nothing here depends on a descriptor's second release slot, which has never been shown to
+  // fire (tinynv_exec_flush). Slots are read in order once the timeline has passed them, and the interval from one
+  // stamp to the next is attributed to the later kernel: its own execution plus the dispatch gap before it, which no
+  // completion stamp can separate. Off unless asked: it is a measurement, and the report at teardown is what it is
+  // for. See kprof_harvest and kprof_report in exec.c.
+  int kprof;                    // asked for
+  int kprof_on;                 // asked for AND the chain shape allows it: tail release, chained descriptors
+  int kprof_skip;               // TINYNV_KERNEL_PROFILE_SKIP: windows not counted at the start (load, prompt, warm-up)
+  tinynv_vmap_t kring;          // TINYNV_KPROF_SLOTS x 16 bytes
+  tinynv_kprof_slot_t *kslot;   // what each ring slot was given to
+  uint32_t kwrite, kharvest;    // ring cursors: the next slot to give out, the oldest not yet read
+  uint64_t kprev_clock;         // the previous stamp read, which the next interval starts from
+  int kprev_valid, kgap_break;  // whether it is one; whether a launch since went unstamped
+  uint64_t kwindows;            // host waits that retired stamped work; the first kprof_skip are not counted
+  uint64_t kstamped, kmissing, klost, kskipped, kbackwards;
+  uint64_t kboundary_ns, kboundary_n, kfirst_n, kattr_ns, kattr_n, kunnamed_ns, kunnamed_n;
+  tinynv_kprof_row_t *krow;
+  int nkrow;
+  int32_t *kindex;              // open addressing over the descriptor's address -> row
   // The engine's own clock across a synchronisation: how long it sat idle between finishing one batch and starting the
   // next. Host profiling cannot see this - the host is busy building at the time - and it is where the residual against
   // the vendor driver has to be hiding.
@@ -380,6 +421,13 @@ uint32_t tinynv_exec_inline_max(const char *e);
 // 0 = a download issues its copy immediately and the card waits (the default); 1 = the host waits for compute first,
 // so the copy's acquire is satisfied before the channel is ever looked at.
 int tinynv_exec_download_sync_first(const char *e);
+// TINYNV_KERNEL_PROFILE and TINYNV_KERNEL_PROFILE_SKIP, resolved where test_exec_mode can drive them: off unless
+// asked, and four windows not counted unless asked.
+int tinynv_exec_kernel_profile(const char *e);
+int tinynv_exec_kernel_profile_skip(const char *e);
+// A kernel's mangled name reduced to what a reader wants: the function and its literal template arguments,
+// "mul_mat_vec_q<(ggml_type)12, 1, 1>" for what nvcc emits. Anything it cannot read is "...". Returns out.
+const char *tinynv_kernel_short_name(const char *mangled, char *out, size_t cap);
 // 0 = every host-to-device copy goes to the copy engine (the default); 1 = small aligned ones ride in the pushbuffer.
 int tinynv_exec_inline_upload_mode(const char *e);
 // Launches in the first chain after a standstill; 0 = off, every chain full depth. See TINYNV_SHORT_FIRST_CHAIN.

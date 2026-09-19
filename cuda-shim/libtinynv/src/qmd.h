@@ -85,6 +85,10 @@ int tinynv_qmd_launch(tinynv_qmd_t *q, const tinynv_qmd_launch_t *l);
 // Releases a semaphore when the kernel finishes. There are two slots; this takes the first free one and returns which,
 // or -1 when both are taken and the caller has to fall back on a release in the command stream.
 int tinynv_qmd_release(tinynv_qmd_t *q, uint64_t addr, uint64_t payload, int timestamp);
+// Forget both release slots, so that a release attached earlier can be replaced. TINYNV_KERNEL_PROFILE stamps every
+// descriptor as it is built and only learns which one is the chain's tail at the flush, where that slot has to carry
+// the timeline instead. Fields are replaced, not OR-ed, so the descriptor is exactly as if it had never released.
+int tinynv_qmd_release_clear(tinynv_qmd_t *q);
 // Set the scope of the barrier at the end of the grid after the fact (TINYNV_QMD_MEMBAR_*): a descriptor that
 // releases the timeline must publish its writes system-wide whatever the measurement mode asked of the others.
 int tinynv_qmd_membar(tinynv_qmd_t *q, int membar);

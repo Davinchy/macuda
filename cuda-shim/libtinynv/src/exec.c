@@ -29,6 +29,7 @@
 #include "exec.h"
 #include "internal.h"
 #include "nv_structs.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,6 +133,144 @@ static int sem_reached(tinynv_exec_t *ex, uint64_t value) {
   return 1;
 }
 
+// TINYNV_KERNEL_PROFILE: one row per kernel instantiation, found by the descriptor's address. Resolved at the launch
+// rather than at the harvest: a module can be unloaded between the two, and the name is copied while it is there.
+static int32_t kprof_row(tinynv_exec_t *ex, const tinynv_kernel_desc_t *k) {
+  uint64_t h = (uint64_t)(uintptr_t)k * 11400714819323198485ull;
+  for (uint32_t i = (uint32_t)(h >> 40) % TINYNV_KPROF_INDEX;; i = (i + 1) % TINYNV_KPROF_INDEX) {
+    int32_t r = ex->kindex[i];
+    if (r < 0) {
+      if (ex->nkrow >= TINYNV_KPROF_ROWS) return -1;   // the table is four times the rows, so it never fills first
+      r = ex->nkrow++;
+      ex->krow[r].key = k;
+      tinynv_kernel_short_name(k->name ? k->name : "?", ex->krow[r].name, sizeof(ex->krow[r].name));
+      ex->kindex[i] = r;
+      return r;
+    }
+    if (ex->krow[r].key == k) return r;
+  }
+}
+
+// Read every slot the timeline has passed, in order, and attribute the interval since the previous stamp. `reached`
+// is the compute queue's value. A chain's tail is read only once a LATER value has been seen (window_end 2, the final
+// harvest at teardown, reads everything): its stamp is a command-stream release that follows the timeline release,
+// so the timeline can be at the tail's value a moment before the tail's stamp has landed. Every other stamp was
+// issued by the engine before the tail's timeline release and lands before it, in channel order.
+//
+// Windows are the host's waits that retired stamped work - one a token on a decode - and the first kprof_skip of
+// them are read but not counted, so the load, the prompt and the warm-up do not sit in a mean that is meant to be a
+// steady token. An interval is refused when the stamp before it is missing or a launch between went unstamped
+// (kskipped), when the clock went backwards (kbackwards), or when it is over 100 ms and so not one kernel.
+static void kprof_harvest(tinynv_exec_t *ex, uint64_t reached, int window_end) {
+  int final = window_end == 2, took = 0;
+  int counted = ex->kwindows >= (uint64_t)ex->kprof_skip;
+  while (ex->kharvest != ex->kwrite) {
+    tinynv_kprof_slot_t *s = &ex->kslot[ex->kharvest];
+    if (s->at > reached || (s->at == reached && s->tail && !final)) break;
+    uint64_t rep[2] = {0, 0};
+    nv_rd_block(&ex->kring.dma.view, (uint64_t)ex->kharvest * 16, rep, sizeof(rep));
+    ex->kharvest = (ex->kharvest + 1) % TINYNV_KPROF_SLOTS;
+    took++;
+    // The payload is the launch's own timeline value, so a slot from a previous lap or one not yet written cannot
+    // pass as this launch's stamp.
+    if (rep[0] != s->at || !rep[1]) { ex->kmissing++; ex->kprev_valid = 0; continue; }
+    if (ex->kprev_valid && !s->broken) {
+      if (rep[1] <= ex->kprev_clock) ex->kbackwards++;
+      else if (counted) {
+        uint64_t dt = rep[1] - ex->kprev_clock;
+        if (dt >= 100000000ull) ex->kskipped++;
+        else if (s->boundary) { ex->kboundary_ns += dt; ex->kboundary_n++; }
+        else {
+          ex->kattr_ns += dt; ex->kattr_n++;
+          if (s->first) ex->kfirst_n++;
+          if (s->row >= 0) {
+            tinynv_kprof_row_t *r = &ex->krow[s->row];
+            r->n++; r->ns += dt;
+            if (dt > r->max_ns) r->max_ns = dt;
+          } else { ex->kunnamed_ns += dt; ex->kunnamed_n++; }
+        }
+      }
+    } else if (ex->kprev_valid) ex->kskipped++;
+    if (counted) ex->kstamped++;
+    ex->kprev_clock = rep[1];
+    ex->kprev_valid = 1;
+  }
+  if (window_end == 1 && took) ex->kwindows++;
+}
+
+static int kprof_cmp(const void *a, const void *b) {
+  const tinynv_kprof_row_t *x = a, *y = b;
+  return x->ns < y->ns ? 1 : x->ns > y->ns ? -1 : 0;
+}
+
+// The report: per window, by instantiation and then with instantiations merged under the function's name. Every
+// number is divided by the windows counted, so "us/window" on a decode is microseconds per token.
+static void kprof_report(tinynv_exec_t *ex) {
+  uint64_t W = ex->kwindows > (uint64_t)ex->kprof_skip ? ex->kwindows - (uint64_t)ex->kprof_skip : 0;
+  fprintf(stderr, "libtinynv: kernel profile from the engine's clock: %llu windows counted (%llu seen, the first %d not "
+                  "counted; a window is a host wait that retired work, one a token on a decode)\n",
+          (unsigned long long)W, (unsigned long long)ex->kwindows, ex->kprof_skip);
+  if (ex->kmissing || ex->klost || ex->kskipped || ex->kbackwards || ex->kunnamed_n)
+    fprintf(stderr, "libtinynv:   %llu stamps missing (slot not written or from another lap), %llu launches unstamped (ring "
+                    "full), %llu intervals refused, %llu clocks backwards, %llu intervals of kernels past the %d rows\n",
+            (unsigned long long)ex->kmissing, (unsigned long long)ex->klost, (unsigned long long)ex->kskipped,
+            (unsigned long long)ex->kbackwards, (unsigned long long)ex->kunnamed_n, TINYNV_KPROF_ROWS);
+  if (!W || !ex->kattr_n) {
+    fprintf(stderr, "libtinynv:   nothing counted: the run ended inside the windows not counted, or no stamp was read back\n");
+    return;
+  }
+  double w = (double)W;
+  fprintf(stderr, "libtinynv:   per window: %.1f launches stamped; %.1f us in kernels over %.1f intervals, each a kernel's own "
+                  "time plus the dispatch gap\n"
+                  "libtinynv:   before it (%.1f of them a chain's first, carrying the chain seam as well); %.1f us at the "
+                  "boundary (engine idle, host\n"
+                  "libtinynv:   turnaround and the first kernel; %.2f boundaries a window)\n",
+          (double)ex->kstamped / w, (double)ex->kattr_ns / 1e3 / w, (double)ex->kattr_n / w, (double)ex->kfirst_n / w,
+          (double)ex->kboundary_ns / 1e3 / w, (double)ex->kboundary_n / w);
+  int n = ex->nkrow;
+  tinynv_kprof_row_t *rows = malloc((size_t)(n ? n : 1) * sizeof(*rows));
+  if (!rows) return;
+  memcpy(rows, ex->krow, (size_t)n * sizeof(*rows));
+  qsort(rows, (size_t)n, sizeof(*rows), kprof_cmp);
+  double total = (double)ex->kattr_ns;
+  fprintf(stderr, "libtinynv:   %6s %10s %9s %9s %9s  %s\n", "share", "us/window", "n/window", "mean us", "max us",
+          "kernel, by instantiation (top 40)");
+  uint64_t rest_ns = 0, rest_n = 0; int rest = 0;
+  for (int i = 0; i < n; i++) {
+    if (!rows[i].n) continue;
+    if (i < 40)
+      fprintf(stderr, "libtinynv:   %5.1f%% %10.1f %9.2f %9.2f %9.1f  %s\n", 100.0 * (double)rows[i].ns / total,
+              (double)rows[i].ns / 1e3 / w, (double)rows[i].n / w, (double)rows[i].ns / 1e3 / (double)rows[i].n,
+              (double)rows[i].max_ns / 1e3, rows[i].name);
+    else { rest_ns += rows[i].ns; rest_n += rows[i].n; rest++; }
+  }
+  if (rest)
+    fprintf(stderr, "libtinynv:   %5.1f%% %10.1f %9.2f %9s %9s  the other %d instantiations\n", 100.0 * (double)rest_ns / total,
+            (double)rest_ns / 1e3 / w, (double)rest_n / w, "", "", rest);
+  // Merged under the function's name: the part of the short name before its template arguments.
+  int nb = 0;
+  for (int i = 0; i < n; i++) {
+    if (!ex->krow[i].n) continue;
+    char base[112];
+    snprintf(base, sizeof(base), "%s", ex->krow[i].name);
+    char *lt = strchr(base, '<');
+    if (lt) *lt = 0;
+    int j;
+    for (j = 0; j < nb; j++) if (!strcmp(rows[j].name, base)) break;
+    if (j == nb) { memset(&rows[nb], 0, sizeof(rows[nb])); snprintf(rows[nb].name, sizeof(rows[nb].name), "%s", base); nb++; }
+    rows[j].n += ex->krow[i].n; rows[j].ns += ex->krow[i].ns;
+    if (ex->krow[i].max_ns > rows[j].max_ns) rows[j].max_ns = ex->krow[i].max_ns;
+  }
+  qsort(rows, (size_t)nb, sizeof(*rows), kprof_cmp);
+  fprintf(stderr, "libtinynv:   %6s %10s %9s %9s %9s  %s\n", "share", "us/window", "n/window", "mean us", "max us",
+          "kernel, instantiations merged");
+  for (int i = 0; i < nb && i < 32; i++)
+    fprintf(stderr, "libtinynv:   %5.1f%% %10.1f %9.2f %9.2f %9.1f  %s\n", 100.0 * (double)rows[i].ns / total,
+            (double)rows[i].ns / 1e3 / w, (double)rows[i].n / w, (double)rows[i].ns / 1e3 / (double)rows[i].n,
+            (double)rows[i].max_ns / 1e3, rows[i].name);
+  free(rows);
+}
+
 // A cheap checksum over a descriptor, so that "is it still what we wrote" can be asked at a stall. It does not need to
 // be a good hash; it needs to notice a descriptor whose bytes have been handed to something else.
 static uint64_t qmd_sum(const uint8_t *b) {
@@ -158,6 +297,7 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
       // Everything the engine has passed is no longer interesting, and dropping it here is what keeps room for the
       // oldest thing that is still outstanding - which is the one a stall needs to show.
       uint64_t reached = v < vcopy ? vcopy : v;
+      if (ex->kprof_on) kprof_harvest(ex, v, 1);
       int keep = 0;
       for (int i = 0; i < ex->ntrail; i++)
         if (ex->trail[i].upto > reached) ex->trail[keep++] = ex->trail[i];
@@ -906,8 +1046,11 @@ static int chain_is_sound(tinynv_exec_t *ex, int n) {
     // Tail-only: every link but the last must be silent, and the last carries the whole chain's value. Checking the
     // shape that was asked for rather than either shape is the point - a check that accepts both cannot tell a chain
     // built wrong from a chain built the other way.
-    int releases = ex->no_chain_deps ? 0 : (!ex->tail_release || i == n - 1);
-    uint64_t want = ex->tail_release ? ex->reserved : base + 1 + (uint64_t)i;
+    // Under TINYNV_KERNEL_PROFILE every stamped link releases too - its own value, into its own ring slot - and the
+    // check is the same one: the value a link releases is the one it reserved, whichever address it goes to.
+    int stamped = ex->kprof_on && ex->chain[i].kslot < TINYNV_KPROF_SLOTS;
+    int releases = ex->no_chain_deps ? 0 : (!ex->tail_release || stamped || i == n - 1);
+    uint64_t want = base + 1 + (uint64_t)i;   // the tail's is ex->reserved, which is base + n
     uint64_t next = ex->no_chain_deps ? 0 : (i + 1 < n ? ex->chain[i + 1].va : 0);
     if (tinynv_qmd_link_check(&ex->chain[i].qmd, releases, want, next, &why))
       return tinynv_fail("launch %d of %d in the chain is wrong: %s", i, n, why ? why : "unspecified");
@@ -984,6 +1127,15 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   if (ex->tail_release && !ex->no_chain_deps && ex->qmd_membar != TINYNV_QMD_MEMBAR_SYS &&
       tinynv_qmd_membar(&ex->chain[n - 1].qmd, TINYNV_QMD_MEMBAR_SYS))
     return -1;
+  // TINYNV_KERNEL_PROFILE: the tail was stamped by its descriptor like every other launch, until now. That slot has
+  // to carry the timeline, so the stamp is taken off it and the tail is stamped by a command-stream release with
+  // wait-for-idle into the same ring slot instead, appended below after the launch. Nothing depends on the second
+  // release slot of a descriptor, whose behaviour nobody has established (the retraction further down).
+  uint32_t ktail = ex->kprof_on ? ex->chain[n - 1].kslot : TINYNV_KPROF_SLOTS;
+  if (ktail < TINYNV_KPROF_SLOTS) {
+    if (tinynv_qmd_release_clear(&ex->chain[n - 1].qmd)) return -1;
+    ex->kslot[ktail].tail = 1;
+  }
   if (ex->tail_release && !ex->no_chain_deps &&
       tinynv_qmd_release(&ex->chain[n - 1].qmd, ex->sem.va + SEM_SLOT(0), ex->reserved, ex->profile ? 1 : 0) < 0)
     return tinynv_fail("the last descriptor has no free release slot");
@@ -1242,7 +1394,8 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // has pending: delta_span_dwords per patch, summed in the check pass above - exact because every run is a dword
   // multiple by construction (tinynv_delta_runs diffs dwords) and the emit loop below splits a long run into pieces
   // exactly as delta_span_dwords priced them.
-  uint32_t want_dwords = (ex->no_chain_deps ? 48 + 4 * (uint32_t)n : 48) + (ex->profile ? 8u : 0u) + delta_pend_dwords;
+  uint32_t want_dwords = (ex->no_chain_deps ? 48 + 4 * (uint32_t)n : 48) + (ex->profile ? 8u : 0u) +
+                         (ktail < TINYNV_KPROF_SLOTS ? 8u : 0u) + delta_pend_dwords;
   if (batch_begin(ex, &ex->g->gsp.compute_q, want_dwords, &c, &va)) return -1;
   // Written here, not queued through inline_pend: batch_begin() has already reserved the room want_dwords asked
   // for and drained whatever TINYNV_INLINE_UPLOAD had pending into this same c, in that order, ahead of this -
@@ -1299,6 +1452,11 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // Not on the driver's own work. A download served by a caller's kernel is still a launch, and it would otherwise
   // stamp "the token's last kernel finished" partway through the boundary it is part of.
   if (ex->profile && !ex->internal_work && tinynv_cmd_release_clocked(&c, ex->sem.va + SEM_TS_TAIL, chain_upto))
+    return -1;
+  // The tail's stamp (TINYNV_KERNEL_PROFILE): the clock when the engine went idle after this chain, into the tail's
+  // own ring slot, with the tail's own value as the payload the harvest checks. The chain after this one is ordered
+  // behind it on the channel, so by the time a later timeline value is seen this has been written.
+  if (ktail < TINYNV_KPROF_SLOTS && tinynv_cmd_release_clocked(&c, ex->kring.va + 16ull * ktail, chain_upto))
     return -1;
   ex->flush_lo = chain_upto - (uint64_t)n + 1;
   ex->flush_n = n;
@@ -1638,6 +1796,18 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
     ex->region[AR_DESC].next = ex->region[AR_DESC].size;
     ex->delta_rewind_n++;
   }
+  // TINYNV_KERNEL_PROFILE: the ring comes round where the descriptors do - at the first launch after a standstill -
+  // once everything given out has been read, so launch k of every token stamps the same slot and the release address
+  // in its descriptor is the same bytes token to token for the delta path. This launch is also the token boundary:
+  // the interval ending at its stamp holds the engine's idle time and the host's turnaround, and is kept apart.
+  // The wait that ended the standstill left the last chain's tail unread (its stamp follows the timeline release);
+  // by now the host has been away sampling a token, so it is read here, and if a stamp has not landed after all the
+  // payload check counts it missing rather than believing it.
+  int kboundary = ex->kprof_on && ex->after_stall && !ex->nchain;
+  if (kboundary) {
+    if (ex->kharvest != ex->kwrite) kprof_harvest(ex, sem_read_slot(ex, 0), 2);
+    if (ex->kharvest == ex->kwrite) ex->kwrite = ex->kharvest = 0;
+  }
   if (!arena_fits(ex, AR_DESC, slot + cbuf0_bytes, 256) && tinynv_exec_flush(ex)) return -1;
 
   uint64_t qmd_va;
@@ -1704,6 +1874,30 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   if (!ex->tail_release && !ex->no_chain_deps &&
       tinynv_qmd_release(&q, ex->sem.va + SEM_SLOT(0), at, ex->profile) < 0)
     return tinynv_fail("the descriptor has no free release slot");
+  // TINYNV_KERNEL_PROFILE: this descriptor's own report - its value, then the engine's clock - into the next ring
+  // slot. Whether it turns out to be the chain's tail is decided at the flush, which then takes this off and stamps
+  // the tail from the command stream. A full ring first reads what has retired; if it is still full the launch goes
+  // unstamped and the next stamped interval is marked as spanning two kernels rather than counted.
+  uint32_t kslot_i = TINYNV_KPROF_SLOTS;
+  if (ex->kprof_on) {
+    uint32_t next = (ex->kwrite + 1) % TINYNV_KPROF_SLOTS;
+    if (next == ex->kharvest) kprof_harvest(ex, sem_read_slot(ex, 0), 0);
+    if (next == ex->kharvest) { ex->klost++; ex->kgap_break = 1; }
+    else {
+      kslot_i = ex->kwrite;
+      tinynv_kprof_slot_t *s = &ex->kslot[kslot_i];
+      s->at = at;
+      s->row = kprof_row(ex, k);
+      s->first = ex->nchain == 0;
+      s->boundary = (uint8_t)kboundary;
+      s->tail = 0;
+      s->broken = (uint8_t)ex->kgap_break;
+      ex->kgap_break = 0;
+      if (tinynv_qmd_release(&q, ex->kring.va + 16ull * kslot_i, at, 1) < 0)
+        return tinynv_fail("the descriptor has no free release slot for its stamp");
+      ex->kwrite = next;
+    }
+  }
 
   // Ordering. Nothing in the command stream separates one kernel from the next any more, so the order has to be in the
   // descriptors: the one before this points at it and schedules it when it finishes. Without this a launch and the
@@ -1723,6 +1917,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   ex->chain[ex->nchain].host = host;
   ex->chain[ex->nchain].va = qmd_va;
   ex->chain[ex->nchain].len = (uint32_t)(slot + cbuf0_bytes);
+  ex->chain[ex->nchain].kslot = kslot_i;
   ex->nchain++;
   ex->reserved = at;
 
@@ -1753,6 +1948,91 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
 // what lets TINYNV_DELTA_DELIVERY patch ~2 KB a flush instead of ~7 KB and turned the MoE decode from a loss into a
 // gain. TINYNV_TAIL_RELEASE=0 releases per launch again, which is the setting that can locate a stall inside a chain.
 int tinynv_exec_tail_release(const char *e) { return !e || !*e || *e != '0'; }
+
+// TINYNV_KERNEL_PROFILE: off unless asked. A run that stamps every descriptor is measuring, and the report at teardown
+// says what it saw; nothing else about the run should find itself in that state by accident.
+int tinynv_exec_kernel_profile(const char *e) { return e && *e && *e != '0'; }
+// TINYNV_KERNEL_PROFILE_SKIP: windows not counted at the start of a run. Four unless asked - the load, the prompt and
+// the first tokens, none of which is the steady decode the mean is meant to describe.
+int tinynv_exec_kernel_profile_skip(const char *e) {
+  if (!e || !*e) return 4;
+  long n = atol(e);
+  return n < 0 ? 4 : n > 100000 ? 100000 : (int)n;
+}
+
+// The Itanium scheme as nvcc applies it to a kernel: _Z, either a nested name (N ... E) or one length-prefixed
+// identifier, then I ... E template arguments, of which only literals are read - L<type><value>E, the type a builtin
+// letter or a length-prefixed enum name, S_ / S<n>_ repeating an earlier one. Anything else stops the reading and
+// leaves "...", which is honest about a function-pointer argument (k_bin_bcast<&op_add, ...>) rather than a guess at
+// it. The parameter list after the arguments is dropped: it is the same for every instantiation.
+const char *tinynv_kernel_short_name(const char *m, char *out, size_t cap) {
+  size_t o = 0;
+  if (!cap) return out;
+#define PUT(c) do { if (o + 1 < cap) out[o++] = (c); } while (0)
+#define PUTS(s, n) do { for (size_t i_ = 0; i_ < (n); i_++) PUT((s)[i_]); } while (0)
+  if (!m || m[0] != '_' || m[1] != 'Z') { snprintf(out, cap, "%s", m ? m : "?"); return out; }
+  const char *p = m + 2;
+  int nested = *p == 'N';
+  if (nested) p++;
+  int parts = 0;
+  while (*p >= '0' && *p <= '9') {
+    char *end;
+    size_t n = strtoul(p, &end, 10);
+    p = end;
+    if (strlen(p) < n) { PUTS("...", 3); goto done; }
+    if (parts++) PUTS("::", 2);
+    PUTS(p, n);
+    p += n;
+    if (!nested) break;
+  }
+  if (nested && *p == 'E') p++;
+  if (*p == 'I') {
+    p++;
+    PUT('<');
+    char last_enum[48] = "";
+    int args = 0;
+    while (*p && *p != 'E') {
+      if (args++) PUTS(", ", 2);
+      if (*p != 'L') { PUTS("...", 3); break; }
+      p++;
+      char en[48] = "";
+      int is_bool = 0;
+      if (*p >= '0' && *p <= '9') {
+        char *end;
+        size_t n = strtoul(p, &end, 10);
+        p = end;
+        if (strlen(p) < n || n >= sizeof(en)) { PUTS("...", 3); break; }
+        memcpy(en, p, n);
+        en[n] = 0;
+        p += n;
+        memcpy(last_enum, en, sizeof(en));
+      } else if (*p == 'S') {
+        while (*p && *p != '_') p++;
+        if (*p == '_') p++;
+        memcpy(en, last_enum, sizeof(en));
+      } else if (*p == 'b') { is_bool = 1; p++; }
+      else if (*p && strchr("ijlmxyst", *p)) p++;
+      else { PUTS("...", 3); break; }
+      const char *v = p;
+      if (*p == 'n') p++;
+      while (*p >= '0' && *p <= '9') p++;
+      if (*p != 'E') { PUTS("...", 3); break; }
+      if (en[0]) { PUT('('); PUTS(en, strlen(en)); PUT(')'); }
+      if (is_bool) { const char *b = v[0] == '1' ? "true" : "false"; PUTS(b, strlen(b)); }
+      else {
+        if (*v == 'n') { PUT('-'); v++; }
+        PUTS(v, (size_t)(p - v));
+      }
+      p++;   // the E that closes the literal
+    }
+    PUT('>');
+  }
+done:
+  out[o < cap ? o : cap - 1] = 0;
+  return out;
+#undef PUT
+#undef PUTS
+}
 
 // TINYNV_DELTA_DELIVERY and TINYNV_DELTA_REWIND, resolved where test_exec_mode can drive them. Both on by default
 // since 2026-09-19: sub-launch runs alone lose 44% on the MoE (every flush ~90 KB of pushbuffer), runs with the
@@ -1952,6 +2232,8 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   { const char *e = getenv("TINYNV_REFILL_RAW_FROM"); ex->refill_raw_from = e && *e ? strtoull(e, NULL, 10) : 200; }
   { const char *e4 = getenv("TINYNV_NO_CHAIN_DEPS"); ex->no_chain_deps = e4 && *e4 && *e4 != '0'; }
   { const char *e5 = getenv("TINYNV_LAUNCH_PROFILE"); ex->profile = e5 && *e5 && *e5 != '0'; }
+  ex->kprof = tinynv_exec_kernel_profile(getenv("TINYNV_KERNEL_PROFILE"));
+  ex->kprof_skip = tinynv_exec_kernel_profile_skip(getenv("TINYNV_KERNEL_PROFILE_SKIP"));
   // Delivered by the copy engine by default since 2026-09-15, having been the opt-in path for a day and a 62-minute
   // soak: 1,876 requests, 343,160 tokens, 188 greedy probes all identical, no refusals. TINYNV_ARENA_DMA=0 goes back to
   // writing descriptors across the link, for a card or a link where this turns out to be wrong rather than because the
@@ -1991,6 +2273,26 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   // All three are host memory the GPU reads across the bus: the processor writes every one of them, and on a card behind
   // thunderbolt the window onto video memory is far too small to be where the two sides meet.
   if (tinynv_mm_alloc_buffer(&g->mm, SEM_BYTES, 1, 1, 1, 0, 1, &ex->sem)) return -1;
+  // TINYNV_KERNEL_PROFILE needs the chain shape it stamps: chained descriptors releasing the timeline at the tail
+  // only, so that every other link's first release slot is free for its stamp. The ring is host memory like the
+  // timeline's own slots, written by the engine and read here.
+  if (ex->kprof) {
+    ex->kprof_on = ex->tail_release && !ex->no_chain_deps;
+    if (!ex->kprof_on)
+      fprintf(stderr, "libtinynv: TINYNV_KERNEL_PROFILE needs chained descriptors releasing at the tail only (the default "
+                      "TINYNV_TAIL_RELEASE, no TINYNV_NO_CHAIN_DEPS): not stamping\n");
+    else {
+      if (tinynv_mm_alloc_buffer(&g->mm, (uint64_t)TINYNV_KPROF_SLOTS * 16, 1, 1, 1, 0, 1, &ex->kring)) return -1;
+      ex->kslot = calloc(TINYNV_KPROF_SLOTS, sizeof(*ex->kslot));
+      ex->krow = calloc(TINYNV_KPROF_ROWS, sizeof(*ex->krow));
+      ex->kindex = malloc((size_t)TINYNV_KPROF_INDEX * sizeof(*ex->kindex));
+      if (!ex->kslot || !ex->krow || !ex->kindex) return tinynv_fail("out of memory for the kernel profile");
+      for (int i = 0; i < TINYNV_KPROF_INDEX; i++) ex->kindex[i] = -1;
+      fprintf(stderr, "libtinynv: kernel profile on: every descriptor releases the engine's clock into a slot of its own "
+                      "(%u slots); the first %d windows are not counted; the report is at teardown\n",
+              (unsigned)TINYNV_KPROF_SLOTS, ex->kprof_skip);
+    }
+  }
   // The allocator's zero flag does nothing for host memory - it zeroes through the window onto video memory, which this
   // is not - so the timeline starts as whatever the dext handed over. Every wait in this file is "has the engine reached
   // N yet", so a single non-zero byte here means the first wait returns immediately and nothing is ever really waited
@@ -2091,6 +2393,9 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
 }
 
 void tinynv_exec_fini(tinynv_exec_t *ex) {
+  // Everything submitted has been waited for by the caller (tinynv.c idles before this), so the last chain's tail can
+  // be read now along with anything else still in the ring.
+  if (ex->kprof_on) { kprof_harvest(ex, ~0ull, 2); kprof_report(ex); }
   // One line, and only when it happened, because a wrap is a stall and a run that paid several wants to know without
   // having to have asked in advance.
   if (ex->wraps[AR_DESC] || ex->wraps[AR_CMD] || ex->seg_waits)
@@ -2254,5 +2559,9 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
     free(ex->region[r].last_delivered);
   }
   tinynv_vmap_free(&ex->g->mm, &ex->sem);
+  if (ex->kring.size) tinynv_vmap_free(&ex->g->mm, &ex->kring);
+  free(ex->kslot);
+  free(ex->krow);
+  free(ex->kindex);
   memset(ex, 0, sizeof(*ex));
 }

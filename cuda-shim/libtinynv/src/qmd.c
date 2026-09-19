@@ -232,6 +232,15 @@ int tinynv_qmd_release(tinynv_qmd_t *q, uint64_t addr, uint64_t payload, int tim
   return slot;
 }
 
+int tinynv_qmd_release_clear(tinynv_qmd_t *q) {
+  for (int i = 0; i < TINYNV_QMD_RELEASES; i++) {
+    SETF(q, rel_enable[i], 0);
+    if (set_addr(q, rel_addr_lo[i], rel_addr_hi[i], 0) || set_addr(q, rel_pay_lo[i], rel_pay_hi[i], 0)) return -1;
+    SETF(q, rel_size[i], TINYNV_QMDV_RELEASE_STRUCTURE_SIZE_SEMAPHORE_TWO_WORDS);
+  }
+  return 0;
+}
+
 // Is this link of a chain the one it was meant to be? Separated from the code that builds chains so that it can be
 // tested against descriptors built wrong on purpose - a check that cannot fail is worse than no check, because it reads
 // like one. `next_va` is where the following launch lives, or zero for the last link, which must schedule nothing: a

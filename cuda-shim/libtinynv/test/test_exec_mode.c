@@ -175,6 +175,40 @@ int main(void) {
           "the inline-upload default moved from the 32,764-byte per-call ceiling (2026-09-19, +2.3%% MoE)");
   }
 
+  // The per-kernel profile: off unless asked, four windows not counted unless asked, and the name reader that turns
+  // what nvcc emits into what a reader of the report wants. Real shapes from ggml-cuda, plus the edges.
+  {
+    static const struct { const char *e; int want; } kp[] = {{NULL, 0}, {"", 0}, {"0", 0}, {"1", 1}, {"yes", 1}};
+    for (size_t i = 0; i < sizeof(kp) / sizeof(*kp); i++)
+      CHECK(tinynv_exec_kernel_profile(kp[i].e) == kp[i].want, "TINYNV_KERNEL_PROFILE=%s resolved the wrong way",
+            kp[i].e ? kp[i].e : "(unset)");
+    CHECK(tinynv_exec_kernel_profile(NULL) == 0, "the kernel profile is a measurement and must be off unless asked");
+    static const struct { const char *e; int want; } ks[] = {{NULL, 4}, {"", 4}, {"0", 0}, {"12", 12}, {"-3", 4}, {"x", 0}};
+    for (size_t i = 0; i < sizeof(ks) / sizeof(*ks); i++)
+      CHECK(tinynv_exec_kernel_profile_skip(ks[i].e) == ks[i].want, "TINYNV_KERNEL_PROFILE_SKIP=%s gave %d, expected %d",
+            ks[i].e ? ks[i].e : "(unset)", tinynv_exec_kernel_profile_skip(ks[i].e), ks[i].want);
+    static const struct { const char *m, *want; } nm[] = {
+        {"_Z13mul_mat_vec_qIL9ggml_type12ELi1ELi1EEvPKvS2_PKiPfiiiiiiiiiiii", "mul_mat_vec_q<(ggml_type)12, 1, 1>"},
+        {"_Z12rms_norm_f32ILi1024EEvPKfPfiiiiiiiii", "rms_norm_f32<1024>"},
+        {"_Z11k_bin_bcastIXadL_Z6op_addffEEfffEvPKT0_PKT1_PT2_iiii", "k_bin_bcast<...>"},
+        {"_Z22quantize_mmq_q8_1_cudaILb1EEvPKfPKiPvxxxxxx", "quantize_mmq_q8_1_cuda<true>"},
+        {"_Z8soft_maxILb0ELi32EEvPKfS1_Pfiiffi", "soft_max<false, 32>"},
+        {"_Z3fooIL9ggml_type2ELS_14EEv", "foo<(ggml_type)2, (ggml_type)14>"},
+        {"_Z3barILin1EEv", "bar<-1>"},
+        {"_ZN2ns6kernelEv", "ns::kernel"},
+        {"_Z7k_scalePfS_fi", "k_scale"},
+        {"copy1d", "copy1d"},
+        {"_Z99x", "..."},
+        {NULL, "?"}};
+    for (size_t i = 0; i < sizeof(nm) / sizeof(*nm); i++) {
+      char out[112];
+      tinynv_kernel_short_name(nm[i].m, out, sizeof(out));
+      CHECK(!strcmp(out, nm[i].want), "%s read as \"%s\", expected \"%s\"", nm[i].m ? nm[i].m : "(null)", out, nm[i].want);
+    }
+    { char small[8]; tinynv_kernel_short_name("_Z13mul_mat_vec_qILi1EEv", small, sizeof(small));
+      CHECK(strlen(small) == 7 && !strncmp(small, "mul_mat", 7), "a short buffer is filled and terminated, got \"%s\"", small); }
+  }
+
   // Whether a download drains the compute on the host before issuing its copy. Off by default: it is a test of a
   // mechanism, not yet a fix, and the two arms want measuring against each other rather than one being assumed.
   {
