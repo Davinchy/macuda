@@ -915,6 +915,85 @@ mapping path must therefore refuse `va < mm->va_base` and `(va - mm->va_base) + 
 list-of-exclusions failure §2 exists to avoid: widen the window one day and the aliasing returns with nothing to say
 so.
 
+## 4h. Delivering only what changed: the delta path, four laps of the same mistake (2026-09-18/19)
+
+`TINYNV_DELTA_DELIVERY` (off by default) diffs the descriptor region's fresh shadow against a host mirror of what was
+last actually delivered at each address (`last_delivered`) and patches only the difference through the inline-upload
+path, instead of handing the whole dirty span to the copy engine every flush. It aims at the token-boundary handoff
+in §4f: the copy engine delivering descriptors is the last copy-engine work at a boundary, and the switch between the
+two channels is what costs ~700 µs on about half the tokens. A flush whose descriptors ride in the compute batch needs
+no copy and so no switch.
+
+**Why it should be worth doing, measured before anything was built (2026-09-18, `TINYNV_DUMP_CMD`).** On a 16-token
+MoE decode, of 2,435 dwords submitted per steady-state token across 26 batches, only 65 (2.7%, 260 bytes) differ from
+the token before. The changed values are predictable fixed-stride counters - a KV-cache offset field advancing by the
+same delta every layer, paired address dwords advancing by the same larger delta - never the launch addresses
+themselves: ggml-cuda's MoE routing is on-device buffer *content*, not a changed kernel address. So the shape of a
+token's descriptor stream is nearly constant and the delta is small, which is the premise everything below rests on.
+
+**What the four versions had in common is the finding.** Each one measured its diff at a granularity one level too
+coarse, read the result as "the change is big", and was wrong the same way as the one before it.
+
+1. **One envelope over the whole flush** (`a4f9010`). A flush accumulates up to 128 launches (~213 KB) before
+   delivering. The first and last differing byte of that were 213,483 bytes apart - 100% "changed" - the moment even one
+   byte differed near each end, which is near-certain at that scale. Correct, safe, a no-op in practice. Caught on
+   hardware with `TINYNV_DELTA_VERBOSE`, not by reasoning.
+2. **One envelope per launch** (`c728085`, `51a1011`). Each launch's own span (its QMD slot plus its own cbuf0,
+   `chain[i].len`) is where the change lives. First hardware run aborted: the byte-precise bounds had no alignment
+   guarantee and `tinynv_cmd_inline_upload` takes whole dwords at a dword address (`submit.c`) - "an inline upload is
+   a whole number of dwords, not 1542 bytes". Widened to dwords; safe because a launch's span is 256-aligned with a
+   256-rounded length, so widening cannot cross into a neighbour. The single-envelope version had the identical latent
+   bug and never ran often enough to hit it.
+3. **Its own budget** (`b76c16a`). Even fixed, 5 of 1,223 flushes in a 96-token decode took the path. The patches
+   were queued through the same held list `TINYNV_INLINE_UPLOAD` uses (16 entries / 8 KB), which was mostly spent
+   before the delta check ran. Now written straight into the chain's own delivery batch after `batch_begin()`,
+   reserving their own room in `want_dwords`, under an aggregate cap of their own. Still 5 of 1,223 - and the
+   diagnostic showed why: nearly every launch carries *some* change each token, but of a 1,400-1,800-byte envelope only
+   40-240 bytes (3-15%, usually 10-13%) actually differ. The per-launch envelope overstated a flush's change 7-10x -
+   the same shape as lap 1, one level down - which is why raising the cap (16 KB, then 64 KB) only moved the miss.
+4. **Runs of dwords within a launch** (this lap, 2026-09-19, offline only so far). `tinynv_delta_runs` walks a
+   launch's span a dword at a time and records each run of differing dwords, merging two runs whose gap is at most
+   `TINYNV_DELTA_GAP` bytes (default 32: a second inline-upload call costs 8 header dwords, so carrying up to 8
+   unchanged dwords is never dearer than splitting around them, and the tie merges - fewer LAUNCH_DMAs for the
+   engine, which the dword count does not price). Dword-granular by construction, so there is nothing to widen. A
+   flush's runs live in one flat list (`ex->delta_span`, 4096) with one slot held back per launch still to come, so
+   every launch always has room for at least its envelope and the list can never cost a flush its fast path; a launch
+   whose runs overflow their room, or cost more dwords than its envelope would (only possible with the gap swept
+   below the default), goes out as the envelope - lap 3's behaviour, never worse. The aggregate cap now prices the
+   pushbuffer footprint *with headers* (`TINYNV_DELTA_AGGREGATE_KB`, default 128): with runs the headers are a real
+   fraction - a thousand small patches is 32 KB of headers alone - and a cap on data alone would let the batch outgrow
+   what the check said. A run longer than one call carries is split at emit time, priced the same way.
+
+**Offline evidence for lap 4.** `test_delta` (17,100 checks, most from a covering loop): runs are dword multiples
+inside `[lo,hi)`, cover every differing dword and no other, never start or end on an unchanged dword, merge exactly at
+the gap and not past it; an overflow still reports the exact envelope; at the default gap no pattern's runs cost more
+than its envelope (400 random densities plus the adversarial 36-byte-gap and every-other-dword cases); both knob
+parsers, both spellings of each ask. Two planted defects were seen to fail before the test was trusted: the tie
+flipped from `<=` to `<` (356 failures, all on the 32-byte-gap property) and envelope tracking stopped at overflow
+(3 failures, all on the overflow envelope).
+
+**Properties that are load-bearing, and the one line that could make this wrong.**
+
+- **All-or-nothing per flush.** The check pass commits nothing until every launch has been looked at. Patching some
+  launches and then letting a fallback path resend the same bytes as part of a wider copy would deliver a byte twice
+  under two different values of "what is there now" - a wrong answer, not a slow one.
+- **`last_delivered` is brought up to date once, after whichever path delivered**, over the whole originally-dirty
+  span. That single `memcpy` is the one place a bug turns "sometimes not as good as it could be" into "wrong": if the
+  recorded mirror ever drifts from what is resident, a future skip omits an update that had to reach video memory.
+- **Trusted only past the region's first lap** (`wraps[AR_DESC]`): before that, `last_delivered` has never been
+  compared against a real prior delivery at that address.
+- **Ownership moves over the whole span whether or not any bytes did** (`tinynv_arena_mark` as the full paths do), so
+  every launch in the chain reads consistently as of this delivery.
+
+**What is still an estimate, and what to read on hardware.** The gap (32) and the aggregate (128 KB) come from host
+arithmetic - a pushbuffer dword is ~19 ns of register write (§4d) - and price nothing on the engine's side; what a
+LAUNCH_DMA costs the front end is unmeasured. Both are knobs so the sweep is a card run each, not a rebuild. The
+first run's `TINYNV_DELTA_VERBOSE` lines (`delta runs:` per launch, `delta flush:` per flush, first three flushes)
+say whether the envelope-vs-genuine gap actually closed and what a flush's real footprint is; the summary line at exit
+says how many flushes took the path. And the mechanism is per flush while the stall it aims at is per token boundary,
+so the number that matters is not the flush count but the boundary instrument in §4f, read the same way as every
+lever there: interleaved with the reference in the same minutes, host state on the record.
+
 ## 5. What this needs from the humans
 
 - **The 3090's DMA is untranslated, so no kernel parameter change is needed** (Session A's finding #4, settled 2026-09-13):

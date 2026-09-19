@@ -915,16 +915,57 @@ static int chain_is_sound(tinynv_exec_t *ex, int n) {
   return 0;
 }
 
-// TINYNV_DELTA_DELIVERY's per-launch diffs, once they clear the per-launch TINYNV_INLINE_MAX check, are also
-// capped as a whole flush against this. Deliberately not TINYNV_INLINE_MAX itself: that number prices ONE small
-// copy against the copy engine moving it instead; the real alternative on a miss here is the FULL envelope
-// fallback, ~800us of copy-engine time for the whole flush's dirty span (libtinynv-design.md SS4f, "writing a
-// full chain's ~192 KB across the link instead is ~800 us"). Processor writes cost ~4.2us/KB (measured: 1.5KB at
-// a launch's descriptor is 6.3us of ~7 - libtinynv-design.md SS4d), so this many KB of inline patches costs a few
-// tens of us against an ~800us fallback either way - the aggregate can be generous without the trade flipping.
-// 16 KB is a first estimate, not a swept default: unlike TINYNV_INLINE_PEND's 16, it has not been measured
-// against smaller or larger values yet. Treat it as provisional until it is.
-#define TINYNV_DELTA_AGGREGATE_MAX (64u * 1024u)
+// TINYNV_DELTA_DELIVERY's per-flush budget. Once every launch's patches are known, their pushbuffer footprint - the
+// data AND the eight header dwords each tinynv_cmd_inline_upload call costs (TINYNV_INLINE_DWORDS) - is capped as a
+// whole flush against ex->delta_aggregate_max (TINYNV_DELTA_AGGREGATE_KB; tinynv_exec_delta_aggregate has the
+// default). Deliberately not TINYNV_INLINE_MAX: that number prices ONE small copy against the copy engine moving it
+// instead; the real alternative on a miss here is the FULL delivery of the whole flush's dirty span - ~192 KB through
+// the mirror and the copy engine, and at a token boundary the channel switch that comes with it (libtinynv-design.md
+// SS4f). Processor writes cost ~4.2us/KB (SS4d: 1.5 KB at a launch's descriptor is 6.3 us of ~7), so the budget is a
+// ceiling and not a target: the point of sub-launch runs is that a flush's genuine change is a few tens of KB.
+//
+// Headers are counted since 2026-09-19 because with runs they are a real fraction: a flush of a thousand small patches
+// carries 32 KB of headers alone, and a cap that priced only the data would let the batch outgrow what the check said
+// it was. The 64 KB this replaces counted data only and was sized against the per-launch envelope, which overstated
+// genuine change 7-10x; neither number has been swept on hardware, which is why it is a knob and not a constant.
+//
+// One patch's pushbuffer cost in dwords. A run longer than TINYNV_INLINE_MAX goes out as several calls (the emit loop
+// in tinynv_exec_flush), so the headers are per piece. This is the one place that arithmetic lives: the reservation
+// (want_dwords) and the emit loop are both exact in terms of it, and a batch sized by one and filled by the other is
+// the shape of bug the command buffer refuses at the push ("holds %u dwords and the batch needs more") rather than
+// at the card, which is where it belongs.
+static uint32_t delta_span_dwords(uint32_t len) {
+  uint32_t pieces = (len + TINYNV_INLINE_MAX - 1) / TINYNV_INLINE_MAX;
+  return 8u * pieces + len / 4u;
+}
+
+int tinynv_delta_runs(const uint8_t *fresh, const uint8_t *last, uint32_t lo, uint32_t hi, uint32_t gap,
+                      tinynv_delta_span_t *out, unsigned max, tinynv_delta_span_t *envelope) {
+  // Dwords, not bytes, because that is what an inline upload carries (submit.c: a whole number of dwords at a 4-byte
+  // aligned address). Diffing at the granularity the patch is made at leaves nothing to widen afterwards - the
+  // widening that once crashed a run ("an inline upload is a whole number of dwords, not 1542 bytes", 2026-09-19)
+  // has nothing left to do, and a run can never be a byte wider than the dwords that differ.
+  unsigned n = 0;
+  int over = 0;
+  envelope->lo = hi;
+  envelope->hi = lo;
+  for (uint32_t j = lo; j < hi; j += 4) {
+    if (!memcmp(fresh + j, last + j, 4)) continue;
+    if (j < envelope->lo) envelope->lo = j;
+    envelope->hi = j + 4;
+    if (over) continue;   // past max: only the envelope is still being tracked, and the caller will use that
+    // Close enough to the run before it that carrying the unchanged dwords between them costs less than a second
+    // call's headers would, so it rides with that run. At the default gap the two costs are equal at the boundary
+    // and the merge wins the tie: fewer calls is fewer LAUNCH_DMAs for the engine to process, which a dword count
+    // does not price at all.
+    if (n && j - out[n - 1].hi <= gap) { out[n - 1].hi = j + 4; continue; }
+    if (n == max) { over = 1; continue; }
+    out[n].lo = j;
+    out[n].hi = j + 4;
+    n++;
+  }
+  return over ? -1 : (int)n;
+}
 
 int tinynv_exec_flush(tinynv_exec_t *ex) {
   if (!ex->nchain) return 0;
@@ -999,89 +1040,112 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // last_delivered can be brought up to date at the end regardless of which path actually did the delivering.
   uint64_t delta_lo = ex->region[AR_DESC].dirty_lo, delta_hi = ex->region[AR_DESC].dirty_hi;
   int delta_handled = 0;
-  // Per-launch diff bounds and how much of it there is, hoisted out of the block below because the actual write
-  // happens after batch_begin() further down - see the comment there for why it moved.
-  uint64_t plo[TINYNV_EXEC_CHAIN_MAX], phi[TINYNV_EXEC_CHAIN_MAX];
+  // This flush's patches and their footprint, hoisted out of the block below because the actual write happens after
+  // batch_begin() further down - see the comment there for why it moved. The spans themselves live in ex->delta_span.
   unsigned delta_pend_n = 0;
-  uint32_t delta_pend_bytes = 0;
+  uint32_t delta_pend_dwords = 0;
   if (ex->delta_delivery && ex->region[AR_DESC].last_delivered && ex->arena_dma &&
       ex->wraps[AR_DESC] && delta_hi > delta_lo) {
     // Trusted only past the region's first lap (wraps[AR_DESC] set): before that, last_delivered has never been
     // compared against a real prior delivery at this address, so there is nothing yet to diff against honestly.
     //
-    // Per launch, not one envelope over the whole flush. A flush holds up to chain_max launches before delivering
-    // (n here), and one min-max diff over that much content reads as "almost 100% different" the instant even one
-    // byte differs near each end - measured on hardware 2026-09-18 (TINYNV_DELTA_VERBOSE), which is why the single-
-    // envelope version of this that shipped in a4f9010 was a correctness-safe no-op in practice. Each launch's own
-    // span (its QMD slot plus its own cbuf0, chain[i].len) is where the real per-token delta actually lives, so
-    // diffing there finds it at the granularity it occurs at.
+    // Per launch, and within a launch per run. A flush holds up to chain_max launches before delivering (n here), and
+    // one min-max diff over that much content reads as "almost 100% different" the instant even one byte differs
+    // near each end - measured on hardware 2026-09-18 (TINYNV_DELTA_VERBOSE), which is why the single-envelope
+    // version of this that shipped in a4f9010 was a correctness-safe no-op in practice. One envelope per launch
+    // (c728085) then found the same shape one level down: every launch's ~1.5 KB span carries some genuine change
+    // each token, but only 40-240 bytes of it - 3-15% of the envelope, measured 2026-09-19 - so the envelope
+    // overstated a flush's change 7-10x, and raising the budget only moved where it missed. tinynv_delta_runs finds
+    // the runs of dwords that actually differ, which is the granularity the change occurs at: a KV-cache offset here,
+    // a pair of address dwords there, each advancing by a fixed stride a token (libtinynv-design.md SS4h).
     //
-    // All-or-nothing per flush, checked before anything is pushed: either every launch's own diff fits inline, or
+    // All-or-nothing per flush, checked before anything is pushed: either every launch's own patches fit inline, or
     // none of them are pushed here and the flush falls through to the existing full-span paths below untouched.
-    // Committing some launches' diffs here and then letting a fallback path resend the same bytes as part of a
+    // Committing some launches' patches here and then letting a fallback path resend the same bytes as part of a
     // wider copy would deliver a byte twice under two different values of "what's there now" - a correctness bug,
     // not a slower correct answer - which is why the check pass below commits nothing until it has looked at
     // every launch in the chain.
     uint8_t *sh = ex->region[AR_DESC].shadow, *ld = ex->region[AR_DESC].last_delivered;
-    unsigned need_n = 0;
-    uint32_t need_bytes = 0;
+    // DIAGNOSTIC ONLY, TINYNV_DELTA_VERBOSE: the first three flushes through here in full, then only the misses.
+    // Each pass through this block ends in exactly one of delta_n, delta_skip_n and delta_full_n, so their sum is
+    // how many came before this one.
+    int verbose = getenv("TINYNV_DELTA_VERBOSE") != NULL;
+    int diag = verbose && ex->delta_n + ex->delta_skip_n + ex->delta_full_n < 3;
+    unsigned ns = 0, changed = 0;   // patches recorded so far across every launch checked, and launches that had any
+    uint32_t need_dwords = 0, need_bytes = 0, env_bytes = 0;
     int all_fit = 1;
     for (int i = 0; i < n; i++) {
-      uint64_t lo = ex->chain[i].va - ex->region[AR_DESC].mem.va, hi = lo + ex->chain[i].len;
-      uint64_t dlo = hi, dhi = lo;
-      uint64_t genuine = 0;   // DIAGNOSTIC ONLY, TINYNV_DELTA_VERBOSE: bytes that actually differ within [dlo,dhi)
-      for (uint64_t j = lo; j < hi; j++)
-        if (sh[j] != ld[j]) { if (j < dlo) dlo = j; dhi = j + 1; genuine++; }
-      if (dhi > dlo && getenv("TINYNV_DELTA_VERBOSE") && ex->delta_full_n < 3)
-        fprintf(stderr, "libtinynv: delta envelope check: launch %d span-width %llu genuine-diff-bytes %llu (%.0f%% of span)\n",
-                i, (unsigned long long)(dhi - dlo), (unsigned long long)genuine, 100.0 * (double)genuine / (double)(dhi - dlo));
-      if (dhi > dlo) {
-        // tinynv_cmd_inline_upload requires a whole number of dwords at a 4-byte-aligned destination (submit.c) -
-        // the byte-precise diff found above has neither guarantee, so it is widened to the nearest dword on each
-        // side before anything downstream sees it. Safe to widen: each launch's own [lo,hi) is itself allocated on
-        // a 256-byte boundary with a 256-byte-rounded length (tinynv_exec_run's cbuf0_bytes rounding), so rounding
-        // dlo down / dhi up can never cross into a neighbouring launch's span. This crashed on hardware once
-        // (2026-09-19, "an inline upload is a whole number of dwords, not N bytes") before this rounding existed -
-        // the single-envelope version before it had the identical latent bug, just never taken often enough to hit it.
-        dlo &= ~(uint64_t)3;
-        dhi = (dhi + 3) & ~(uint64_t)3;
+      uint32_t lo = (uint32_t)(ex->chain[i].va - ex->region[AR_DESC].mem.va), hi = lo + ex->chain[i].len;
+      // Room in the flat list for this launch's runs: its own per-launch cap, and never so much that a launch still
+      // to come in this chain is left without the one slot its envelope needs. Holding one slot back per remaining
+      // launch means every launch always has room for at least its envelope, so a full list can only ever cost a
+      // launch its runs, never the flush its fast path (TINYNV_DELTA_SPANS_MAX >= TINYNV_EXEC_CHAIN_MAX makes the
+      // reservation possible from the first launch on; asserted beside the define).
+      unsigned room = TINYNV_DELTA_SPANS_MAX - ns - (unsigned)(n - 1 - i);
+      if (room > TINYNV_DELTA_LAUNCH_RUNS_MAX) room = TINYNV_DELTA_LAUNCH_RUNS_MAX;
+      tinynv_delta_span_t env;
+      int k = tinynv_delta_runs(sh, ld, lo, hi, ex->delta_gap, ex->delta_span + ns, room, &env);
+      if (env.hi <= env.lo) continue;   // this launch is byte-identical to its last delivery - nothing to send for it
+      uint32_t run_dwords = 0, run_bytes = 0;
+      for (int r = 0; r < k; r++) {
+        run_bytes += ex->delta_span[ns + r].hi - ex->delta_span[ns + r].lo;
+        run_dwords += delta_span_dwords(ex->delta_span[ns + r].hi - ex->delta_span[ns + r].lo);
       }
-      plo[i] = dlo;
-      phi[i] = dhi;
-      if (dhi <= dlo) continue;   // this launch is byte-identical to its last delivery - nothing to send for it
-      uint32_t dlen = (uint32_t)(dhi - dlo);
-      // Capped against its own budget (TINYNV_DELTA_AGGREGATE_MAX, defined above tinynv_exec_flush), not the shared
-      // inline_pend one: these patches are written straight into the chain's own delivery batch after batch_begin()
-      // (see below), not queued through inline_pend. Measured on hardware 2026-09-19: sharing inline_pend's budget
-      // with TINYNV_INLINE_UPLOAD was why this fired on only 5 of 1223 flushes in a 96-token decode, even with that
-      // shared budget maxed at its ceiling (TINYNV_INLINE_PEND=128) - see the constant's own comment for why the
-      // aggregate cap here is deliberately not TINYNV_INLINE_MAX itself.
-      if (dlen > TINYNV_INLINE_MAX || need_bytes + dlen > TINYNV_DELTA_AGGREGATE_MAX) {
+      uint32_t env_dwords = delta_span_dwords(env.hi - env.lo);
+      // The cheaper of the two shapes, priced in pushbuffer dwords. At the default gap the runs can never cost more
+      // than the envelope - every gap kept is longer than the headers it saves - so this only decides anything when
+      // the gap is swept below that or the runs overflowed their room. It is the decision either way, so it is made
+      // here rather than assumed.
+      if (k < 0 || env_dwords <= run_dwords) {
+        ex->delta_span[ns] = env;
+        k = 1;
+        run_dwords = env_dwords;
+        run_bytes = env.hi - env.lo;
+        ex->delta_collapse_n++;
+      }
+      if (diag)
+        fprintf(stderr, "libtinynv: delta runs: launch %d envelope %u B (%u dw) -> %d run%s %u B (%u dw)\n", i,
+                env.hi - env.lo, env_dwords, k, k == 1 ? "" : "s", run_bytes, run_dwords);
+      // Capped as a whole flush by pushbuffer footprint, headers included - see delta_span_dwords and the comment
+      // above tinynv_exec_flush for why that and not TINYNV_INLINE_MAX. This is the only way the pass falls back now:
+      // a run longer than one call carries is split at emit time, and the list always has room for an envelope.
+      if (need_dwords + run_dwords > ex->delta_aggregate_max / 4u) {
         all_fit = 0;
-        if (getenv("TINYNV_DELTA_VERBOSE") && ex->delta_full_n <= 20)
-          fprintf(stderr, "libtinynv: per-launch delta miss #%llu: launch %d of %d, span [%llu,%llu) len %llu\n",
-                  (unsigned long long)ex->delta_full_n + 1, i, n, (unsigned long long)dlo, (unsigned long long)dhi,
-                  (unsigned long long)dlen);
+        if (verbose && ex->delta_full_n <= 20)
+          fprintf(stderr, "libtinynv: delta miss #%llu: launch %d of %d takes the flush's patches to %u dwords "
+                          "(%u patches, %u B genuine before it), past TINYNV_DELTA_AGGREGATE_KB\n",
+                  (unsigned long long)ex->delta_full_n + 1, i, n, need_dwords + run_dwords, ns + (unsigned)k,
+                  need_bytes);
         break;
       }
-      need_n++;
-      need_bytes += dlen;
+      ns += (unsigned)k;
+      need_dwords += run_dwords;
+      need_bytes += run_bytes;
+      env_bytes += env.hi - env.lo;
+      changed++;
     }
+    if (diag)
+      fprintf(stderr, "libtinynv: delta flush: %d launches, %u changed, envelope %u B, genuine %u B in %u patches, "
+                      "pushbuffer %u B with headers%s\n", n, changed, env_bytes, need_bytes, ns, need_dwords * 4u,
+              all_fit ? "" : " - DID NOT FIT");
     if (all_fit) {
       // Nothing above touched arena state - safe to commit now that every launch has been checked. The actual
       // tinynv_cmd_inline_upload calls happen after batch_begin() below, once the chain's own command buffer
-      // exists to write them into; plo[]/phi[]/delta_pend_n (set here) are what that later code reads.
-      delta_pend_n = need_n;
-      delta_pend_bytes = need_bytes;
+      // exists to write them into; ex->delta_span[0..delta_pend_n) and delta_pend_dwords (set here) are what that
+      // later code reads.
+      delta_pend_n = ns;
+      delta_pend_dwords = need_dwords;
       // Ownership moves over the whole originally-dirty span regardless of how many launches actually had bytes to
       // send, same as the full-span paths below: every launch in the chain read consistently as of this delivery,
       // not just the ones that changed.
       tinynv_arena_mark(&ex->region[AR_DESC], delta_lo, delta_hi, chain_upto);
       ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
-      if (need_n) {
+      if (ns) {
         ex->hybrid_n++;
         ex->delta_n++;
         ex->delta_bytes += need_bytes;
+        ex->delta_span_n += ns;
+        ex->delta_pb_bytes += need_dwords * 4u;
       } else {
         // Every launch in the chain matched its last delivery - a decode step can repeat a cache-hit prefix
         // exactly. Ownership still has to move; no bytes need to.
@@ -1089,10 +1153,9 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
       }
       delta_handled = 1;
     } else {
-      // At least one launch's own diff did not fit inline (an unexpectedly large change, or a chain shape that
-      // does not match what was here last lap) - fall through to the existing full-span paths below, unchanged.
-      // Conservative on purpose: this is never worse than today's behaviour, only sometimes not as good as it
-      // could be.
+      // The flush's genuine change is bigger than the budget (a chain shape that does not match what was here last
+      // lap, or a real bulk change) - fall through to the existing full-span paths below, unchanged. Conservative on
+      // purpose: this is never worse than today's behaviour, only sometimes not as good as it could be.
       ex->delta_full_n++;
     }
   }
@@ -1140,21 +1203,25 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // alone carrying the rest.
   // Eight more under the profile for the tail stamp appended below.
   // Room for this flush's own delta patches, on top of batch_begin()'s own reservation for whatever TINYNV_INLINE_UPLOAD
-  // has pending: TINYNV_INLINE_DWORDS(len) per call, 8 + len/4, summed - exact since every plo[]/phi[] span was
-  // widened to a dword multiple above, so delta_pend_bytes/4 has no remainder to lose.
-  uint32_t want_dwords = (ex->no_chain_deps ? 48 + 4 * (uint32_t)n : 48) + (ex->profile ? 8u : 0u) +
-                          (delta_pend_n ? 8u * delta_pend_n + delta_pend_bytes / 4u : 0u);
+  // has pending: delta_span_dwords per patch, summed in the check pass above - exact because every run is a dword
+  // multiple by construction (tinynv_delta_runs diffs dwords) and the emit loop below splits a long run into pieces
+  // exactly as delta_span_dwords priced them.
+  uint32_t want_dwords = (ex->no_chain_deps ? 48 + 4 * (uint32_t)n : 48) + (ex->profile ? 8u : 0u) + delta_pend_dwords;
   if (batch_begin(ex, &ex->g->gsp.compute_q, want_dwords, &c, &va)) return -1;
   // Written here, not queued through inline_pend: batch_begin() has already reserved the room want_dwords asked
   // for and drained whatever TINYNV_INLINE_UPLOAD had pending into this same c, in that order, ahead of this -
   // same "after the acquire, before anything the caller appends" placement inline_pend's own drain relies on
   // (see batch_begin), just written directly since these were never held anywhere else to begin with.
   if (delta_pend_n) {
-    uint8_t *sh = ex->region[AR_DESC].shadow;
-    for (int i = 0; i < n; i++)
-      if (phi[i] > plo[i] &&
-          tinynv_cmd_inline_upload(&c, ex->region[AR_DESC].mem.va + plo[i], sh + plo[i], (uint32_t)(phi[i] - plo[i])))
-        return -1;
+    const uint8_t *sh = ex->region[AR_DESC].shadow;
+    for (unsigned s = 0; s < delta_pend_n; s++)
+      // A run longer than one call carries (TINYNV_INLINE_MAX) goes out as consecutive pieces; each is a whole
+      // number of dwords at a dword-aligned address because the run is and TINYNV_INLINE_MAX is.
+      for (uint32_t off = ex->delta_span[s].lo; off < ex->delta_span[s].hi; off += TINYNV_INLINE_MAX) {
+        uint32_t len = ex->delta_span[s].hi - off;
+        if (len > TINYNV_INLINE_MAX) len = TINYNV_INLINE_MAX;
+        if (tinynv_cmd_inline_upload(&c, ex->region[AR_DESC].mem.va + off, sh + off, len)) return -1;
+      }
   }
 
   // Wait for the chain before this one. A chain orders the kernels inside it - each descriptor schedules the next - but
@@ -1274,6 +1341,35 @@ unsigned tinynv_exec_pend_entries(const char *e) {
   if (n < 1) n = 1;
   if (n > TINYNV_INLINE_PEND_CAP_N) n = TINYNV_INLINE_PEND_CAP_N;
   return (unsigned)n;
+}
+
+// TINYNV_DELTA_DELIVERY's two tunables. Both are first estimates from arithmetic rather than swept defaults, which is
+// why they are knobs: the sweep costs a card run each, not a rebuild.
+//
+// The gap: how many bytes of unchanged content two differing runs in one launch may straddle and still go out as one
+// patch. A second tinynv_cmd_inline_upload call costs 8 header dwords (TINYNV_INLINE_DWORDS), so carrying up to 8
+// dwords - 32 bytes - of unchanged data is never dearer than splitting around them, and at exactly 32 the merge wins
+// the tie (one LAUNCH_DMA fewer for the engine). Rounded down to a dword multiple, since runs are dwords. 0 is a real
+// value - only contiguous dwords merge - and not "unset"; a negative number is nonsense and reads as 0.
+uint32_t tinynv_exec_delta_gap(const char *e) {
+  if (!e || !*e) return 32;
+  long n = atol(e);
+  if (n < 0) n = 0;
+  if (n > 65536) n = 65536;
+  return (uint32_t)n & ~3u;
+}
+
+// The aggregate: a flush's patches' pushbuffer footprint, headers included, past which the flush takes the full
+// delivery instead. KB on the command line because that is the unit it will be swept in; bytes here. 0 is not a
+// budget anyone means (it would refuse every flush that had anything to say), so it and anything unreadable are the
+// default. Capped at 256 KB: the command-buffer region is 512 KB (CMD_REGION_BYTES), one batch has to fit in it
+// whole, and the same batch may carry up to 64 KB of held TINYNV_INLINE_UPLOAD bytes beside these.
+uint32_t tinynv_exec_delta_aggregate(const char *e) {
+  if (!e || !*e) return 128u * 1024u;
+  long kb = atol(e);
+  if (kb <= 0) return 128u * 1024u;
+  if (kb > 256) kb = 256;
+  return (uint32_t)kb * 1024u;
 }
 
 // How many launches the first chain after a standstill carries, so its descriptors fit in a pushbuffer and the batch
@@ -1682,8 +1778,16 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   // sent there and patches only the difference, instead of resending a structurally-fresh full chain every time.
   { const char *e = getenv("TINYNV_DELTA_DELIVERY");
     ex->delta_delivery = e && *e && *e != '0';
+    const char *g = getenv("TINYNV_DELTA_GAP"), *a = getenv("TINYNV_DELTA_AGGREGATE_KB");
+    ex->delta_gap = tinynv_exec_delta_gap(g);
+    ex->delta_aggregate_max = tinynv_exec_delta_aggregate(a);
+    // Both knobs named with what decided them, the way every other line here is: a sweep is read off these lines,
+    // never off what anyone remembers exporting.
     if (ex->delta_delivery)
-      fprintf(stderr, "libtinynv: AR_DESC delivery patches only what changed since the last lap (was asked for)\n"); }
+      fprintf(stderr, "libtinynv: AR_DESC delivery patches only what changed since the last lap (was asked for): runs "
+                      "of dwords, merged across gaps of up to %u bytes (%s), up to %u KB of pushbuffer a flush (%s)\n",
+              ex->delta_gap, g && *g ? "TINYNV_DELTA_GAP was asked for" : "the default",
+              ex->delta_aggregate_max / 1024u, a && *a ? "TINYNV_DELTA_AGGREGATE_KB was asked for" : "the default"); }
 
   { const char *e = getenv("TINYNV_INLINE_PEND");
     ex->inline_pend_max = tinynv_exec_pend_entries(e);
@@ -1772,6 +1876,12 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   }
   ex->region[AR_DESC].size = desc_bytes;
   ex->region[AR_CMD].size = CMD_REGION_BYTES;
+  // tinynv_delta_span_t holds AR_DESC offsets in 32 bits. TINYNV_DESC_MB stops at 1024 today, so this cannot trip;
+  // it is here so that the day the region can be bigger, the refusal names the reason instead of a patch landing
+  // 4 GB short of where it was meant to.
+  if (ex->region[AR_DESC].size > 0xffffffffull)
+    return tinynv_fail("a %llu byte descriptor region is past what delta delivery's 32-bit offsets can address",
+                       (unsigned long long)ex->region[AR_DESC].size);
 
   if (ex->arena_vram) {
     // Only what the processor still writes has to be reachable through the window: command buffers always, descriptors
@@ -1853,11 +1963,15 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
     fprintf(stderr, "libtinynv: %llu descriptor deliveries rode in the compute batch instead of crossing on the copy "
                     "engine.\n", (unsigned long long)ex->hybrid_n);
   if (ex->delta_n || ex->delta_skip_n || ex->delta_full_n)
-    fprintf(stderr, "libtinynv: delta delivery patched %llu spans (%llu bytes total, %.1f avg), skipped %llu with "
-                    "nothing changed, and %llu fell back full because the genuine diff did not fit inline either.\n",
-            (unsigned long long)ex->delta_n, (unsigned long long)ex->delta_bytes,
-            ex->delta_n ? (double)ex->delta_bytes / (double)ex->delta_n : 0.0,
-            (unsigned long long)ex->delta_skip_n, (unsigned long long)ex->delta_full_n);
+    fprintf(stderr, "libtinynv: delta delivery patched %llu flushes (%llu patches, %llu bytes genuine, %llu bytes of "
+                    "pushbuffer with headers, %.1f KB a flush; %llu launches went as their one envelope), skipped %llu "
+                    "with nothing changed, and %llu fell back full because the flush's patches did not fit the "
+                    "budget.\n",
+            (unsigned long long)ex->delta_n, (unsigned long long)ex->delta_span_n, (unsigned long long)ex->delta_bytes,
+            (unsigned long long)ex->delta_pb_bytes,
+            ex->delta_n ? (double)ex->delta_pb_bytes / 1024.0 / (double)ex->delta_n : 0.0,
+            (unsigned long long)ex->delta_collapse_n, (unsigned long long)ex->delta_skip_n,
+            (unsigned long long)ex->delta_full_n);
   if (ex->inline_n || ex->upload_ce_n)
     fprintf(stderr, "libtinynv: %llu host-to-device copies rode in the pushbuffer (%llu bytes) and %llu went to the "
                     "copy engine.\n           Held list (%u entries, %u bytes): %llu rode in a batch already going "

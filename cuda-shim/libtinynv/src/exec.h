@@ -39,6 +39,22 @@
 #define TINYNV_EXEC_REBASE_AT 0xF0000000ull
 #define TINYNV_EXEC_CHAIN_MAX 128
 
+// TINYNV_DELTA_DELIVERY patches a launch's descriptor span as the runs of dwords that actually differ from what was
+// last delivered there, not as one envelope from its first differing byte to its last (tinynv_delta_runs, and the check
+// pass in tinynv_exec_flush). A flush's runs are kept in one flat list in launch order: launches sit consecutively in
+// AR_DESC and the list is read straight into the chain's own batch, so a per-launch table would only add a second cap
+// to reason about. Measured 2026-09-19, a launch's ~1.5 KB span carries 40-240 genuinely changed bytes a token - a
+// handful of runs - so 4096 across a 128-launch flush is generous; a launch that wants more than
+// TINYNV_DELTA_LAUNCH_RUNS_MAX collapses back to its one envelope rather than failing the flush, which is exactly what
+// shipped before runs existed and so never worse than the day before. Offsets are 32-bit: the region is at most 1 GB
+// (TINYNV_DESC_MB), checked where it is sized.
+#define TINYNV_DELTA_SPANS_MAX       4096
+#define TINYNV_DELTA_LAUNCH_RUNS_MAX 64
+typedef struct { uint32_t lo, hi; } tinynv_delta_span_t;   // [lo,hi) as offsets into AR_DESC, both dword multiples
+// The check pass holds one slot back for every launch still to come, so every launch always has room for at least its
+// envelope - which needs the list to be at least as long as a chain.
+_Static_assert(TINYNV_DELTA_SPANS_MAX >= TINYNV_EXEC_CHAIN_MAX, "every launch in a chain needs a delta slot");
+
 // A region lives in video memory, where the engine reads a descriptor without crossing the link. The processor cannot
 // memcpy into that, so each region has a shadow of ordinary malloc'd memory: building in it is free, and what crosses
 // is one block write per batch, or - for descriptors now - one copy-engine transfer.
@@ -230,9 +246,16 @@ typedef struct {
   int in_chain_flush;
   int hybrid_delivery;
   int delta_delivery;   // TINYNV_DELTA_DELIVERY=1: diff AR_DESC against last_delivered, patch only what changed
+  uint32_t delta_gap;   // TINYNV_DELTA_GAP: unchanged bytes two differing runs may straddle and still go as one patch
+  uint32_t delta_aggregate_max;   // TINYNV_DELTA_AGGREGATE_KB, in bytes: a flush's patches' pushbuffer footprint,
+                                  // headers included, past which the flush takes the full delivery instead
+  tinynv_delta_span_t delta_span[TINYNV_DELTA_SPANS_MAX];   // the flush being built: its patches, in launch order
   unsigned short_chain;
   uint64_t hybrid_n;
   uint64_t delta_n, delta_bytes, delta_skip_n, delta_full_n;
+  // Sub-launch accounting: patches (inline-upload calls) made, their pushbuffer footprint headers included, and
+  // launches whose runs cost more than their one envelope - or overflowed their room - and went out as that instead.
+  uint64_t delta_span_n, delta_pb_bytes, delta_collapse_n;
   // Launch every descriptor from the command stream and link none of them, so nothing orders one kernel against the
   // next. THIS PRODUCES WRONG ANSWERS for any real workload - dependent kernels run side by side - and exists for one
   // measurement: whether the submission path can sustain a launch a microsecond when nothing waits on anything. The
@@ -327,6 +350,18 @@ int tinynv_exec_inline_upload_mode(const char *e);
 unsigned tinynv_exec_short_chain(const char *e);
 // How many small uploads are held before one must be pushed out. Default 16; TINYNV_INLINE_PEND sweeps it.
 unsigned tinynv_exec_pend_entries(const char *e);
+// TINYNV_DELTA_GAP=<bytes>: how much unchanged content two differing runs in one launch's span may straddle and still
+// be sent as one patch. Default 32, rounded down to a dword multiple; 0 is a value (only contiguous dwords merge).
+uint32_t tinynv_exec_delta_gap(const char *e);
+// TINYNV_DELTA_AGGREGATE_KB=<kb>: the pushbuffer footprint, headers included, a flush's delta patches may reach before
+// the flush falls back to a full delivery. Default 128 KB, at most 256. Returns bytes.
+uint32_t tinynv_exec_delta_aggregate(const char *e);
+// The runs of dwords in [lo,hi) where `fresh` differs from `last`, two runs merged when at most `gap` bytes of unchanged
+// content separate them, written to out[]. Returns how many, or -1 when more than `max` would be needed; either way
+// *envelope is the span from the first differing dword to the last (empty, hi <= lo, when nothing differs). lo and hi
+// are dword multiples, and so is every run and the envelope. Exposed for test_delta.
+int tinynv_delta_runs(const uint8_t *fresh, const uint8_t *last, uint32_t lo, uint32_t hi, uint32_t gap,
+                      tinynv_delta_span_t *out, unsigned max, tinynv_delta_span_t *envelope);
 int tinynv_exec_arena_dma(const char *e, int arena_vram, const char **why);
 
 // Wait until the engine has released `value`, or give up. Returns -1 on timeout, which is a fault rather than slowness:

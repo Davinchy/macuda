@@ -103,6 +103,11 @@ $(BUILD)/test_exec_mode: test/test_exec_mode.c $(BUILD)/libtinynv.a
 	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc -DTINYNV_MODE_CHECKS=$$(grep -c 'CHECK(' test/test_exec_mode.c) \
 	  $< $(BUILD)/libtinynv.a -o $@
 
+$(BUILD)/test_delta: test/test_delta.c $(BUILD)/libtinynv.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc -DTINYNV_DELTA_CHECKS=$$(grep -c 'CHECK(' test/test_delta.c) \
+	  $< $(BUILD)/libtinynv.a -o $@
+
 $(BUILD)/test_%: test/test_%.c $(BUILD)/libtinynv.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc $< $(BUILD)/libtinynv.a -o $@
@@ -120,7 +125,7 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # already wins over the environment, so this changes nothing about how they run - it removes the possibility that a
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
-test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_rm_free $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_dev
+test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_rm_free $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_dev
 	@# FIRST, before any test runs: do the tests in this directory still report what they find? On 2026-09-15
 	@# test_rm_free.c exited 0 with FAIL printed - it consulted its failure count at line 117 of a 318-line main, the
 	@# file grew past that guard, and the whole C4b decision plus the rows proving the read-only fix landed below it.
@@ -141,7 +146,9 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@# control, which is the practice the rest of this suite's credibility rests on: a check "seen to fail" and then
 	@# "seen to pass" proves nothing if both runs were the same binary. Invisible to a build id, too - build_id.c is
 	@# recompiled every time, so the id looks current while every other object is stale.
-	@$(PYTHON) tools/check_stale_objects.py
+	@# with the build directory it is asked about: the top-level Makefile builds this driver at cuda-shim/build/shim/nv, and
+	@# the tool's default of build/src was a stale tree from an older standalone build (found 2026-09-19)
+	@$(PYTHON) tools/check_stale_objects.py $(BUILD)/src src
 	@for cb in ../spike/vecadd.sm86.cubin ../spike/vecadd.sm90.cubin ../spike/vecadd.sm120.cubin; do $(BUILD)/test_cubin $$cb || exit 1; done
 	@# `test -f $$cb && run || true` swallowed a real FAILURE, not just a missing file: in `A && B || C` the C runs
 	@# whenever B fails, so these two cubins could have been failing since the line was written and the suite would
@@ -170,6 +177,10 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@# shape of the record, and the corruption they prevent is not something the card reports.
 	@$(BUILD)/test_rm_free
 	@$(BUILD)/test_exec_mode
+	@# which dwords of a launch's descriptor span TINYNV_DELTA_DELIVERY patches and which it trusts are already there.
+	@# a run a dword short is a stale kernel parameter and nothing on the card reports it, so the covering property
+	@# and the gap arithmetic are pinned here, off the card.
+	@$(BUILD)/test_delta
 	@# what a launch costs the processor, with no gpu. sizes any change that removes host work per launch.
 	@$(BUILD)/test_qmd_cost 20000
 	@# the memory manager on its own: awkward sizes, freed and reallocated, which the recorded boot never does
