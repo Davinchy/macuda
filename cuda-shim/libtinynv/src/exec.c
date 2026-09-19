@@ -1427,7 +1427,7 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
   const uint8_t *p = src;
   // Small, whole dwords, aligned: everything else goes to the engine built for moving bytes. The 20480-byte copy of
   // the seven stays there too - past a few KB the pushbuffer itself has to reach the card, so inlining stops paying.
-  if (ex->inline_upload && n && n <= TINYNV_INLINE_MAX && !(n & 3u) && !(dst_va & 3u)) {
+  if (ex->inline_upload && n && n <= ex->inline_max && !(n & 3u) && !(dst_va & 3u)) {
     // BUFFERED, not submitted, and that is the whole of the fix. This took a batch, a doorbell and an idle of its own
     // - and worse, batch_begin FLUSHES the pending chain, so every tiny copy forced whatever launches were queued out
     // early. Six a token. Session A measured the round trip at ~50 us a copy and then showed, by removing the wait
@@ -1761,6 +1761,14 @@ int tinynv_exec_tail_release(const char *e) { return !e || !*e || *e != '0'; }
 // (docs/handoff-2026-09-19.md). The rewind is meaningless without delivery, so it follows delivery off.
 int tinynv_exec_delta_delivery(const char *e) { return !e || !*e || *e != '0'; }
 
+uint32_t tinynv_exec_inline_max(const char *e) {
+  if (!e || !*e) return 4096;
+  long n = atol(e);
+  if (n < 4) return 4096;
+  if (n > TINYNV_INLINE_MAX) n = TINYNV_INLINE_MAX;
+  return (uint32_t)n & ~3u;
+}
+
 int tinynv_exec_qmd_membar(const char *e) {
   if (!e || !*e) return TINYNV_QMD_MEMBAR_SYS;
   if (!strcmp(e, "gpu")) return TINYNV_QMD_MEMBAR_GPU;
@@ -1917,10 +1925,15 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
     // clean, correct and unmoved. That is the same shape as the sensor knob that gated only half of what it claimed,
     // and as TINYNV_TAIL_RELEASE being off while I instrumented the branch it selects away from. Three times in one
     // day is a convention, not a coincidence.
+    const char *mx = getenv("TINYNV_INLINE_MAX");
+    ex->inline_max = tinynv_exec_inline_max(mx);
     fprintf(stderr, "libtinynv: small host-to-device copies %s (%s)%s\n",
             ex->inline_upload ? "ride in the pushbuffer" : "go to the copy engine",
             e && *e ? "was asked for" : "the default",
-            ex->inline_upload ? ", held until the next batch goes out" : ""); }
+            ex->inline_upload ? ", held until the next batch goes out" : "");
+    if (ex->inline_upload)
+      fprintf(stderr, "libtinynv: up to %u bytes a copy ride that way (%s); larger ones go to the copy engine\n",
+              ex->inline_max, mx && *mx ? "TINYNV_INLINE_MAX was asked for" : "the default"); }
   // Where the second window of raw refill pairs opens. The first eight are always the start of a run, which is prefill;
   // 200 is comfortably inside a decode for any run long enough to matter, and a short run simply prints fewer.
   { const char *e = getenv("TINYNV_REFILL_RAW_FROM"); ex->refill_raw_from = e && *e ? strtoull(e, NULL, 10) : 200; }

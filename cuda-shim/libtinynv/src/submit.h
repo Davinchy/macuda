@@ -40,9 +40,13 @@ int tinynv_cmd_timestamp(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value);
 int tinynv_cmd_release_clocked(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value);
 // The copy engine's clock into an address of its own, leaving its timeline release alone. Profile-only.
 int tinynv_cmd_copy_timestamp(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value);
-// The largest host-to-device copy this driver will carry in the pushbuffer rather than hand to the copy engine. Past
-// this the bytes are better moved by the engine built for it: the pushbuffer itself has to reach the card.
-#define TINYNV_INLINE_MAX 4096
+// The largest host-to-device copy ONE inline-upload call can carry: LOAD_INLINE_DATA's non-incrementing header holds
+// a 13-bit dword count, so 8,191 dwords. Which copies actually take this path is a runtime choice, ex->inline_max
+// (TINYNV_INLINE_MAX, 4,096 bytes by default - past a few KB the pushbuffer itself has to reach the card, so inlining
+// stops paying for a lone copy); this constant only sizes the call and the buffer it copies through. Raised from
+// 4,096 on 2026-09-19 so that the 8,192-byte upload every decode token still hands to the copy engine can be measured
+// riding the pushbuffer instead (docs/driver/moe-next-steps.md, option 1).
+#define TINYNV_INLINE_MAX 32764
 // A small host-to-device copy written as methods in a command batch - no copy engine, no second queue, no doorbell of
 // its own. `n` is a whole number of dwords, at most TINYNV_INLINE_MAX, and `dst` is 4-byte aligned.
 int tinynv_cmd_inline_upload(tinynv_cmdbuf_t *c, uint64_t dst, const void *src, uint32_t n);

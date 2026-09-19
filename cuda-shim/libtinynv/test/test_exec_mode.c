@@ -162,6 +162,17 @@ int main(void) {
           "an empty environment no longer builds the oracle's descriptor tail");
   }
 
+  // The inline-upload size cap: 4,096 unless asked, a dword multiple, never past the per-call ceiling.
+  {
+    static const struct { const char *e; uint32_t want; } im[] = {{NULL, 4096}, {"", 4096}, {"4096", 4096}, {"8192", 8192},
+                                                                   {"8193", 8192}, {"3", 4096}, {"abc", 4096}, {"0", 4096},
+                                                                   {"32764", 32764}, {"65536", TINYNV_INLINE_MAX}};
+    for (size_t i = 0; i < sizeof(im) / sizeof(*im); i++)
+      CHECK(tinynv_exec_inline_max(im[i].e) == im[i].want, "TINYNV_INLINE_MAX=%s gave %u, expected %u",
+            im[i].e ? im[i].e : "(unset)", tinynv_exec_inline_max(im[i].e), im[i].want);
+    CHECK(tinynv_exec_inline_max(NULL) == 4096, "the inline-upload default moved from 4,096 bytes");
+  }
+
   // Whether a download drains the compute on the host before issuing its copy. Off by default: it is a test of a
   // mechanism, not yet a fix, and the two arms want measuring against each other rather than one being assumed.
   {

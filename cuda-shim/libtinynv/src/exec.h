@@ -228,6 +228,9 @@ typedef struct {
   // identical token to token, which is what the delta path lives on. Both diagnostics say loudly that they are
   // degraded rather than quietly saying less, and TINYNV_TAIL_RELEASE=0 brings them back.
   int tail_release;
+  // TINYNV_INLINE_MAX: the largest caller upload that rides in the pushbuffer instead of going to the copy engine,
+  // bytes, a dword multiple, at most submit.h's TINYNV_INLINE_MAX (the per-call ceiling). 4,096 by default.
+  uint32_t inline_max;
   // TINYNV_QMD_MEMBAR=sys|gpu|none and TINYNV_QMD_INVALIDATE=all|cb0|none: what every NON-releasing descriptor makes
   // the engine do at its tail (qmd.c). Measurement knobs, the oracle's choice by default; a descriptor that releases
   // the timeline keeps the system-scope barrier whatever these say (tinynv_exec_flush, tinynv_exec_run).
@@ -371,6 +374,9 @@ int tinynv_exec_delta_rewind(int delivery, const char *e);
 // default. TINYNV_QMD_INVALIDATE: "all" (the default), "cb0", "none". Resolved here so test_exec_mode pins them.
 int tinynv_exec_qmd_membar(const char *e);
 int tinynv_exec_qmd_invalidate(const char *e);
+// TINYNV_INLINE_MAX=<bytes>: unset, empty, unreadable or under 4 is the 4,096-byte default; rounded down to a dword
+// multiple and clamped to the per-call ceiling. Resolved here so test_exec_mode pins the default.
+uint32_t tinynv_exec_inline_max(const char *e);
 // 0 = a download issues its copy immediately and the card waits (the default); 1 = the host waits for compute first,
 // so the copy's acquire is satisfied before the channel is ever looked at.
 int tinynv_exec_download_sync_first(const char *e);
