@@ -299,6 +299,8 @@ static uint64_t qmd_sum(const uint8_t *b) {
 }
 
 int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
+  // A pending keep-alive is let go before anything is waited for: a wait must never sit out the spin's ceiling.
+  tinynv_exec_keepalive_release(ex, 1);
   // Anything staged and not announced is work the engine has not been told about, so waiting for it would sit out the
   // whole timeout. This is normally empty; it is not when a flush failed between staging the delivery and submitting
   // the chain that would have announced it, and that is exactly the path where a hang would be hardest to read.
@@ -1495,6 +1497,10 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   ex->pending_head_va = ex->chain[0].va;
   ex->pending_head_sum = qmd_sum(ex->chain[0].host);
   ex->in_chain_flush = 0;
+  // The keep-alive, if one is spinning, is let go just before the caller's chain is handed over: the chain acquires on
+  // the keep-alive's own timeline value, which it releases the moment it sees the flag. The driver's own work (the
+  // keep-alive launch itself, a download by kernel) does not release it.
+  if (!ex->internal_work) tinynv_exec_keepalive_release(ex, 0);
   if (submit_batch(ex, &ex->g->gsp.compute_q, &c, va, chain_upto, n)) return -1;
   // Once per chain rather than once per launch: see tinynv_exec_run. This reports on work already handed over, which
   // is what it reported on before too - a launch that has not been submitted cannot have faulted.
@@ -1985,6 +1991,35 @@ int tinynv_exec_tail_release(const char *e) { return !e || !*e || *e != '0'; }
 // TINYNV_KERNEL_PROFILE: off unless asked. A run that stamps every descriptor is measuring, and the report at teardown
 // says what it saw; nothing else about the run should find itself in that state by accident.
 int tinynv_exec_kernel_profile(const char *e) { return e && *e && *e != '0'; }
+
+// TINYNV_KEEPALIVE: off unless asked, until it has been measured on both decodes and soaked; TINYNV_KEEPALIVE_US is the
+// spin's ceiling (the watchdog), 2,000 us unless asked, never under 50 or over 20,000.
+int tinynv_exec_keepalive(const char *e) { return e && *e && *e != '0'; }
+unsigned tinynv_exec_keepalive_us(const char *e) {
+  if (!e || !*e) return 2000;
+  long n = atol(e);
+  if (n < 50) return 2000;
+  if (n > 20000) n = 20000;
+  return (unsigned)n;
+}
+
+int tinynv_exec_keepalive_arm(tinynv_exec_t *ex, uint64_t *flag_va) {
+  if (!ex->ka_flag.size) return tinynv_fail("the keep-alive flag was never allocated (TINYNV_KEEPALIVE is off)");
+  uint32_t zero = 0;
+  nv_wr_block(&ex->ka_flag.dma.view, 0, &zero, sizeof(zero));
+  ex->ka_pending = 1;
+  ex->ka_launched++;
+  *flag_va = ex->ka_flag.va;
+  return 0;
+}
+
+void tinynv_exec_keepalive_release(tinynv_exec_t *ex, int by_wait) {
+  if (!ex->ka_pending) return;
+  uint32_t one = 1;
+  nv_wr_block(&ex->ka_flag.dma.view, 0, &one, sizeof(one));
+  ex->ka_pending = 0;
+  if (by_wait) ex->ka_released_wait++; else ex->ka_released_chain++;
+}
 // TINYNV_KERNEL_PROFILE_SKIP: windows not counted at the start of a run. Four unless asked - the load, the prompt and
 // the first tokens, none of which is the steady decode the mean is meant to describe.
 int tinynv_exec_kernel_profile_skip(const char *e) {
@@ -2266,6 +2301,8 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   { const char *e4 = getenv("TINYNV_NO_CHAIN_DEPS"); ex->no_chain_deps = e4 && *e4 && *e4 != '0'; }
   { const char *e5 = getenv("TINYNV_LAUNCH_PROFILE"); ex->profile = e5 && *e5 && *e5 != '0'; }
   ex->kprof = tinynv_exec_kernel_profile(getenv("TINYNV_KERNEL_PROFILE"));
+  ex->keepalive = tinynv_exec_keepalive(getenv("TINYNV_KEEPALIVE"));
+  ex->keepalive_us = tinynv_exec_keepalive_us(getenv("TINYNV_KEEPALIVE_US"));
   ex->kprof_skip = tinynv_exec_kernel_profile_skip(getenv("TINYNV_KERNEL_PROFILE_SKIP"));
   // Delivered by the copy engine by default since 2026-09-15, having been the opt-in path for a day and a 62-minute
   // soak: 1,876 requests, 343,160 tokens, 188 greedy probes all identical, no refusals. TINYNV_ARENA_DMA=0 goes back to
@@ -2306,6 +2343,8 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   // All three are host memory the GPU reads across the bus: the processor writes every one of them, and on a card behind
   // thunderbolt the window onto video memory is far too small to be where the two sides meet.
   if (tinynv_mm_alloc_buffer(&g->mm, SEM_BYTES, 1, 1, 1, 0, 1, &ex->sem)) return -1;
+  // The keep-alive's flag: one host page the engine polls and the processor writes, like the timeline's own slots.
+  if (ex->keepalive && tinynv_mm_alloc_buffer(&g->mm, 0x1000, 1, 1, 1, 0, 1, &ex->ka_flag)) return -1;
   // TINYNV_KERNEL_PROFILE needs the chain shape it stamps: chained descriptors releasing the timeline at the tail
   // only, so that every other link's first release slot is free for its stamp. The ring is host memory like the
   // timeline's own slots, written by the engine and read here.
@@ -2429,6 +2468,10 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
   // Everything submitted has been waited for by the caller (tinynv.c idles before this), so the last chain's tail can
   // be read now along with anything else still in the ring.
   if (ex->kprof_on) { kprof_harvest(ex, ~0ull, 2); kprof_report(ex); }
+  if (ex->ka_launched)
+    fprintf(stderr, "libtinynv: keep-alive launched %llu times after a synchronisation; released %llu by the next chain's "
+                    "hand-over, %llu by a wait\n", (unsigned long long)ex->ka_launched,
+            (unsigned long long)ex->ka_released_chain, (unsigned long long)ex->ka_released_wait);
   // One line, and only when it happened, because a wrap is a stall and a run that paid several wants to know without
   // having to have asked in advance.
   if (ex->wraps[AR_DESC] || ex->wraps[AR_CMD] || ex->seg_waits)
@@ -2593,6 +2636,7 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
   }
   tinynv_vmap_free(&ex->g->mm, &ex->sem);
   if (ex->kring.size) tinynv_vmap_free(&ex->g->mm, &ex->kring);
+  if (ex->ka_flag.size) tinynv_vmap_free(&ex->g->mm, &ex->ka_flag);
   free(ex->kslot);
   free(ex->krow);
   free(ex->kindex);

@@ -45,6 +45,8 @@ struct tinynv_device {
   tinynv_kernel_t download_kernel;
   unsigned download_block, download_bpt;
   int download_via_compute;
+  // A caller's keep-alive kernel, launched after every synchronisation under TINYNV_KEEPALIVE=1 (exec.c owns the knob).
+  tinynv_kernel_t keepalive_kernel;
   tinynv_gpu_t gpu;
   tinynv_exec_t exec;
 
@@ -618,6 +620,47 @@ tinynv_status_t tinynv_set_download_kernel(tinynv_device_t d, tinynv_kernel_t k,
   return TINYNV_OK;
 }
 
+tinynv_status_t tinynv_set_keepalive_kernel(tinynv_device_t d, tinynv_kernel_t k) {
+  if (!d || !k) return TINYNV_ERR_INVALID;
+  tinynv_kernel_info_t info;
+  if (tinynv_kernel_info(k, &info) != TINYNV_OK) return TINYNV_ERR_INVALID;
+  if (info.num_params != 2 || info.params[0].size != 8 || info.params[1].size != 8)
+    return tinynv_fail("a keep-alive kernel takes exactly two 8-byte parameters - the flag's address and a cycle budget - "
+                       "and this one declares %d", info.num_params), TINYNV_ERR_INVALID;
+  d->keepalive_kernel = k;
+  if (d->exec.keepalive)
+    fprintf(stderr, "libtinynv: keep-alive on (was asked for): after every synchronisation a lent kernel keeps the compute "
+                    "engine scheduled until the next chain is handed over, %u us at most\n", d->exec.keepalive_us);
+  return TINYNV_OK;
+}
+
+// The keep-alive launch: the driver's own work, after the engine has been idled by a synchronisation. Outside the lock,
+// because tinynv_launch takes it. Any failure is reported once and the knob is dropped rather than retried per token.
+static void keepalive_launch(tinynv_stream_t s) {
+  tinynv_device_t d = s->dev;
+  tinynv_kernel_info_t info;
+  uint64_t flag_va = 0;
+  if (tinynv_kernel_info(d->keepalive_kernel, &info) != TINYNV_OK || WITH_LOCK(tinynv_exec_keepalive_arm(&d->exec, &flag_va))) {
+    fprintf(stderr, "libtinynv: the keep-alive could not be armed (%s); it is off from here\n", tinynv_last_error());
+    d->exec.keepalive = 0;
+    return;
+  }
+  uint8_t params[64];
+  memset(params, 0, sizeof(params));
+  uint64_t cycles = (uint64_t)d->exec.keepalive_us * 3000ull;   // ~3 cycles a nanosecond at the boost clock: a ceiling
+  memcpy(params + info.params[0].offset, &flag_va, 8);
+  memcpy(params + info.params[1].offset, &cycles, 8);
+  tinynv_exec_set_internal(&d->exec, 1);
+  tinynv_status_t rc = tinynv_launch(s, d->keepalive_kernel, 1, 1, 1, 32, 1, 1, 0, params, (size_t)info.params[1].offset + 8);
+  if (rc == TINYNV_OK && WITH_LOCK(tinynv_exec_flush(&d->exec))) rc = TINYNV_ERR_DRIVER;
+  tinynv_exec_set_internal(&d->exec, 0);
+  if (rc != TINYNV_OK) {
+    fprintf(stderr, "libtinynv: the keep-alive launch failed (%s); it is off from here\n", tinynv_last_error());
+    WITH_LOCK((tinynv_exec_keepalive_release(&d->exec, 1), 0));
+    d->exec.keepalive = 0;
+  }
+}
+
 tinynv_status_t tinynv_memcpy_dtoh(tinynv_stream_t s, void *dst, tinynv_devptr_t src, size_t n) {
   if (ON_GPU(s)) {
     NEED_GPU(s);
@@ -887,7 +930,10 @@ tinynv_status_t tinynv_stream_sync(tinynv_stream_t s) {
   publish_sensors(s->dev);
   // exec_idle, not a bare wait on the timeline: launches may be built and not yet handed over, and those carry timeline
   // values nothing has been told to release. Waiting on one without flushing first waits out the whole timeout.
-  return WITH_LOCK(tinynv_exec_idle(&s->dev->exec)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+  if (WITH_LOCK(tinynv_exec_idle(&s->dev->exec))) return TINYNV_ERR_DRIVER;
+  // The engine is idle now and the host is about to go away and think. TINYNV_KEEPALIVE: keep it scheduled meanwhile.
+  if (s->dev->exec.keepalive && s->dev->keepalive_kernel && !s->dev->torn_down) keepalive_launch(s);
+  return TINYNV_OK;
 }
 
 tinynv_status_t tinynv_event_create(tinynv_device_t d, tinynv_event_t *out) {

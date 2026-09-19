@@ -107,6 +107,14 @@ tinynv_status_t tinynv_stream_flush(tinynv_stream_t);
 // Registering a kernel does not turn this on. TINYNV_DOWNLOAD_VIA_COMPUTE=1 does, and it names itself at start-up.
 tinynv_status_t tinynv_set_download_kernel(tinynv_device_t, tinynv_kernel_t,
                                            unsigned block_threads, unsigned bytes_per_thread);
+// Lend the driver a keep-alive kernel: one block that polls a flag in host memory and exits when the flag is set or
+// after a cycle budget (the watchdog). Under TINYNV_KEEPALIVE=1 the driver launches it after every synchronisation
+// - the moment the compute engine has gone idle - so the engine stays scheduled while the host samples and builds
+// the next token, and sets the flag just before the next chain is handed over (or before any wait), so nothing
+// ever waits on the spin. Measured reason: after the engine idles at a token boundary it takes ~0.3-0.5 ms to reach
+// the next batch, where a mid-token seam costs ~40 us. Two parameters, both 8 bytes: the flag's address and the
+// cycle budget. Registration alone changes nothing; the knob does, and names itself at start-up.
+tinynv_status_t tinynv_set_keepalive_kernel(tinynv_device_t, tinynv_kernel_t);
 tinynv_status_t tinynv_event_create(tinynv_device_t, tinynv_event_t* out);
 tinynv_status_t tinynv_event_record(tinynv_event_t, tinynv_stream_t);
 tinynv_status_t tinynv_event_sync(tinynv_event_t);

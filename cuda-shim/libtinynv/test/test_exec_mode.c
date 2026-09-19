@@ -219,6 +219,18 @@ int main(void) {
     CHECK(tinynv_exec_download_sync_first(NULL) == 0, "a download still issues its copy before draining, by default");
   }
 
+  // The keep-alive: off unless asked, its spin ceiling 2,000 us unless asked and never absurd.
+  {
+    static const struct { const char *e; int want; } ka[] = {{NULL, 0}, {"", 0}, {"0", 0}, {"1", 1}};
+    for (size_t i = 0; i < sizeof(ka) / sizeof(*ka); i++)
+      CHECK(tinynv_exec_keepalive(ka[i].e) == ka[i].want, "TINYNV_KEEPALIVE=%s resolved the wrong way", ka[i].e ? ka[i].e : "(unset)");
+    static const struct { const char *e; unsigned want; } kus[] = {{NULL, 2000}, {"", 2000}, {"500", 500}, {"10", 2000}, {"abc", 2000}, {"99999", 20000}};
+    for (size_t i = 0; i < sizeof(kus) / sizeof(*kus); i++)
+      CHECK(tinynv_exec_keepalive_us(kus[i].e) == kus[i].want, "TINYNV_KEEPALIVE_US=%s gave %u, expected %u",
+            kus[i].e ? kus[i].e : "(unset)", tinynv_exec_keepalive_us(kus[i].e), kus[i].want);
+    CHECK(tinynv_exec_keepalive(NULL) == 0, "the keep-alive is unmeasured and must be off unless asked");
+  }
+
   // Whether small host-to-device copies ride in the pushbuffer. ON by default since it measured clean twice and +3%
   // on both models; it shipped off for a day first, because it changes the data path rather than an instrument and a
   // wrong one reads stale memory somewhere else entirely. The row for the default is the one that matters here - a

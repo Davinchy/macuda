@@ -76,6 +76,12 @@ static void ensure_init(void){
     if ((r=tinynv_module_load(g_dev,copy1d_cubin,copy1d_cubin_len,&mod))!=TINYNV_OK || (r=tinynv_get_kernel(mod,"tinycudart_copy1d",&k))!=TINYNV_OK ||
         (r=tinynv_set_download_kernel(g_dev,k,256,16))!=TINYNV_OK)
       fprintf(stderr,"[tinycudart] the download kernel was not registered (%s): downloads stay on the copy engine\n", tinynv_last_error()); }
+  // And the keep-alive kernel (libtinycudart/keepalive.cu): one warp polling a host flag, launched by the driver after a
+  // synchronisation under TINYNV_KEEPALIVE=1 so the compute engine stays scheduled across a token boundary.
+  { extern unsigned char keepalive_cubin[]; extern unsigned int keepalive_cubin_len; tinynv_module_t mod=NULL; tinynv_kernel_t k=NULL; tinynv_status_t r;
+    if ((r=tinynv_module_load(g_dev,keepalive_cubin,keepalive_cubin_len,&mod))!=TINYNV_OK || (r=tinynv_get_kernel(mod,"tinynv_keepalive",&k))!=TINYNV_OK ||
+        (r=tinynv_set_keepalive_kernel(g_dev,k))!=TINYNV_OK)
+      fprintf(stderr,"[tinycudart] the keep-alive kernel was not registered (%s): TINYNV_KEEPALIVE would do nothing\n", tinynv_last_error()); }
   fprintf(stderr,"[tinycudart] libtinynv build %s\n", tinynv_build_id());  // a stale binary announces itself (B's 4892427)
   atexit(stats_dump);   // always: the flushed-sync count below prints whenever it is non-zero; the rest only with TINYCUDART_STATS=1
 }
@@ -107,8 +113,15 @@ static kstat_t* g_kstats; static size_t g_nkstats, g_kcap; static unsigned long 
 // between them is not counted as the caller thinking. The stats' own name loops run outside both brackets.
 double tinycudart_now_ns(void);
 static double g_last_ret, g_between_ns; static int g_last_was_launch; static unsigned long g_between_n;
+// The host's turnaround after a wait: from a synchronisation returning (the logits read back, on a decode) to the next
+// launch, whatever copies happen between - sampling, the next graph's build and scheduling, the input uploads. This is
+// the host's share of the token boundary the kernel profile measures on the engine's clock.
+static double g_sync_ret, g_turn_ns, g_turn_max; static int g_after_sync; static unsigned long g_turn_n;
 void tinycudart_count_launch(const char* name){ g_launches++; if (!stats_on()) return;
-  { double now=tinycudart_now_ns(); if (g_last_was_launch && g_last_ret>0) { g_between_ns+=now-g_last_ret; g_between_n++; } }
+  { double now=tinycudart_now_ns(); if (g_last_was_launch && g_last_ret>0) { g_between_ns+=now-g_last_ret; g_between_n++; }
+    // the first four are the load, the prompt and the warm-up, whose turnarounds are not a token's
+    if (g_after_sync) { static unsigned long seen; double d=now-g_sync_ret; g_after_sync=0;
+      if (seen++ >= 4) { g_turn_ns+=d; g_turn_n++; if (d>g_turn_max) g_turn_max=d; } } }
   for (size_t i=0;i<g_nkstats;i++) if (g_kstats[i].name==name){ g_kstats[i].launches++; return; }
   if (g_nkstats==g_kcap){ g_kcap=g_kcap?g_kcap*2:256; g_kstats=realloc(g_kstats,g_kcap*sizeof(*g_kstats)); }
   g_kstats[g_nkstats].name=name; g_kstats[g_nkstats].launches=1; g_nkstats++; }
@@ -122,7 +135,10 @@ void tinycudart_count_sync(void){ g_syncs++; g_last_was_launch=0; }
 static unsigned long g_syncs_flushed;   // answered without waiting: the driver said nothing outstanding needed it (inline uploads only)
 void tinycudart_count_sync_flushed(void){ g_syncs_flushed++; }
 static double g_api_ns[8]; static unsigned long g_api_n[8];
-void tinycudart_time_api(int kind, double ns){ g_last_was_launch=0; if (!stats_on()||kind<0||kind>7) return; g_api_ns[kind]+=ns; g_api_n[kind]++; }
+void tinycudart_time_api(int kind, double ns){ g_last_was_launch=0; if (!stats_on()||kind<0||kind>7) return; g_api_ns[kind]+=ns; g_api_n[kind]++;
+  // the FIRST synchronisation after the last launch (the logits read back, on a decode) starts the turnaround; the input
+  // copies that follow before the next launch are part of it, not a new start
+  if ((kind==1||kind==3||kind==6) && !g_after_sync) { g_sync_ret=tinycudart_now_ns(); g_after_sync=1; } }
 double tinycudart_now_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1e9+ts.tv_nsec; }
 void tinycudart_count_copy(int kind, unsigned long long n){ g_copies++; g_last_was_launch=0; if (kind==1) g_bytes_h2d+=n; else if (kind==2) g_bytes_d2h+=n; else if (kind==3) g_bytes_d2d+=n; else g_bytes_set+=n; }
 static int cmp_kstat(const void* a, const void* b){ double x=((const kstat_t*)a)->ns, y=((const kstat_t*)b)->ns; if (x!=y) return x<y?1:-1;
@@ -142,6 +158,9 @@ static void stats_dump(void){
   if (g_between_n) fprintf(stderr,"[tinycudart] stats: between consecutive launches the caller spent %.2f us a launch (%lu pairs: ggml-cuda's dispatch and "
                            "llama.cpp above it); inside tinynv_launch %.2f us a launch - the host's cost per launch is their sum\n",
                            g_between_ns/1e3/g_between_n, g_between_n, g_launches?total/1e3/g_launches:0.0);
+  if (g_turn_n) fprintf(stderr,"[tinycudart] stats: after a synchronisation returned, the host took %.1f us to issue the next launch (%lu times after the first four, worst %.1f us): "
+                       "sampling, the next graph's build and scheduling, input uploads - the host's share of the token boundary\n",
+                       g_turn_ns/1e3/g_turn_n, g_turn_n, g_turn_max/1e3);
   qsort(g_kstats,g_nkstats,sizeof(*g_kstats),cmp_kstat);
   for (size_t i=0;i<g_nkstats && i<40;i++) fprintf(stderr,"[tinycudart]   %8lu  %9.1f ms  %7.1f us/launch  %s\n", g_kstats[i].launches, g_kstats[i].ns/1e6,
           g_kstats[i].launches ? g_kstats[i].ns/1e3/g_kstats[i].launches : 0.0, g_kstats[i].name);

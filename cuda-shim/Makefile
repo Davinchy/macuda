@@ -30,7 +30,7 @@ all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke
 $(NV_LIB): FORCE
 	@$(MAKE) --no-print-directory -C libtinynv BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
 
-$(CUDART): $(BUILD)/cudart.o $(BUILD)/fatbin.o $(BUILD)/hostpool.o $(BUILD)/cudart_api.o $(BUILD)/demangle.o $(BUILD)/copy2d_cubin.o $(BUILD)/copy1d_cubin.o
+$(CUDART): $(BUILD)/cudart.o $(BUILD)/fatbin.o $(BUILD)/hostpool.o $(BUILD)/cudart_api.o $(BUILD)/demangle.o $(BUILD)/copy2d_cubin.o $(BUILD)/copy1d_cubin.o $(BUILD)/keepalive_cubin.o
 	ar rcs $@ $^
 # the strided-copy kernel travels inside the runtime the same way (libtinycudart/copy2d.cu, built by the remote nvcc)
 $(BUILD)/copy2d_cubin.c: libtinycudart/copy2d.cubin
@@ -43,6 +43,12 @@ $(BUILD)/copy1d_cubin.c: libtinycudart/copy1d.cubin
 	@mkdir -p $(@D)
 	cd libtinycudart && xxd -i copy1d.cubin > $(ROOT)/$@
 $(BUILD)/copy1d_cubin.o: $(BUILD)/copy1d_cubin.c
+	$(CC) $(CFLAGS) -c $< -o $@
+# the keep-alive kernel the driver launches after a synchronisation when TINYNV_KEEPALIVE=1 (libtinycudart/keepalive.cu)
+$(BUILD)/keepalive_cubin.c: libtinycudart/keepalive.cubin
+	@mkdir -p $(@D)
+	cd libtinycudart && xxd -i keepalive.cubin > $(ROOT)/$@
+$(BUILD)/keepalive_cubin.o: $(BUILD)/keepalive_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(CUBLAS): $(BUILD)/cublas.o $(BUILD)/gemm_cubin.o
 	ar rcs $@ $^

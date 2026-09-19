@@ -355,6 +355,14 @@ typedef struct {
   tinynv_kprof_row_t *krow;
   int nkrow;
   int32_t *kindex;              // open addressing over the descriptor's address -> row
+  // TINYNV_KEEPALIVE: a lent kernel keeps the engine scheduled across a synchronisation. The flag it polls lives in
+  // ka_flag (host memory); armed (flag 0, pending) before the launch, released (flag 1) at the next chain's hand-over or
+  // at any wait, whichever comes first. See tinynv_exec_keepalive_arm/release and tinynv_stream_sync in tinynv.c.
+  int keepalive;                // asked for (TINYNV_KEEPALIVE)
+  unsigned keepalive_us;        // TINYNV_KEEPALIVE_US: the spin's ceiling, the watchdog
+  tinynv_vmap_t ka_flag;
+  int ka_pending;
+  uint64_t ka_launched, ka_released_chain, ka_released_wait;
   // The engine's own clock across a synchronisation: how long it sat idle between finishing one batch and starting the
   // next. Host profiling cannot see this - the host is busy building at the time - and it is where the residual against
   // the vendor driver has to be hiding.
@@ -431,6 +439,13 @@ int tinynv_exec_download_sync_first(const char *e);
 // TINYNV_KERNEL_PROFILE and TINYNV_KERNEL_PROFILE_SKIP, resolved where test_exec_mode can drive them: off unless
 // asked, and four windows not counted unless asked.
 int tinynv_exec_kernel_profile(const char *e);
+// TINYNV_KEEPALIVE and TINYNV_KEEPALIVE_US: off unless asked; 2,000 us of spin at most unless asked.
+int tinynv_exec_keepalive(const char *e);
+unsigned tinynv_exec_keepalive_us(const char *e);
+// Arm the keep-alive (flag to 0, pending) and say where the flag is; release it (flag to 1). Release is called at
+// every wait and at every caller chain's hand-over, and is free when nothing is pending.
+int tinynv_exec_keepalive_arm(tinynv_exec_t *ex, uint64_t *flag_va);
+void tinynv_exec_keepalive_release(tinynv_exec_t *ex, int by_wait);
 int tinynv_exec_kernel_profile_skip(const char *e);
 // A kernel's mangled name reduced to what a reader wants: the function and its literal template arguments,
 // "mul_mat_vec_q<(ggml_type)12, 1, 1>" for what nvcc emits. Anything it cannot read is "...". Returns out.
