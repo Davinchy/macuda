@@ -26,7 +26,19 @@
 #include "class/cl00de.h"
 #include "ctrl/ctrl2080/ctrl2080internal.h"
 #include "ctrl/ctrla06c.h"
+#include "kernel/gpu/gsp/gsp_fw_heap.h"
 #include "nv_structs.h"
+#include "fw_layout.h"
+
+// The firmware heap this driver hands GSP-RM is the vendor's own formula for a 32 GB card, term by term
+// (kernel_gsp.c, _kgspCalculateFwHeapSize): the LIBOS3 bare-metal OS carveout, the Hopper+ base RM size, 96 KB per
+// GB of FB over 32 GB, and 48 KB per channel over 2048 channels. The non-WPR heap is the GB20x HAL's value
+// (g_kernel_gsp_nvoc.h). If either side moves, the build breaks here rather than the firmware placing a bigger region
+// under the manager's feet: these two sizes are what fw_layout.h sizes the reservation from.
+_Static_assert(TINYNV_FW_HEAP_SIZE == GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS3_BAREMETAL + GSP_FW_HEAP_PARAM_BASE_RM_SIZE_GH100 +
+                                          32 * GSP_FW_HEAP_PARAM_SIZE_PER_GB_FB + GSP_FW_HEAP_PARAM_CLIENT_ALLOC_SIZE,
+               "the firmware heap size handed to GSP-RM is no longer the vendor's formula for a 32 GB card");
+_Static_assert(TINYNV_FW_NONWPR_HEAP == 2228224, "the GB20x non-WPR heap is 2,228,224 bytes (g_kernel_gsp_nvoc.h)");
 
 // ours against theirs: the same number of bytes, and every field we touch in the same place
 #define SAME_SIZE(mine, theirs) _Static_assert(sizeof(mine) == sizeof(theirs), #mine " is not the size of " #theirs)

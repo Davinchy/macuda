@@ -3,6 +3,7 @@
 #define TINYNV_MMU_H
 #include "dev.h"
 #include "tlsf.h"
+#include "fw_layout.h"
 
 #define TINYNV_BAD_ADDR ((uint64_t)-1)
 
@@ -52,6 +53,13 @@ typedef struct {
   // A second such run, taken after the boot for this driver's own use; see tinynv_mm_reserve_cpu_region.
   uint64_t exec_pool_base, exec_pool_size, exec_pool_next;
 } tinynv_mm_t;
+
+// Does the manager stop below what the firmware owns? Pure arithmetic on the two wpr2 registers (base, exclusive
+// limit, both bytes), so test_mm drives it with synthetic values; tinynv.c reads the registers once the firmware has
+// booted and calls this. Returns 0 when the layout is sound OR when the chip exposes no region (both registers zero:
+// the vendor notes they can be hidden, so an unverified reservation is reported as such, not refused), -1 through
+// tinynv_fail otherwise - nonsense registers included. `line` gets one sentence saying what was found.
+int tinynv_mm_check_fw_carveout(const tinynv_mm_t *mm, uint64_t wpr2_lo, uint64_t wpr2_hi, char *line, size_t n);
 
 // One table in the tree, named by where it is and how far down it sits.
 typedef struct { uint64_t paddr; int lv; } tinynv_pt_t;

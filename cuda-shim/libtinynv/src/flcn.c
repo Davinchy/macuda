@@ -13,6 +13,7 @@
 #include "internal.h"
 #include "nv_regs.h"
 #include "nv_structs.h"
+#include "fw_layout.h"
 #include <string.h>
 #include <time.h>
 
@@ -120,9 +121,10 @@ int tinynv_flcn_init_hw(tinynv_gpu_t *g) {
   memset(&cot, 0, sizeof(cot));
   cot.version = 2;
   cot.size = (uint16_t)sizeof(cot);
-  // the firmware places its own protected region; these say how big it should be and where, counted from the top of vram
-  cot.frtsVidmemOffset = 0x1c00000;
-  cot.frtsVidmemSize = 0x100000;
+  // the firmware places its own protected region; these say how big it should be and where, counted from the top of
+  // vram - named in fw_layout.h beside the reservation they size
+  cot.frtsVidmemOffset = TINYNV_FW_FRTS_FROM_END;
+  cot.frtsVidmemSize = TINYNV_FW_FRTS_SIZE;
   cot.gspBootArgsSysmemOffset = f->boot_args_sysmem;
   cot.gspFmcSysmemOffset = f->fmc_sysmem;
   memcpy(cot.hash384, f->hash, f->hash_len);

@@ -230,6 +230,35 @@ static int device_boot(tinynv_device_t d) {
   if (tinynv_gsp_init_objects(&d->gpu) || tinynv_gsp_init_channel(&d->gpu) || tinynv_gsp_init_gr_context(&d->gpu) ||
       tinynv_gsp_open_client(&d->gpu) || tinynv_gsp_init_queues(&d->gpu))
     return -1;
+
+  // Does the memory manager stop below what the firmware owns? The firmware has placed its write-protected region by
+  // now, so the two registers describe the firmware THIS open booted and not a resident one from an earlier run
+  // (dev.c resets that on arrival, before anything else). The reservation is arithmetic on the sizes we handed over
+  // (fw_layout.h); this is the chip's own word on where they landed, and the open is refused if the two disagree -
+  // the alternative is an allocator that hands out the firmware's heap the first time a model fills the card, which
+  // fails as a garbled RPC hours later with nothing pointing here. Placed outside the recorded boot on purpose:
+  // test_dev drives the gpu and gsp stages directly and ends after the queues, so these two reads never meet the
+  // replay, which would count them as divergences. TINYNV_FW_RESERVE_CHECK=0 downgrades a refusal to the line, for a
+  // diagnostic session that wants to see the numbers and carry on; nothing above the manager's top is safe that run.
+  {
+    uint32_t lo = tinynv_rd32(&d->gpu.dev, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+    uint32_t hi = tinynv_rd32(&d->gpu.dev, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+    // VAL is bits 31:4 and the alignment is 12; HI names the region's last 4 KB page, so its exclusive limit is one
+    // page past it. A hidden region reads zero in both.
+    uint64_t wlo = (uint64_t)(lo >> 4) << 12, whi = hi ? (((uint64_t)(hi >> 4) << 12) + 0x1000) : 0;
+    char line[256];
+    int rc = tinynv_mm_check_fw_carveout(&d->gpu.mm, wlo, whi, line, sizeof line);
+    fprintf(stderr, "libtinynv: firmware carveout: held back %llu MB of %llu MB (the sizes handed to the firmware sum "
+                    "to %llu MB); %s\n",
+            (unsigned long long)(TINYNV_FW_RESERVE_TOP >> 20), (unsigned long long)(d->gpu.dev.vram_size >> 20),
+            (unsigned long long)(TINYNV_FW_CARVEOUT_ESTIMATE >> 20), rc ? tinynv_last_error() : line);
+    if (rc) {
+      const char *e = getenv("TINYNV_FW_RESERVE_CHECK");
+      if (!(e && *e == '0')) return -1;
+      fprintf(stderr, "libtinynv: carrying on anyway (TINYNV_FW_RESERVE_CHECK=0 was asked for): nothing above the "
+                      "manager's top is safe to touch this run\n");
+    }
+  }
   if (tinynv_exec_init(&d->gpu, &d->exec)) return -1;
 
   // Sensors, unless refused. Arming costs one 464-byte host buffer, one object and two controls, all once; after that
@@ -360,7 +389,12 @@ tinynv_status_t tinynv_device_props(tinynv_device_t d, tinynv_device_props_t *p)
   else { p->cc_major = (int)((sm >> 8) & 0xff); p->cc_minor = (int)(lo > 0xf ? lo >> 4 : lo); }
 
   snprintf(p->name, sizeof(p->name), "%s (sm_%d%d)", d->gpu.dev.chip_name, p->cc_major, p->cc_minor);
-  p->total_mem = d->gpu.dev.vram_size;
+  // What the manager can actually hand out, not the size of the chip's memory: the firmware's reservation at the top
+  // and the boot and page-table regions at the bottom are nobody's to allocate. Reporting the chip's figure (as this
+  // did until 2026-09-19) overstated the budget by ~322 MB, which is exactly the kind of number a caller sizing a
+  // model's residency plans against. Free space is still reported as this total (cudart_api.c); that is the next lie
+  // to remove, and it needs a live-bytes counter this manager does not keep yet.
+  p->total_mem = d->gpu.mm.pa.size;
   // The most cores the die could have, not the number this part has enabled: the count of enabled ones is a separate
   // query this driver does not make yet. A caller sizing a grid by it will overshoot, which costs occupancy and not
   // correctness - but it is an upper bound and says so here rather than pretending to be measured.

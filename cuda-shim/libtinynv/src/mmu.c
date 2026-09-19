@@ -85,8 +85,12 @@ int tinynv_mm_init(tinynv_mm_t *mm, tinynv_dev_t *dev) {
   memset(mm, 0, sizeof(*mm));
   mm->dev = dev;
 
-  // the top of video memory is reserved for the firmware's own structures, so the manager never sees it
-  uint64_t managed = dev->vram_size - 64 * MB;
+  // The top of video memory is the firmware's - its write-protected region and the unprotected heap just below it -
+  // so the manager never sees it. Derived from the sizes this driver hands the firmware (fw_layout.h) since
+  // 2026-09-19; the flat 64 MB before that was related to none of them and left the top ~169 MB of this region inside
+  // what the firmware owns, unnoticed only because no run had ever come within that of the top. The boot reads the
+  // wpr2 registers afterwards and refuses the open if this arithmetic turns out short (tinynv_mm_check_fw_carveout).
+  uint64_t managed = dev->vram_size - TINYNV_FW_RESERVE_TOP;
   mm->reserve_ptable = !dev->large_bar;
 
   uint64_t ptable_size = mm->reserve_ptable ? round_up(managed / 512, MB) : 0;
@@ -171,6 +175,38 @@ void tinynv_free_boot_mem(tinynv_mm_t *mm, tinynv_bootmem_t *m) {
   else free(m->addrs);
   memset(m, 0, sizeof(*m));
   m->paddr = TINYNV_BAD_ADDR;
+}
+
+int tinynv_mm_check_fw_carveout(const tinynv_mm_t *mm, uint64_t wpr2_lo, uint64_t wpr2_hi, char *line, size_t n) {
+  const uint64_t vram = mm->dev->vram_size, top = mm->pa.base + mm->pa.size;
+  if (!wpr2_lo && !wpr2_hi) {
+    snprintf(line, n, "chip did not expose wpr2 (registers read 0); reservation unverified this run");
+    return 0;
+  }
+  // Nonsense is refused rather than trusted: a region that is not inside video memory, or nowhere near the size of
+  // the firmware image plus its heap, is a misread register, and a check that quietly passed on garbage would be no
+  // check. The bounds are the image's and the reservation's own.
+  const uint64_t span = wpr2_hi > wpr2_lo ? wpr2_hi - wpr2_lo : 0;
+  if (wpr2_lo >= wpr2_hi || wpr2_hi > vram || span < TINYNV_FW_HEAP_SIZE + TINYNV_FW_IMAGE_BOUND / 2 ||
+      span > TINYNV_FW_RESERVE_TOP)
+    return tinynv_fail("the wpr2 registers read %#llx..%#llx, which is not a %llu-%llu MB region inside %llu MB of "
+                       "video memory - a misread, not a layout",
+                       (unsigned long long)wpr2_lo, (unsigned long long)wpr2_hi,
+                       (unsigned long long)((TINYNV_FW_HEAP_SIZE + TINYNV_FW_IMAGE_BOUND / 2) >> 20),
+                       (unsigned long long)(TINYNV_FW_RESERVE_TOP >> 20), (unsigned long long)(vram >> 20));
+  // The unprotected heap sits just below the region (gsp_fw_wpr_meta.h), and it is the first thing an allocator that
+  // bumps upward would reach: the bound is its bottom, not wpr2's.
+  const uint64_t fw_low = wpr2_lo - TINYNV_FW_NONWPR_HEAP;
+  if (top > fw_low)
+    return tinynv_fail("the manager stops at %#llx but the firmware owns from %#llx (wpr2 %#llx..%#llx with %llu KB "
+                       "of non-wpr heap below it): raise TINYNV_FW_RESERVE_TOP in fw_layout.h",
+                       (unsigned long long)top, (unsigned long long)fw_low, (unsigned long long)wpr2_lo,
+                       (unsigned long long)wpr2_hi, (unsigned long long)(TINYNV_FW_NONWPR_HEAP >> 10));
+  snprintf(line, n, "chip says wpr2 %#llx..%#llx (%.1f MB) with %.1f MB of non-wpr heap below it; the manager stops "
+                    "%.1f MB under that",
+           (unsigned long long)wpr2_lo, (unsigned long long)wpr2_hi, (double)span / (double)MB,
+           (double)TINYNV_FW_NONWPR_HEAP / (double)MB, (double)(fw_low - top) / (double)MB);
+  return 0;
 }
 
 int tinynv_mm_reserve_bar_pool(tinynv_mm_t *mm) {

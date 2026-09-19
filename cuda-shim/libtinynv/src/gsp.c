@@ -1366,6 +1366,12 @@ static int init_gsp_image(tinynv_gpu_t *g) {
   if (tinynv_elf_section(&gsp->gsp_fw, ".fwimage", &image, &image_len)) return -1;
   if (tinynv_elf_section(&gsp->gsp_fw, sig_name, &sig, &sig_len)) return -1;
   gsp->gsp_image_size = image_len;
+  // The reservation at the top of video memory was sized against this image (fw_layout.h): a bigger one is refused
+  // here, where the message can say why, rather than placed under the manager's feet.
+  if (image_len > TINYNV_FW_IMAGE_BOUND)
+    return tinynv_fail("the GSP-RM image is %zu bytes, past the %llu MB the firmware reservation was sized for - raise "
+                       "TINYNV_FW_IMAGE_BOUND and the reservation with it (fw_layout.h)",
+                       image_len, (unsigned long long)(TINYNV_FW_IMAGE_BOUND >> 20));
 
   size_t npages[4], offsets[4] = {0, 0, 0, 0};
   npages[3] = round_up(image_len, PAGE) / PAGE;
@@ -1398,6 +1404,9 @@ static int init_boot_binary_image(tinynv_gpu_t *g) {
     return tinynv_fail("the riscv bootloader's header points outside the file");
   memcpy(&gsp->bl_desc, gsp->bl_fw.data + h.header_offset, sizeof(gsp->bl_desc));
   gsp->bootloader_size = h.data_size;
+  if (h.data_size > TINYNV_FW_BOOTBIN_BOUND)   // same reason as the image bound above
+    return tinynv_fail("the riscv bootloader is %u bytes, past the %llu MB the firmware reservation was sized for "
+                       "(fw_layout.h)", h.data_size, (unsigned long long)(TINYNV_FW_BOOTBIN_BOUND >> 20));
   return tinynv_alloc_boot_mem(&g->mm, h.data_size, gsp->bl_fw.data + h.data_offset, -1, &gsp->bootloader);
 }
 
@@ -1422,12 +1431,14 @@ static int init_wpr_meta(tinynv_gpu_t *g) {
   m.bootloaderManifestOffset = gsp->bl_desc.manifestOffset;
 
   if (!g->dev.fmc_boot) return tinynv_fail("the vbios boot path does not build this structure the same way");
-  // on the chain-of-trust path the firmware places its own carveout, so these are sizes and not offsets
-  m.vgaWorkspaceSize = 0x20000;
-  m.pmuReservedSize = 0x1820000;
-  m.nonWprHeapSize = 0x220000;
-  m.gspFwHeapSize = 0x8700000;
-  m.frtsSize = 0x100000;
+  // on the chain-of-trust path the firmware places its own carveout, so these are sizes and not offsets. They are
+  // named in fw_layout.h, which is also what sizes the reservation the memory manager holds back for them: change one
+  // there and the static assert beside them says whether the reservation still covers it.
+  m.vgaWorkspaceSize = TINYNV_FW_VGA_WORKSPACE;
+  m.pmuReservedSize = TINYNV_FW_PMU_RESERVED;
+  m.nonWprHeapSize = TINYNV_FW_NONWPR_HEAP;
+  m.gspFwHeapSize = TINYNV_FW_HEAP_SIZE;
+  m.frtsSize = TINYNV_FW_FRTS_SIZE;
 
   if (tinynv_alloc_boot_mem(&g->mm, sizeof(m), &m, -1, &gsp->wpr_meta)) return -1;
   gsp->wpr_meta_sysmem = gsp->wpr_meta.addrs[0];

@@ -113,6 +113,14 @@ int main(int argc, char **argv) {
            (unsigned long long)(g.mm.boot.size >> 20), (unsigned long long)(g.mm.ptable.size >> 20),
            (unsigned long long)g.mm.ptable.base, (unsigned long long)(g.mm.pa.size >> 20),
            (unsigned long long)g.mm.pa.base, (unsigned long long)g.mm.root_page_table);
+    // The firmware's reservation (fw_layout.h) against the recorded card's 32,607 MB: the manager must stop exactly
+    // there, and the page-table reservation - and so every recorded address - must not have moved because of it.
+    CHECK(g.mm.pa.base == 0x4200000ull, "the video-memory region starts at %#llx, not 0x4200000, so the reservation "
+          "moved the page tables and the replay below cannot match", (unsigned long long)g.mm.pa.base);
+    CHECK(g.mm.pa.base + g.mm.pa.size == g.dev.vram_size - TINYNV_FW_RESERVE_TOP,
+          "the manager stops at %#llx, not %llu MB under the top of %llu MB",
+          (unsigned long long)(g.mm.pa.base + g.mm.pa.size), (unsigned long long)(TINYNV_FW_RESERVE_TOP >> 20),
+          (unsigned long long)(g.dev.vram_size >> 20));
   }
 
   // Without firmware this test can only reach bring-up: 12 operations against the 456,618 a whole boot records,

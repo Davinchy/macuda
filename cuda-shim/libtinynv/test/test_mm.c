@@ -241,6 +241,40 @@ int main(int argc, char **argv) {
   printf("video memory %llu GB, page tables reserved at %#llx, root table at %#llx\n",
          (unsigned long long)(VRAM >> 30), (unsigned long long)mm.ptable.base, (unsigned long long)mm.root_page_table);
 
+  // The firmware's reservation at the top, derived from the sizes handed to the firmware (fw_layout.h) since
+  // 2026-09-19, against a replay-invariance guard: on a 32 GB card the page-table reservation rounds to the same 64 MB
+  // for any hold-back under 351 MB, so pa.base must not move - every address the recorded boot depends on follows
+  // from it - and pa.size must end exactly at the reservation.
+  CHECK(mm.pa.base == 0x4200000ull, "the video-memory region starts at %#llx, not 0x4200000: the reservation moved the "
+        "page-table size and every recorded address with it", (unsigned long long)mm.pa.base);
+  CHECK(mm.pa.base + mm.pa.size == VRAM - TINYNV_FW_RESERVE_TOP, "the manager stops at %#llx, not %llu MB under the "
+        "top", (unsigned long long)(mm.pa.base + mm.pa.size), (unsigned long long)(TINYNV_FW_RESERVE_TOP >> 20));
+  // And the check the boot makes against the chip's wpr2 registers, driven with synthetic values: the layout this
+  // card is expected to show, an overlap, hidden registers, two misreads, and the exact boundary from both sides.
+  {
+    const uint64_t M = 1ull << 20, V = VRAM, top = mm.pa.base + mm.pa.size;
+    char line[256];
+    CHECK(tinynv_mm_check_fw_carveout(&mm, V - 225 * M, V - 22 * M, line, sizeof line) == 0,
+          "a 203 MB wpr2 starting 225 MB below the top was refused: %s", tinynv_last_error());
+    CHECK(strstr(line, "the manager stops") != NULL, "the sound case did not describe itself: %s", line);
+    CHECK(tinynv_mm_check_fw_carveout(&mm, V - 300 * M, V - 97 * M, line, sizeof line) != 0,
+          "a wpr2 starting 300 MB below the top - 44 MB inside the manager - was accepted");
+    CHECK(strstr(tinynv_last_error(), "raise TINYNV_FW_RESERVE_TOP") != NULL,
+          "the refusal does not say what to do about it: %s", tinynv_last_error());
+    CHECK(tinynv_mm_check_fw_carveout(&mm, 0, 0, line, sizeof line) == 0 && strstr(line, "unverified") != NULL,
+          "hidden registers (0, 0) should read as unverified, not as a refusal or a pass: %s", line);
+    CHECK(tinynv_mm_check_fw_carveout(&mm, V - 30 * M, V - 25 * M, line, sizeof line) != 0, "a 5 MB 'wpr2' was believed");
+    CHECK(tinynv_mm_check_fw_carveout(&mm, V - 900 * M, V, line, sizeof line) != 0, "a 900 MB 'wpr2' was believed");
+    CHECK(tinynv_mm_check_fw_carveout(&mm, V - 225 * M, V + 10 * M, line, sizeof line) != 0,
+          "a wpr2 past the end of video memory was believed");
+    CHECK(tinynv_mm_check_fw_carveout(&mm, top + TINYNV_FW_NONWPR_HEAP, top + TINYNV_FW_NONWPR_HEAP + 200 * M, line,
+                                      sizeof line) == 0,
+          "a non-wpr heap ending exactly at the manager's top should pass: %s", tinynv_last_error());
+    CHECK(tinynv_mm_check_fw_carveout(&mm, top + TINYNV_FW_NONWPR_HEAP - 0x1000, top + TINYNV_FW_NONWPR_HEAP + 200 * M,
+                                      line, sizeof line) != 0,
+          "a non-wpr heap reaching one page into the manager's range was accepted");
+  }
+
   // Round sizes first, which is all the recorded boot ever asked for, so a failure here would mean something much worse.
   const uint64_t round[] = {4096, 64 << 10, 1 << 20, 2 << 20, 8 << 20, 32 << 20};
   for (size_t i = 0; i < sizeof(round) / sizeof(*round); i++) take(round[i]);

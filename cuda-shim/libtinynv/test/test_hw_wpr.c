@@ -1,8 +1,14 @@
 // Does this driver's memory manager overlap the firmware's write-protected region? Asked, not computed.
 //
-// mmu.c:88 holds back a flat 64 MB: `managed = dev->vram_size - 64 * MB`, with the comment "the top of video memory is
+// Since 2026-09-19 the manager holds back TINYNV_FW_RESERVE_TOP (fw_layout.h), derived from the sizes handed to the
+// firmware, and the boot itself reads the two registers below and refuses the open on an overlap (tinynv.c,
+// tinynv_mm_check_fw_carveout). This probe is the read-only measurement that came first and stays the record: run it
+// after any change to those sizes and write its numbers into libtinynv-design.md SS4f-ter. What follows is the
+// arithmetic as it stood when the 64 MB was flat, kept because it is why the probe exists.
+//
+// mmu.c held back a flat 64 MB: `managed = dev->vram_size - 64 * MB`, with the comment "the top of video memory is
 // reserved for the firmware's own structures, so the manager never sees it". But the sizes this driver HANDS the
-// firmware in the WPR metadata (gsp.c:1365-1369) add up to considerably more than that:
+// firmware in the WPR metadata (gsp.c) add up to considerably more than that:
 //
 //     vgaWorkspace     0.1 MB
 //     pmuReserved     24.1 MB
@@ -26,6 +32,7 @@
 // raising it walks the firmware's region further into memory the manager is already handing out - so this has to be
 // answered BEFORE the heap is touched, not after.
 #include "tinynv.h"
+#include "fw_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -61,11 +68,13 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (base >= managed_end) {
-    printf("  NO OVERLAP: the firmware's region starts at or above where the manager stops, with %.1f MB of gap.\n"
-           "  The 64 MB held back is sufficient TODAY. It is still not derived from the sizes handed to the\n"
-           "  firmware, so raising gspFwHeapSize without raising the reservation would close this gap silently.\n",
-           (base - managed_end) / MB);
-    return 0;
+    printf("  NO OVERLAP: the firmware's region starts at or above where the manager stops, with %.1f MB of gap\n"
+           "  (%.1f MB of it is the firmware's unprotected non-wpr heap, which sits just below wpr2). The %llu MB held\n"
+           "  back is derived from the sizes handed to the firmware (fw_layout.h) and the boot checks it against these\n"
+           "  registers, so raising gspFwHeapSize without raising the reservation now fails the build, not the card.\n",
+           (base - managed_end) / MB, (double)TINYNV_FW_NONWPR_HEAP / MB,
+           (unsigned long long)(TINYNV_FW_RESERVE_TOP >> 20));
+    return base - managed_end >= TINYNV_FW_NONWPR_HEAP ? 0 : 1;
   }
   printf("  OVERLAP: the manager hands out addresses up to %#llx and the firmware's region starts at %#llx, so\n"
          "  %.1f MB of what this driver believes it owns is inside the write-protected region. Nothing has broken\n"
