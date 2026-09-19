@@ -502,10 +502,52 @@ qwen35moe, 18.2 GiB of experts).
 bottleneck — it's the weight stream, not activations); using the idle card for an unrelated side-task in
 parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever found yet).
 
+## Window 4, 2026-09-19 11:30-11:34 — the derived cost model, run on THIS tree's driver with residency
+
+**What changed first (`11cf4c6`, card-free, item 1 below done):** the router's card cost is no longer one number for
+one model. `expert_layout()` reads a GGUF's header (key/value table and tensor directory, never a weight) and sums the
+`blk.N.ffn_*_exps` tensors per block; `--model` and `--ncpumoe` derive the fixed cost per ubatch as streamed expert GiB
+over `--link-rate` (5.46 GiB/s, windows 2 and 3), and the first card prefill after a start is charged streamed GiB x
+`--cold-rate` (0.0465 s/GiB, three points across two models). Learning keeps the first prefill out of the warm fit
+and re-expresses a fit as link rate and cold rate, so a change of residency carries the calibration.
+`tools/disagg-router-model-test.py` holds the derived model against all six recorded prefills of windows 2 and 3 -
+every one within 0.1 s - and corrected the record on the way: **Coder-Next's experts are 43.69 GiB by the file's own
+directory** (the "43.7" the link rate was derived from); the 43.50 in these notes was a hand estimate.
+
+**Why this run could happen here at all:** residency on this tree's driver was blocked on the flat 64 MB firmware
+reservation (README's second known limit). `30751d1` (same morning) derived it (256 MB from the sizes handed to the
+firmware, checked against the chip's WPR2 registers at every open); the card server's startup line in the banked log
+reads `firmware carveout: held back 256 MB of 32607 MB ... the manager stops 29.0 MB under that`.
+
+**The run.** Coder-Next, `NCPUMOE=30 THRESH=0`, card `llama-server-null` at driver `0c15edc`, Metal the kit's server,
+router `11cf4c6`. Registered before any request: warm fixed 4.98 s per ubatch, first prefill +1.26 s, marginal 5,150
+tok/s; prompt A (first) 10.3 s +-10%, the 6K chat 6.2 s +-10%, prompt B 9.4 s +-10%. Metal decoded every reply from
+the restored cache (`prompt_n 1`).
+
+| req | cold tokens | predicted prefill (prompt only) | observed | save |
+|---|---|---|---|---|
+| t1 = prompt A, first after start | 20,454 | 9.0 warm + 1.3 first = **10.3 s** | **10.2 s** (2011 tok/s) | 582 MB / 0.6 s |
+| t2 = chat-6k | 6,974 | 4.98 + 1.35 = **6.3 s** | **5.7 s** (1234 tok/s) | 251 MB / 0.3 s |
+| t3 = prompt B | 21,942 | 4.98 + 4.26 = **9.2 s** | **9.0 s** (2438 tok/s) | 619 MB / 0.7 s |
+
+All three inside the registered bands; the first-prefill term landed to 0.1 s (the router's own line: "+1.2 s over
+the warm model's 9.0 s; the model's own first-prefill term was 1.3 s"). The two warm points fit themselves to
+4.16 s + 4,536 tok/s - two points, so a description and not a refit (9574c6b's rule) - which reads as this driver
+streaming slightly faster than `ad308bd` did; a third warm point is what would say. The 24K state saves were 0.6-0.7 s
+again (item 5's 2.5 s has now failed to reproduce on three drivers). op-verify 450/450 after; DART absent, dext
+unchanged, lock released. Logs banked as `logs/disagg/serve/w4-20260919-113019-{card,metal,router}.log`.
+
+**Process note:** three `disagg-serve.sh` calls issued from one shell loop with their output piped through a filter
+returned in the same second having sent nothing; the same calls issued singly with their output unfiltered ran
+normally. Not understood, not chased (the harness's own python heredoc and a pipeline in the same shell line are the
+suspects); issue the requests one at a time and read them raw.
+
 ## What is next, after window 3
 
-1. **The router's cost model should be two numbers, not one, and parameterized by expert GiB, not hard-coded per
-   model.** Window 3 confirms both halves: the warm fixed cost is well predicted by expert GiB / link bandwidth
+1. **DONE, 2026-09-19 (`11cf4c6`, window 4 above): the router's cost model is two numbers parameterized by expert GiB
+   and residency, and it predicted a fresh window on a new driver to within 3% on the long prompts.** (As written before:)
+   The router's cost model should be two numbers, not one, and parameterized by expert GiB, not hard-coded per
+   model. Window 3 confirms both halves: the warm fixed cost is well predicted by expert GiB / link bandwidth
    (5.46 GiB/s, carried over from window 2 unchanged) across a different architecture and driver, and a first
    prefill after a server start pays an extra cost that itself scales with expert GiB (~0.046-0.048 s/GiB across
    three points now). Wiring both into `tools/disagg-router.py` — `card_fixed = experts_GiB / link_rate`,
