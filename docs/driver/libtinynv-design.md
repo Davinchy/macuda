@@ -1077,6 +1077,24 @@ three depths, both greedy texts byte-identical, SDXL Turbo / SD 1.5 / Z-Image PN
 times (image generation is indifferent to both), a five-minute MTP soak clean. The logits download served by the
 compute engine instead of the copy engine measured nothing and stays a knob.
 
+### 4i. The per-kernel profile, and where the MoE's time actually is (2026-09-19 14:11-14:22)
+
+`TINYNV_KERNEL_PROFILE=1` (`f562d0b`..`8843e12`): every descriptor releases a four-word report - its timeline
+value, then the engine's clock - into a ring slot of its own in host memory; the chain's tail is stamped by a
+command-stream release with wait-for-idle into its slot instead, so nothing rests on a descriptor's second release
+slot. Slots are read in order once the timeline has passed them and the interval between stamps goes to the later
+kernel: its execution plus the dispatch gap before it, which a completion stamp cannot separate. The token boundary
+(any wait that returned with the compute queue retired) is kept apart, the first four windows are not counted, and
+the report lists kernels by instantiation and merged, the chain-seam total, the long intervals and the eight
+longest. Both greedy texts byte-identical under it; zero stamps missing over 107 windows; cost ~6% MoE / ~3% dense
+(the payload changes every token, ~4.6 KB a flush more for the delta path).
+
+What it found (`docs/driver/moe-next-steps.md` section 8): the MoE's kernels run at native speed - 2.45 us a launch
+inside a chain, the in-chain time of a token about native's whole token - and the loss is the engine idle at chain
+seams (1.85 ms a window) and at the boundary (1.24 ms), because the host builds a launch in 4.1 us (2.38 in
+ggml-cuda/llama.cpp, 1.75 in `tinynv_launch`) against the engine's 2.45. The dense is kernel-bound at 1.27 TB/s
+effective. The chain-replay study's host figure of ~1.05 us a launch was the driver's share alone.
+
 ## 5. What this needs from the humans
 
 - **The 3090's DMA is untranslated, so no kernel parameter change is needed** (Session A's finding #4, settled 2026-09-13):

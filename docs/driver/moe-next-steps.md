@@ -94,3 +94,33 @@ afternoon. Then B, because after A every remaining microsecond is inside kernel 
 accepting the ~1 µs gap as the floor) needs the per-kernel list rather than another inference. D in parallel whenever
 the card is free: it changes what a user of the MoE sees today. Absolute levels only compare within the same minutes
 on this host (the same code paths read 16% apart today under different host load); every A/B stays interleaved.
+
+## 8. B measured (2026-09-19 14:11-14:22, `f562d0b`..`35f17de`): the MoE is host-bound
+
+`TINYNV_KERNEL_PROFILE=1` stamps every descriptor's completion with the engine's clock into a ring slot of its own
+(the chain's tail from the command stream), reads the slots once the timeline has passed them, and attributes each
+interval to the kernel that ended it. Both greedy texts stay byte-identical under it; zero stamps were missing over
+107 windows. Per window on the MoE (~1.16 windows a token in `llama-simple`): 1,476 launches, 5.4 ms in kernels of
+which **1.85 ms is the chain's first intervals** (10.4 chains: the engine finished the chain and waited for the
+host's next one), 1.24 ms at the token boundary; the mean interval inside a chain is **2.45 us** including the
+dispatch gap, so a window's in-chain time (~3.6 ms, ~4.1 ms a token) is about native's whole token. The host side
+of the same run (`TINYNV_LAUNCH_PROFILE`, `TINYCUDART_STATS`): **4.1 us a launch** - 2.38 between consecutive launches
+in ggml-cuda/llama.cpp, 1.75 inside `tinynv_launch` (1.29 of it the driver's build). The dense 27B is the opposite
+case: 12.0 ms of its 15.4 ms token is kernels (mul_mat_vec_q 76%, 1.27 TB/s effective), seams 0.48 ms, boundary
+1.3 ms.
+
+**So the ranking changes.** The unattributed 1.4 ms of section 1 was never in the kernels: it is the engine idle
+at chain seams because the host cannot build launches as fast as the engine retires them, plus the boundary. The
+levers, in order of what they buy the MoE:
+
+- **B'. A CUDA-graph subset in the runtime layer** (capture records kernel, parameters, shape; replay re-issues to
+  the driver): removes ggml's 2.38 us a launch, host to ~1.75 us, under the engine's 2.45 - the seams close and the
+  boundary's graph-build share goes with them. Estimated 6.6 -> ~4.5-4.8 ms a window (+35-45%). What ggml needs:
+  begin/end capture, instantiate, launch, exec update, kernel-node get/set params; capture boundaries are ggml's
+  own (`ggml_cuda_graph` re-captures on topology change, updates copy-kernel pointers per token). The engine-side
+  replay the chain-replay study declined is not this: the driver still builds every descriptor.
+- **The driver's own 1.29 us** (0.62 build + 0.65 flush share a launch): a second lever of up to ~0.5 us; the
+  per-kernel spread (rope_multi 8.5 us, k_bin_bcast 3.6, quantize 0.9) says the parameter path is part of it.
+- **C, fusion** (fewer launches) helps both sides proportionally and stays worth doing.
+- **D, speculative decoding**: unchanged, the visible win with no code.
+- The Windows Nsight capture (B's second half) now only refines the per-kernel comparison.

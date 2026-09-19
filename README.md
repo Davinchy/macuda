@@ -223,11 +223,11 @@ models/  logs/                not committed; see models/README.md
 
 ## Known limits and hazards
 
-- **MoE decode is at ~60-68% of native** (host-load dependent) and dense decode at ~95% (2026-09-19 defaults). Every per-launch
-  choice at the descriptor and delivery layer has now been measured (`docs/driver/libtinynv-design.md` §4f, §4h; the chain-replay
-  study and `docs/driver/moe-next-steps.md`): the copy engine is out of the decode loop, chain depth 128 is the optimum, the
-  remaining barrier and invalidates are load-bearing or free. What remains is inside kernel-executing time and the ~1 µs
-  inter-kernel dispatch gap; the ranked options for the MoE are in `moe-next-steps.md`.
+- **MoE decode is at ~60-68% of native** (host-load dependent) and dense decode at ~95% (2026-09-19 defaults). A per-kernel
+  profile from the card's own clock (`TINYNV_KERNEL_PROFILE`, design doc §4i) shows the MoE's kernels running at native speed
+  and the loss being the engine idle at chain seams and token boundaries: the host builds a launch in ~4.1 µs (2.4 of it in
+  ggml-cuda/llama.cpp above the runtime layer) against the engine's ~2.45 µs, so the engine drains between chains. The MoE is
+  host-bound; the dense is kernel-bound at ~1.27 TB/s effective. The ranked options are in `docs/driver/moe-next-steps.md` §8.
 - **The firmware's reservation is derived and checked (closed 2026-09-19).** The driver holds back 256 MB at the top of VRAM, sized
   from the sizes it hands the firmware (`libtinynv/src/fw_layout.h`, static-asserted against their sum), and at every open reads the
   chip's WPR2 registers and refuses to start if the manager's top is above the firmware's region. Measured on this card: WPR2 spans
