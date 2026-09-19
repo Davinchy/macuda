@@ -345,7 +345,13 @@ typedef struct {
   int kboundary_pending;        // a wait returned with the compute queue fully retired: the next launch is a boundary
   uint64_t kwindows;            // host waits that retired stamped work; the first kprof_skip are not counted
   uint64_t kstamped, kmissing, klost, kskipped, kbackwards;
-  uint64_t kboundary_ns, kboundary_n, kfirst_n, kattr_ns, kattr_n, kunnamed_ns, kunnamed_n;
+  uint64_t kboundary_ns, kboundary_n, kfirst_n, kfirst_ns, kattr_ns, kattr_n, kunnamed_ns, kunnamed_n;
+  // Intervals of 50 us and more that are not the boundary: a stall inside a token. Split by whether the launch was
+  // its chain's first (the engine waited for the host to hand the chain over) or not (something inside a chain).
+#define TINYNV_KPROF_LONG_NS 50000ull
+#define TINYNV_KPROF_TOP 8
+  uint64_t klong_n[2], klong_ns[2];
+  struct { uint64_t ns; int32_t row; uint8_t first; } ktop[TINYNV_KPROF_TOP];   // the longest, by length
   tinynv_kprof_row_t *krow;
   int nkrow;
   int32_t *kindex;              // open addressing over the descriptor's address -> row

@@ -182,7 +182,17 @@ static void kprof_harvest(tinynv_exec_t *ex, uint64_t reached, int window_end) {
         else if (s->boundary) { ex->kboundary_ns += dt; ex->kboundary_n++; }
         else {
           ex->kattr_ns += dt; ex->kattr_n++;
-          if (s->first) ex->kfirst_n++;
+          if (s->first) { ex->kfirst_n++; ex->kfirst_ns += dt; }
+          if (dt >= TINYNV_KPROF_LONG_NS) {
+            ex->klong_n[s->first ? 1 : 0]++;
+            ex->klong_ns[s->first ? 1 : 0] += dt;
+            // Kept sorted, longest first; the shortest of the eight falls off.
+            int t = TINYNV_KPROF_TOP - 1;
+            if (dt > ex->ktop[t].ns) {
+              for (; t > 0 && dt > ex->ktop[t - 1].ns; t--) ex->ktop[t] = ex->ktop[t - 1];
+              ex->ktop[t].ns = dt; ex->ktop[t].row = s->row; ex->ktop[t].first = s->first;
+            }
+          }
           if (s->row >= 0) {
             tinynv_kprof_row_t *r = &ex->krow[s->row];
             r->n++; r->ns += dt;
@@ -227,6 +237,15 @@ static void kprof_report(tinynv_exec_t *ex) {
                   "libtinynv:   turnaround and the first kernel; %.2f boundaries a window)\n",
           (double)ex->kstamped / w, (double)ex->kattr_ns / 1e3 / w, (double)ex->kattr_n / w, (double)ex->kfirst_n / w,
           (double)ex->kboundary_ns / 1e3 / w, (double)ex->kboundary_n / w);
+  fprintf(stderr, "libtinynv:   the chain's first intervals total %.1f us a window (the seam: the engine waiting for the host's next "
+                  "chain, plus that kernel);\n"
+                  "libtinynv:   intervals of %llu us and more inside a token: %.2f a window totalling %.1f us at a chain's first launch, "
+                  "%.2f totalling %.1f us inside a chain\n",
+          (double)ex->kfirst_ns / 1e3 / w, (unsigned long long)(TINYNV_KPROF_LONG_NS / 1000), (double)ex->klong_n[1] / w,
+          (double)ex->klong_ns[1] / 1e3 / w, (double)ex->klong_n[0] / w, (double)ex->klong_ns[0] / 1e3 / w);
+  for (int t = 0; t < TINYNV_KPROF_TOP && ex->ktop[t].ns; t++)
+    fprintf(stderr, "libtinynv:   %s%8.1f us  %s%s\n", t ? "                " : "the longest:    ", (double)ex->ktop[t].ns / 1e3,
+            ex->ktop[t].row >= 0 ? ex->krow[ex->ktop[t].row].name : "(unnamed)", ex->ktop[t].first ? "  (a chain's first)" : "");
   int n = ex->nkrow;
   tinynv_kprof_row_t *rows = malloc((size_t)(n ? n : 1) * sizeof(*rows));
   if (!rows) return;
