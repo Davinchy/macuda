@@ -22,6 +22,10 @@ typedef struct tinynv_queue tinynv_queue_t;
 // ringing once costs one read rather than N. tinynv_submit is the two halves back to back, for callers with one batch.
 int tinynv_submit_stage(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, uint32_t dwords);
 int tinynv_submit_ring(tinynv_gpu_t *g);
+// The same announcement in two halves: send the fence read (and remember what it announces), then - later, when the
+// reply has had time to arrive - take it and ring. tinynv_submit_ring is the two back to back.
+int tinynv_submit_ring_send(tinynv_gpu_t *g);
+int tinynv_submit_ring_complete(tinynv_gpu_t *g);
 
 // A batch under construction. The caller owns the storage, because a batch is built into memory the GPU will read.
 typedef struct { uint32_t *words, n, cap; } tinynv_cmdbuf_t;

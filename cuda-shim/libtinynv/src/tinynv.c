@@ -1002,7 +1002,7 @@ tinynv_status_t tinynv_launch(tinynv_stream_t s, tinynv_kernel_t k, unsigned gx,
     return tinynv_fail("launch %s: %u threads per block, the kernel allows %u", d->name, threads, bound), TINYNV_ERR_LAUNCH;
   s->submitted++;
   if (s->dev->has_pci) {
-    NEED_GPU(s);
+    if (!s->dev->booted) NEED_GPU(s);   // the boot check takes the lock; once booted, a flag says so
     tinynv_device_t dev = s->dev;
     pthread_mutex_lock(&g_lock);
     // The module's image goes across once, on the first launch out of it rather than at load: a ggml cubin is megabytes

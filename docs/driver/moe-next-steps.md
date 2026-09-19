@@ -151,3 +151,15 @@ the driver's own 1.74 us a launch** (1.29 building the descriptor and its consta
 lock, checks and info copies): at ~1 us the first chain builds in half the time, the seams close, a short first
 chain starts paying, and the MoE gains an estimated ~10%, the dense a few percent. The CUDA-graph subset in the
 runtime layer would remove ggml's remaining 0.42 us as well, for less than that.
+
+## 11. The last 12% (2026-09-19 16:00-16:20): host levers measured out, the path is a resident-chain replay
+
+The submit's cost was split (announcing = the fence read's round trip, ~25 us a batch) and a token's batches
+counted (13 compute chains + 1 copy; every chain after the first carries 29 dwords: the descriptors are identical
+token to token). Deeper chains after a short first one lost 4% at 512 and did nothing at 256; the fence read
+pipelined (`TINYNV_RING_ASYNC`) cut the host's launch cost 6% and moved nothing. The budget: ~0.4 ms a token of
+engine dispatch gaps (2.45 us a launch against native's 0.14 inside a graph), ~0.4 ms of chain seams, a boundary at
+parity. **Next: B' as a resident-chain replay** - capture at ggml's CUDA-graph boundary (runtime layer), keep the
+token's descriptors resident in the driver, link all chains into one, patch the timeline values and the first
+chain's input uploads, one submission a token. Estimated +15% MoE (parity), +3-4% dense. Needs the ggml-cuda host
+halves rebuilt with `-DGGML_CUDA_USE_GRAPHS` (host-only rebuild via the recovered fatbins).

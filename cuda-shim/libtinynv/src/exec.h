@@ -316,6 +316,10 @@ typedef struct {
   // which meant "no wrap line in the log" read as "no wraps" when it only ever meant "no wrap FAILURE" - the failures
   // are loud and the ordinary case said nothing at all. Counted always; reported at teardown only if it happened.
   uint64_t wraps[2], wrap_wait_ns, seg_waits;
+  uint64_t nsubmit_kind[3];   // launch chains, other compute batches, copy-engine batches (always counted)
+  // The last 128 submissions in order, never trimmed (the trail is): a token's worth, printed under the profile.
+  struct { uint32_t dwords; uint8_t copy, links; } hist[128];
+  uint32_t nhist;
   // Deliver the descriptor region by copy engine instead of by processor stores. The bytes are the whole per-launch
   // cost - 1.5 KB a launch at about 235 MB/s of register-write bandwidth, which is 6.3 us of the 7 - and the engine
   // reads host memory far faster than the processor writes video memory through the window. The mirror is a host
@@ -325,7 +329,7 @@ typedef struct {
   int arena_dma;
   tinynv_vmap_t mirror;
   int profile;
-  uint64_t prof_ns[7], prof_n[7];
+  uint64_t prof_ns[8], prof_n[8];
   // TINYNV_KERNEL_PROFILE: the engine's clock at every kernel's completion, by kernel. Each descriptor releases a
   // four-word report - its timeline value, then the clock - into a slot of its own in `kring`, host memory the engine
   // writes and the processor reads. The chain's tail is stamped by a command-stream release with wait-for-idle into
@@ -358,6 +362,10 @@ typedef struct {
   // TINYNV_KEEPALIVE: a lent kernel keeps the engine scheduled across a synchronisation. The flag it polls lives in
   // ka_flag (host memory); armed (flag 0, pending) before the launch, released (flag 1) at the next chain's hand-over or
   // at any wait, whichever comes first. See tinynv_exec_keepalive_arm/release and tinynv_stream_sync in tinynv.c.
+  // TINYNV_RING_ASYNC: an announcement's fence read is sent with the batch and its reply taken - and the doorbells rung
+  // - sixteen launches into the next chain, or at the next wait or announcement, whichever comes first. The round
+  // trip (~25 us to the server process) then overlaps descriptor building instead of blocking it.
+  int ring_async;
   int keepalive;                // asked for (TINYNV_KEEPALIVE)
   unsigned keepalive_us;        // TINYNV_KEEPALIVE_US: the spin's ceiling, the watchdog
   unsigned keepalive_min_kb;    // TINYNV_KEEPALIVE_MIN_KB: only a download at least this large is a token boundary
@@ -446,6 +454,7 @@ int tinynv_exec_download_sync_first(const char *e);
 // asked, and four windows not counted unless asked.
 int tinynv_exec_kernel_profile(const char *e);
 // TINYNV_KEEPALIVE and TINYNV_KEEPALIVE_US: off unless asked; 2,000 us of spin at most unless asked.
+int tinynv_exec_ring_async(const char *e);
 int tinynv_exec_keepalive(const char *e);
 unsigned tinynv_exec_keepalive_us(const char *e);
 // TINYNV_KEEPALIVE_MIN_KB: the download size from which the keep-alive is launched; 64 unless asked. A decode reads

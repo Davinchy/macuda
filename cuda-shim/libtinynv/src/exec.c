@@ -80,11 +80,12 @@
 // WAIT is every call; BLOCKED is only the ones that actually had to wait for the engine. The difference matters,
 // because a wait that was already satisfied costs nothing and a wait that was not is the GPU and the host taking turns
 // instead of overlapping.
-enum { PROF_LAUNCH, PROF_FLUSH, PROF_PUSH, PROF_SUBMIT, PROF_POLL, PROF_WAIT, PROF_BLOCKED, PROF_N };
-static const char *const PROF_NAME[7] = {"a launch, all of it", "a flush, all of it",
+enum { PROF_LAUNCH, PROF_FLUSH, PROF_PUSH, PROF_SUBMIT, PROF_POLL, PROF_RING, PROF_WAIT, PROF_BLOCKED, PROF_N };
+static const char *const PROF_NAME[8] = {"a launch, all of it", "a flush, all of it",
                                          "  of which pushing the shadow across",
                                          "  of which submitting (ring, pointer, doorbell)",
                                          "  of which asking about faults",
+                                         "  of which announcing (the fence read, the doorbells)",
                                          "waiting at a synchronisation, every call",
                                          "  of which actually stood still for the engine"};
 #define PROF_START(ex) double prof_t0_ = (ex)->profile ? now() : 0.0
@@ -965,10 +966,20 @@ static int submit_batch(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c
     // Deferred, this writes the ring entry and the pointer and stops. The next batch out calls tinynv_submit, whose
     // ring half announces everything staged - so the pair costs one round trip instead of two. Never deferred
     // synchronously: submit_batch waits at the end of this function, and waiting on a batch nobody has rung is a hang.
-    int rc = (ex->defer_ring && !ex->sync) ? tinynv_submit_stage(ex->g, q, cmdbuf_va, c->n)
-                                           : tinynv_submit(ex->g, q, cmdbuf_va, c->n);
+    // Staged (the ring entry and the write pointer, posted writes) and announced (one read as the fence, then the
+    // doorbells) are timed apart: the read is a round trip to the server process and the writes are not.
+    int rc = tinynv_submit_stage(ex->g, q, cmdbuf_va, c->n);
     PROF_END(ex, PROF_SUBMIT);
-    if (rc) return -1; }
+    if (rc) return -1;
+    if (!(ex->defer_ring && !ex->sync)) {
+      PROF_START(ex);
+      rc = ex->ring_async ? tinynv_submit_ring_send(ex->g) : tinynv_submit_ring(ex->g);
+      PROF_END(ex, PROF_RING);
+      if (rc) return -1;
+    } }
+  ex->nsubmit_kind[q == &ex->g->gsp.copy_q ? 2 : links ? 0 : 1]++;
+  ex->hist[ex->nhist % 128].dwords = c->n; ex->hist[ex->nhist % 128].copy = q == &ex->g->gsp.copy_q;
+  ex->hist[ex->nhist % 128].links = (uint8_t)(links > 255 ? 255 : links); ex->nhist++;
   // The highest value handed over, not the most recent one. With the descriptor delivery submitting a copy that takes
   // a number after the chain's, the compute batch is submitted with a LOWER value than the copy that preceded it, and
   // a timeline that took the latest would step backwards - under-waiting at the next idle, which is a wrap handing out
@@ -1963,6 +1974,15 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   ex->chain[ex->nchain].kslot = kslot_i;
   ex->nchain++;
   if (!ex->internal_work) ex->launches_since_ka++;
+  // TINYNV_RING_ASYNC: the previous chain's announcement is completed here, sixteen launches in, by which time its
+  // fence read's reply has arrived; the doorbell is then at most ~30 us later than a blocking announcement would
+  // have rung it, and the host spent those microseconds building rather than waiting.
+  if (ex->ring_async && ex->nchain == 16 && ex->g->ring_pending) {
+    PROF_START(ex);
+    int rc = tinynv_submit_ring_complete(ex->g);
+    PROF_END(ex, PROF_RING);
+    if (rc) return -1;
+  }
   ex->reserved = at;
 
   // Asking the firmware whether anything faulted happens at the flush, not here. It is two reads across the link every
@@ -1999,6 +2019,8 @@ int tinynv_exec_kernel_profile(const char *e) { return e && *e && *e != '0'; }
 
 // TINYNV_KEEPALIVE: off unless asked, until it has been measured on both decodes and soaked; TINYNV_KEEPALIVE_US is the
 // spin's ceiling (the watchdog), 2,000 us unless asked, never under 50 or over 20,000.
+// TINYNV_RING_ASYNC: off until measured on both decodes and soaked.
+int tinynv_exec_ring_async(const char *e) { return e && *e && *e != '0'; }
 int tinynv_exec_keepalive(const char *e) { return e && *e && *e != '0'; }
 unsigned tinynv_exec_keepalive_us(const char *e) {
   if (!e || !*e) return 2000;
@@ -2315,6 +2337,10 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   { const char *e4 = getenv("TINYNV_NO_CHAIN_DEPS"); ex->no_chain_deps = e4 && *e4 && *e4 != '0'; }
   { const char *e5 = getenv("TINYNV_LAUNCH_PROFILE"); ex->profile = e5 && *e5 && *e5 != '0'; }
   ex->kprof = tinynv_exec_kernel_profile(getenv("TINYNV_KERNEL_PROFILE"));
+  ex->ring_async = tinynv_exec_ring_async(getenv("TINYNV_RING_ASYNC"));
+  if (ex->ring_async)
+    fprintf(stderr, "libtinynv: announcements are pipelined (TINYNV_RING_ASYNC was asked for): the fence read is sent with the "
+                    "batch and the doorbell rung sixteen launches into the next chain\n");
   ex->keepalive = tinynv_exec_keepalive(getenv("TINYNV_KEEPALIVE"));
   ex->keepalive_us = tinynv_exec_keepalive_us(getenv("TINYNV_KEEPALIVE_US"));
   ex->keepalive_min_kb = tinynv_exec_keepalive_min_kb(getenv("TINYNV_KEEPALIVE_MIN_KB"));
@@ -2485,6 +2511,21 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
   // A keep-alive still spinning is let go and waited for here: the caller's idle before this deliberately ignored it.
   if (ex->ka_pending) { tinynv_exec_keepalive_release(ex, 1); tinynv_exec_wait(ex, ex->ka_value, 2.0); }
   if (ex->kprof_on) { kprof_harvest(ex, ~0ull, 2); kprof_report(ex); }
+  // Under the profile, the trail's last 128 submissions in order: a token's worth of batches by queue, size and links,
+  // which is the only place the batch count a token pays can be read off directly.
+  if (ex->profile && ex->nhist) {
+    uint32_t n = ex->nhist < 128 ? ex->nhist : 128, start = ex->nhist < 128 ? 0 : ex->nhist % 128;
+    fprintf(stderr, "libtinynv: the last %u submissions in order (queue:dwords/links) -", n);
+    for (uint32_t i = 0; i < n; i++) {
+      uint32_t k = (start + i) % 128;
+      fprintf(stderr, "%s%s:%u/%u", i % 16 ? " " : "\nlibtinynv:   ", ex->hist[k].copy ? "copy" : "comp", ex->hist[k].dwords, ex->hist[k].links);
+    }
+    fprintf(stderr, "\n");
+  }
+  if (ex->nsubmit)
+    fprintf(stderr, "libtinynv: %llu batches submitted: %llu launch chains, %llu other compute batches, %llu copy-engine batches\n",
+            (unsigned long long)ex->nsubmit, (unsigned long long)ex->nsubmit_kind[0], (unsigned long long)ex->nsubmit_kind[1],
+            (unsigned long long)ex->nsubmit_kind[2]);
   if (ex->ka_launched)
     fprintf(stderr, "libtinynv: keep-alive launched %llu times after a synchronisation; released %llu by the next chain's "
                     "hand-over, %llu by a wait\n", (unsigned long long)ex->ka_launched,
@@ -2530,7 +2571,7 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
     uint64_t L = ex->prof_n[PROF_LAUNCH];
     fprintf(stderr, "libtinynv: where the processor's time went, per launch, over %llu launches\n",
             (unsigned long long)L);
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i <= PROF_RING; i++)
       fprintf(stderr, "libtinynv:   %-46s %7.2f us  (%llu calls)\n", PROF_NAME[i],
               (double)ex->prof_ns[i] / 1e3 / (double)L, (unsigned long long)ex->prof_n[i]);
     // The two wait lines are per launch like everything above, so they can be added to the others and compared against
@@ -2540,7 +2581,7 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
       fprintf(stderr, "libtinynv:   %-46s %7.2f us  (%llu calls)\n", PROF_NAME[i],
               (double)ex->prof_ns[i] / 1e3 / (double)L, (unsigned long long)ex->prof_n[i]);
     double named = (double)(ex->prof_ns[PROF_FLUSH]);
-    double rest_of_flush = named - (double)(ex->prof_ns[PROF_PUSH] + ex->prof_ns[PROF_SUBMIT] + ex->prof_ns[PROF_POLL]);
+    double rest_of_flush = named - (double)(ex->prof_ns[PROF_PUSH] + ex->prof_ns[PROF_SUBMIT] + ex->prof_ns[PROF_POLL] + ex->prof_ns[PROF_RING]);
     fprintf(stderr, "libtinynv:   %-46s %7.2f us\n", "  of which everything else in a flush",
             rest_of_flush / 1e3 / (double)L);
     fprintf(stderr, "libtinynv:   %-46s %7.2f us\n", "building a launch, outside any flush",

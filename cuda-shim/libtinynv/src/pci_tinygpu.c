@@ -29,6 +29,10 @@ _Static_assert(sizeof(resp_t) == 17, "response is 17 packed bytes");
 
 typedef struct {
   int fd;
+  // A read whose request has been sent and whose reply has not been taken. Any other request must first take that
+  // reply (the socket carries one conversation), so rpc() drains it into pending_val and rd32_recv finds it there.
+  int pending, pending_done;
+  uint32_t pending_val;
   int ndma;
   struct { void *va; size_t size; } dma[MAX_DMA];
   uint64_t bar_size[TINYNV_MAX_BARS];
@@ -44,9 +48,26 @@ static int xfer_all(int fd, void *buf, size_t len, int sending) {
   return 0;
 }
 
+// Take the reply of a split read that is still on the socket: the header, an error message if it carries one, and
+// the four bytes read. Kept for rd32_recv, which may be asked for it after other requests have gone by.
+static uint32_t tg_take_pending(tg_t *tg) {
+  resp_t rp;
+  uint32_t v = 0xffffffffu;
+  tg->pending = 0;
+  if (xfer_all(tg->fd, &rp, sizeof(rp), 0)) return v;
+  if (rp.status != 0) {
+    char msg[256];
+    size_t n = rp.resp0 < sizeof(msg) ? (size_t)rp.resp0 : sizeof(msg);
+    if (n) xfer_all(tg->fd, msg, n, 0);
+    return v;
+  }
+  xfer_all(tg->fd, &v, 4, 0);
+  return v;
+}
 // one request, one reply. payload is appended to the request; readout is the bulk data that follows the reply.
 static int rpc(tg_t *tg, resp_t *rp, uint8_t cmd, uint32_t bar, uint64_t a0, uint64_t a1, uint64_t a2,
                const void *payload, size_t payload_len, void *readout, size_t readout_len, int *fd_out) {
+  if (tg->pending) { tg->pending_val = tg_take_pending(tg); tg->pending_done = 1; }
   req_t rq = {.cmd = cmd, .dev_id = 0, .bar = bar, .arg0 = a0, .arg1 = a1, .arg2 = a2};
   if (xfer_all(tg->fd, &rq, sizeof(rq), 1)) return -1;
   if (payload_len && xfer_all(tg->fd, (void *)payload, payload_len, 1)) return -1;
@@ -101,6 +122,23 @@ static uint32_t tg_rd32(tinynv_mmio_t *m, uint64_t off) {
   rpc(m->ctx, &rp, CMD_MMIO_READ, (uint32_t)m->bar, m->off + off, 4, 0, NULL, 0, &v, 4, NULL);
   return v;
 }
+// The split read over the socket: the request goes now and the reply stays on the socket until asked for. Posted
+// writes may go between; another request first drains it (rpc above).
+static int tg_rd32_send(tinynv_mmio_t *m, uint64_t off) {
+  tg_t *tg = m->ctx;
+  if (tg->pending) { tg->pending_val = tg_take_pending(tg); tg->pending_done = 1; }
+  tg->pending_done = 0;
+  req_t rq = {.cmd = CMD_MMIO_READ, .bar = (uint32_t)m->bar, .arg0 = m->off + off, .arg1 = 4};
+  if (xfer_all(tg->fd, &rq, sizeof(rq), 1)) return -1;
+  tg->pending = 1;
+  return 0;
+}
+static uint32_t tg_rd32_recv(tinynv_mmio_t *m) {
+  tg_t *tg = m->ctx;
+  if (tg->pending_done) { tg->pending_done = 0; return tg->pending_val; }
+  if (tg->pending) return tg_take_pending(tg);
+  return 0xffffffffu;
+}
 static void tg_wr32(tinynv_mmio_t *m, uint64_t off, uint32_t v) {
   tg_t *tg = m->ctx;
   req_t rq = {.cmd = CMD_MMIO_WRITE, .bar = (uint32_t)m->bar, .arg0 = m->off + off, .arg1 = 4};
@@ -124,7 +162,8 @@ static int tg_bar_map(tinynv_pci_t *p, int bar, uint64_t off, uint64_t size, tin
   if (off + size > bar_size) return tinynv_fail("tinygpu: window [%#llx,%#llx) is outside bar %d of %#llx bytes",
                                          (unsigned long long)off, (unsigned long long)(off + size), bar, (unsigned long long)bar_size);
   *out = (tinynv_mmio_t){.ptr = NULL, .ctx = tg, .bar = bar, .off = off, .size = size,
-                         .rd32 = tg_rd32, .wr32 = tg_wr32, .rd_block = tg_rd_block, .wr_block = tg_wr_block};
+                         .rd32 = tg_rd32, .wr32 = tg_wr32, .rd_block = tg_rd_block, .wr_block = tg_wr_block,
+                         .rd32_send = tg_rd32_send, .rd32_recv = tg_rd32_recv};
   return 0;
 }
 

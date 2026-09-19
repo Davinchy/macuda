@@ -22,6 +22,12 @@ struct tinynv_mmio {
   void (*wr32)(tinynv_mmio_t *m, uint64_t off, uint32_t v);
   void (*rd_block)(tinynv_mmio_t *m, uint64_t off, void *dst, size_t n);
   void (*wr_block)(tinynv_mmio_t *m, uint64_t off, const void *src, size_t n);
+  // A read in two halves, optional: send the request now, take the value later, so a fence's round trip can overlap
+  // other work. A backend without them answers at send time (below) and the value waits in async_val.
+  int (*rd32_send)(tinynv_mmio_t *m, uint64_t off);
+  uint32_t (*rd32_recv)(tinynv_mmio_t *m);
+  uint32_t async_val;
+  int async_have;
 };
 
 // Host memory the GPU can read: mapped here, and described to the GPU by its 4 KB page addresses (IOVAs behind an IOMMU).
@@ -61,6 +67,16 @@ static inline uint32_t nv_rd32(tinynv_mmio_t *m, uint64_t off) {
 }
 static inline void nv_wr32(tinynv_mmio_t *m, uint64_t off, uint32_t v) {
   if (m->ptr) m->ptr[off / 4] = v; else m->wr32(m, off, v);
+}
+// The split read: one send, then at most one recv, and never two sends without the recv between them.
+static inline void nv_rd32_send(tinynv_mmio_t *m, uint64_t off) {
+  if (!m->ptr && m->rd32_send) { m->rd32_send(m, off); m->async_have = 0; return; }
+  m->async_val = nv_rd32(m, off);
+  m->async_have = 1;
+}
+static inline uint32_t nv_rd32_recv(tinynv_mmio_t *m) {
+  if (m->async_have) { m->async_have = 0; return m->async_val; }
+  return (!m->ptr && m->rd32_recv) ? m->rd32_recv(m) : 0xffffffffu;
 }
 static inline void nv_rd_block(tinynv_mmio_t *m, uint64_t off, void *dst, size_t n) {
   if (!m->ptr) { m->rd_block(m, off, dst, n); return; }

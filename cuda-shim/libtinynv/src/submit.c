@@ -329,8 +329,10 @@ int tinynv_submit_stage(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, 
   return 0;
 }
 
-int tinynv_submit_ring(tinynv_gpu_t *g) {
+int tinynv_submit_ring_send(tinynv_gpu_t *g) {
   if (!g->nstaged) return 0;
+  // One in flight at a time: the socket carries one conversation, and an announcement owed must be paid first.
+  if (g->ring_pending && tinynv_submit_ring_complete(g)) return -1;
   uint64_t base = g->gsp.fifo_mem.ranges[0].paddr;
 
   // Read a write pointer back before ringing anything, and note which bar each of these is on: the rings and the
@@ -354,7 +356,18 @@ int tinynv_submit_ring(tinynv_gpu_t *g) {
   // not what was just written, this read is not the fence it is being trusted as, and everything reasoned on top of it
   // is wrong. Said once, loudly, rather than assumed for the rest of the session.
   tinynv_queue_t *last = g->staged[g->nstaged - 1];
-  uint32_t want = (uint32_t)(last->put % last->entries), got = nv_rd32(&g->dev.vram, base + last->gpput_off);
+  g->ring_want = (uint32_t)(last->put % last->entries);
+  nv_rd32_send(&g->dev.vram, base + last->gpput_off);
+  for (int i = 0; i < g->nstaged; i++) g->ring_q[i] = g->staged[i];
+  g->ring_n = g->nstaged;
+  g->nstaged = 0;
+  g->ring_pending = 1;
+  return 0;
+}
+
+int tinynv_submit_ring_complete(tinynv_gpu_t *g) {
+  if (!g->ring_pending) return 0;
+  uint32_t want = g->ring_want, got = nv_rd32_recv(&g->dev.vram);
   if (got != want && g->submit_checked < 4) {
     g->submit_checked++;
     fprintf(stderr, "tinynv: the write pointer read back as %u where %u was just written - the read before the doorbell "
@@ -364,10 +377,15 @@ int tinynv_submit_ring(tinynv_gpu_t *g) {
     fprintf(stderr, "tinynv: the write pointer reads back as written, so the read before the doorbell reaches the "
             "device\n");
   }
-
-  for (int i = 0; i < g->nstaged; i++) tinynv_wr32(&g->dev, TINYNV_DOORBELL, g->staged[i]->token);
-  g->nstaged = 0;
+  for (int i = 0; i < g->ring_n; i++) tinynv_wr32(&g->dev, TINYNV_DOORBELL, g->ring_q[i]->token);
+  g->ring_n = 0;
+  g->ring_pending = 0;
   return 0;
+}
+
+int tinynv_submit_ring(tinynv_gpu_t *g) {
+  if (tinynv_submit_ring_send(g)) return -1;
+  return tinynv_submit_ring_complete(g);
 }
 
 int tinynv_submit(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va, uint32_t dwords) {

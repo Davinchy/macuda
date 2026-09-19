@@ -18,6 +18,11 @@ struct tinynv_gpu {
   // Two is what the flush path needs (the descriptor delivery and the chain it feeds); four is room to spare.
   tinynv_queue_t *staged[4];
   int nstaged;
+  // An announcement in flight: the fence read has been sent, the doorbells wait for its reply. At most one, and the
+  // next send or any wait completes it. See tinynv_submit_ring_send / _complete.
+  int ring_pending, ring_n;
+  uint32_t ring_want;
+  tinynv_queue_t *ring_q[4];
   tinynv_flcn_t flcn;
   tinynv_gsp_t gsp;
 };
