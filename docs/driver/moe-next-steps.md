@@ -135,3 +135,19 @@ every text and image byte-identical, op-verify 450/450 x3, a five-minute MTP soa
 shrinks to a small item: the host is now ~2.2 us a launch against the engine's 2.45. What remains on both models is
 the token boundary (~1.2-1.4 ms of engine idle a token: sampling, the ggml graph build and scheduler, the first
 chain) - compare against native's boundary in the Nsight trace - and the driver's own 1.74 us a launch.
+
+## 10. The boundary and the 3090 reference (2026-09-19 15:00-16:30): the lever left is the driver's cost a launch
+
+Native traces on the Pop!_OS 3090 box (Nsight, `logs/native-3090/`): graphs are worth +29% natively on the MoE
+(134.6 -> 174.3 tok/s) because native without graphs is host-bound at ~5 us a launch - the state the shim was in this
+morning; with graphs the gap between kernels inside a token is 0.14 us and the per-token boundary in the bench loop
+~1.1 ms, about ours. Native's dense kernels run at 87% of the 3090's bandwidth; ours at 71% of the 5090's, which is
+what native reaches on a 5090 too. On our side, the host's turnaround after the logits is 161 us, the short first
+chain and the logits download on the compute queue measured nothing again, and a keep-alive kernel that holds the
+engine scheduled across the boundary (`TINYNV_KEEPALIVE`, three attempts to get its semantics right) measured
+nothing once it worked: the engine was never asleep. The boundary is the copy, the host's turnaround and the first
+chain's build, and the seams are the host barely ahead of the engine (2.2 vs 2.45 us a launch). **What is left is
+the driver's own 1.74 us a launch** (1.29 building the descriptor and its constant bank, 0.45 in the API layer's
+lock, checks and info copies): at ~1 us the first chain builds in half the time, the seams close, a short first
+chain starts paying, and the MoE gains an estimated ~10%, the dense a few percent. The CUDA-graph subset in the
+runtime layer would remove ggml's remaining 0.42 us as well, for less than that.

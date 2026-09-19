@@ -638,6 +638,9 @@ tinynv_status_t tinynv_set_keepalive_kernel(tinynv_device_t d, tinynv_kernel_t k
 // because tinynv_launch takes it. Any failure is reported once and the knob is dropped rather than retried per token.
 static void keepalive_launch(tinynv_stream_t s) {
   tinynv_device_t d = s->dev;
+  // Only after a token's worth of the caller's kernels: the small read-backs inside a token synchronise too (the shim
+  // syncs the stream after every synchronous host copy), and those must not each start a spin the next wait pays for.
+  if (d->exec.launches_since_ka < TINYNV_KEEPALIVE_MIN_LAUNCHES) return;
   tinynv_kernel_info_t info;
   uint64_t flag_va = 0;
   if (tinynv_kernel_info(d->keepalive_kernel, &info) != TINYNV_OK || WITH_LOCK(tinynv_exec_keepalive_arm(&d->exec, &flag_va))) {
@@ -653,6 +656,7 @@ static void keepalive_launch(tinynv_stream_t s) {
   tinynv_exec_set_internal(&d->exec, 1);
   tinynv_status_t rc = tinynv_launch(s, d->keepalive_kernel, 1, 1, 1, 32, 1, 1, 0, params, (size_t)info.params[1].offset + 8);
   if (rc == TINYNV_OK && WITH_LOCK(tinynv_exec_flush(&d->exec))) rc = TINYNV_ERR_DRIVER;
+  d->exec.ka_value = d->exec.timeline;   // the keep-alive was the last thing submitted; waits up to here ignore it
   tinynv_exec_set_internal(&d->exec, 0);
   if (rc != TINYNV_OK) {
     fprintf(stderr, "libtinynv: the keep-alive launch failed (%s); it is off from here\n", tinynv_last_error());
@@ -671,9 +675,17 @@ tinynv_status_t tinynv_memcpy_dtoh(tinynv_stream_t s, void *dst, tinynv_devptr_t
     // may well be slower per byte than the copy engine's bursts, so this can trade a ~500-1,100 us handoff for a
     // slower transfer. The raw columns say which in one run - tail->copy-start should collapse, and copy-start to
     // copy-end becomes a real interval because this path's release does wait for its kernel.
-    if (s->dev->download_via_compute && s->dev->download_kernel && n)
-      return download_by_kernel(s, dst, (uint64_t)src, n);
-    return WITH_LOCK(tinynv_exec_download(&s->dev->exec, dst, (uint64_t)src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+    tinynv_status_t rc = (s->dev->download_via_compute && s->dev->download_kernel && n)
+                             ? download_by_kernel(s, dst, (uint64_t)src, n)
+                             : WITH_LOCK(tinynv_exec_download(&s->dev->exec, dst, (uint64_t)src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+    // A download waits for itself, so the engine is idle here - on a decode this is the token boundary, and the stream
+    // synchronisation the caller issues next is answered without a wait. TINYNV_KEEPALIVE: keep the engine scheduled.
+    // Only a download the size of the logits: the ~24 small read-backs a token are not the boundary, and a keep-alive
+    // after each of them cost the decode 20% (measured 15:28, 2,287 launches for 96 tokens, 2,192 released by a wait).
+    if (rc == TINYNV_OK && s->dev->exec.keepalive && s->dev->keepalive_kernel && !s->dev->torn_down &&
+        n >= (size_t)s->dev->exec.keepalive_min_kb * 1024u)
+      keepalive_launch(s);
+    return rc;
   }
   memcpy(dst, (const void *)(uintptr_t)src, n);
   return TINYNV_OK;

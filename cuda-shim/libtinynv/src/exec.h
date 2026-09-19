@@ -360,8 +360,14 @@ typedef struct {
   // at any wait, whichever comes first. See tinynv_exec_keepalive_arm/release and tinynv_stream_sync in tinynv.c.
   int keepalive;                // asked for (TINYNV_KEEPALIVE)
   unsigned keepalive_us;        // TINYNV_KEEPALIVE_US: the spin's ceiling, the watchdog
+  unsigned keepalive_min_kb;    // TINYNV_KEEPALIVE_MIN_KB: only a download at least this large is a token boundary
   tinynv_vmap_t ka_flag;
   int ka_pending;
+  uint64_t ka_value;            // the pending keep-alive's own timeline value: a wait that needs no more than it ignores it
+  // Caller launches since the last keep-alive. A synchronisation after fewer than TINYNV_KEEPALIVE_MIN_LAUNCHES of them
+  // is one of the ~24 small read-backs a token, not the boundary; a keep-alive after each of those cost 20%.
+#define TINYNV_KEEPALIVE_MIN_LAUNCHES 64
+  uint64_t launches_since_ka;
   uint64_t ka_launched, ka_released_chain, ka_released_wait;
   // The engine's own clock across a synchronisation: how long it sat idle between finishing one batch and starting the
   // next. Host profiling cannot see this - the host is busy building at the time - and it is where the residual against
@@ -442,6 +448,9 @@ int tinynv_exec_kernel_profile(const char *e);
 // TINYNV_KEEPALIVE and TINYNV_KEEPALIVE_US: off unless asked; 2,000 us of spin at most unless asked.
 int tinynv_exec_keepalive(const char *e);
 unsigned tinynv_exec_keepalive_us(const char *e);
+// TINYNV_KEEPALIVE_MIN_KB: the download size from which the keep-alive is launched; 64 unless asked. A decode reads
+// back ~24 small tensors a token and the logits once (~1 MB); a keep-alive after each small one cost 20%.
+unsigned tinynv_exec_keepalive_min_kb(const char *e);
 // Arm the keep-alive (flag to 0, pending) and say where the flag is; release it (flag to 1). Release is called at
 // every wait and at every caller chain's hand-over, and is free when nothing is pending.
 int tinynv_exec_keepalive_arm(tinynv_exec_t *ex, uint64_t *flag_va);

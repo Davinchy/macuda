@@ -228,6 +228,10 @@ int main(void) {
     for (size_t i = 0; i < sizeof(kus) / sizeof(*kus); i++)
       CHECK(tinynv_exec_keepalive_us(kus[i].e) == kus[i].want, "TINYNV_KEEPALIVE_US=%s gave %u, expected %u",
             kus[i].e ? kus[i].e : "(unset)", tinynv_exec_keepalive_us(kus[i].e), kus[i].want);
+    static const struct { const char *e; unsigned want; } kmin[] = {{NULL, 64}, {"", 64}, {"0", 0}, {"1024", 1024}, {"-5", 64}, {"x", 0}};
+    for (size_t i = 0; i < sizeof(kmin) / sizeof(*kmin); i++)
+      CHECK(tinynv_exec_keepalive_min_kb(kmin[i].e) == kmin[i].want, "TINYNV_KEEPALIVE_MIN_KB=%s gave %u, expected %u",
+            kmin[i].e ? kmin[i].e : "(unset)", tinynv_exec_keepalive_min_kb(kmin[i].e), kmin[i].want);
     CHECK(tinynv_exec_keepalive(NULL) == 0, "the keep-alive is unmeasured and must be off unless asked");
   }
 

@@ -127,6 +127,9 @@ static uint64_t sem_read_slot(tinynv_exec_t *ex, int q) {
 static int sem_reached(tinynv_exec_t *ex, uint64_t value) {
   for (int q = 0; q < 2; q++) {
     uint64_t want = ex->q_last[q];
+    // A pending keep-alive is the driver's work, not the caller's: while it is the last thing on the compute queue, a
+    // wait is satisfied by everything before it, and the spin goes on until the next chain is handed over.
+    if (q == 0 && ex->ka_pending && want == ex->ka_value && want) want--;
     if (want > value) want = value;          // only as far as the caller asked
     if (want && sem_read_slot(ex, q) < want) return 0;
   }
@@ -299,8 +302,9 @@ static uint64_t qmd_sum(const uint8_t *b) {
 }
 
 int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
-  // A pending keep-alive is let go before anything is waited for: a wait must never sit out the spin's ceiling.
-  tinynv_exec_keepalive_release(ex, 1);
+  // A pending keep-alive is let go before a wait that needs the compute queue past it (the driver's own later work,
+  // which never happens on a decode); a wait that needs no more than what came before it leaves the spin alone.
+  if (ex->ka_pending && ex->q_last[0] != ex->ka_value) tinynv_exec_keepalive_release(ex, 1);
   // Anything staged and not announced is work the engine has not been told about, so waiting for it would sit out the
   // whole timeout. This is normally empty; it is not when a flush failed between staging the delivery and submitting
   // the chain that would have announced it, and that is exactly the path where a hang would be hardest to read.
@@ -988,7 +992,7 @@ static int submit_batch(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c
     return tinynv_fail("a compute batch was submitted inside a chain flush: it takes timeline value %llu and the "
                        "chain handed over after it releases a lower one, so the timeline would go backwards by the "
                        "length of the chain", (unsigned long long)upto);
-  if (!ex->submitting_inline) ex->needs_wait = 1;
+  if (!ex->submitting_inline && !ex->internal_work) ex->needs_wait = 1;   // the driver's own work is waited for by the driver
   if (upto > ex->timeline) ex->timeline = upto;
   ex->q_last[q == &ex->g->gsp.copy_q] = upto;
   return ex->sync ? tinynv_exec_wait(ex, upto, 30.0) : 0;
@@ -1958,6 +1962,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   ex->chain[ex->nchain].len = (uint32_t)(slot + cbuf0_bytes);
   ex->chain[ex->nchain].kslot = kslot_i;
   ex->nchain++;
+  if (!ex->internal_work) ex->launches_since_ka++;
   ex->reserved = at;
 
   // Asking the firmware whether anything faulted happens at the flush, not here. It is two reads across the link every
@@ -2003,12 +2008,21 @@ unsigned tinynv_exec_keepalive_us(const char *e) {
   return (unsigned)n;
 }
 
+unsigned tinynv_exec_keepalive_min_kb(const char *e) {
+  if (!e || !*e) return 64;
+  long n = atol(e);
+  if (n < 0) return 64;
+  if (n > 1048576) n = 1048576;
+  return (unsigned)n;
+}
+
 int tinynv_exec_keepalive_arm(tinynv_exec_t *ex, uint64_t *flag_va) {
   if (!ex->ka_flag.size) return tinynv_fail("the keep-alive flag was never allocated (TINYNV_KEEPALIVE is off)");
   uint32_t zero = 0;
   nv_wr_block(&ex->ka_flag.dma.view, 0, &zero, sizeof(zero));
   ex->ka_pending = 1;
   ex->ka_launched++;
+  ex->launches_since_ka = 0;
   *flag_va = ex->ka_flag.va;
   return 0;
 }
@@ -2303,6 +2317,7 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   ex->kprof = tinynv_exec_kernel_profile(getenv("TINYNV_KERNEL_PROFILE"));
   ex->keepalive = tinynv_exec_keepalive(getenv("TINYNV_KEEPALIVE"));
   ex->keepalive_us = tinynv_exec_keepalive_us(getenv("TINYNV_KEEPALIVE_US"));
+  ex->keepalive_min_kb = tinynv_exec_keepalive_min_kb(getenv("TINYNV_KEEPALIVE_MIN_KB"));
   ex->kprof_skip = tinynv_exec_kernel_profile_skip(getenv("TINYNV_KERNEL_PROFILE_SKIP"));
   // Delivered by the copy engine by default since 2026-09-15, having been the opt-in path for a day and a 62-minute
   // soak: 1,876 requests, 343,160 tokens, 188 greedy probes all identical, no refusals. TINYNV_ARENA_DMA=0 goes back to
@@ -2467,6 +2482,8 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
 void tinynv_exec_fini(tinynv_exec_t *ex) {
   // Everything submitted has been waited for by the caller (tinynv.c idles before this), so the last chain's tail can
   // be read now along with anything else still in the ring.
+  // A keep-alive still spinning is let go and waited for here: the caller's idle before this deliberately ignored it.
+  if (ex->ka_pending) { tinynv_exec_keepalive_release(ex, 1); tinynv_exec_wait(ex, ex->ka_value, 2.0); }
   if (ex->kprof_on) { kprof_harvest(ex, ~0ull, 2); kprof_report(ex); }
   if (ex->ka_launched)
     fprintf(stderr, "libtinynv: keep-alive launched %llu times after a synchronisation; released %llu by the next chain's "
