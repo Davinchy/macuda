@@ -211,10 +211,11 @@ typedef struct {
   // first model ran a token through, and it is what a hang should be re-run on before anything else is suspected.
   // Off unless asked for; set from TINYNV_SYNC / TINYNV_ASYNC at init by tinynv_exec_sync_mode below.
   int sync;
-  // Release once per chain instead of once per launch, which is what the oracle does. Opt-in, because it trades the two
-  // diagnostics that depend on per-link timeline values - the "stopped at link N of M" message and the first failure
-  // mode of tinynv_qmd_link_check - for whatever the release costs, and that cost is the thing being measured. Both
-  // diagnostics say loudly that they are degraded rather than quietly saying less.
+  // Release once per chain instead of once per launch, which is what the oracle does. The default since 2026-09-19
+  // (see tinynv_exec_tail_release): it trades the two diagnostics that depend on per-link timeline values - the
+  // "stopped at link N of M" message and the first failure mode of tinynv_qmd_link_check - for descriptors that stay
+  // identical token to token, which is what the delta path lives on. Both diagnostics say loudly that they are
+  // degraded rather than quietly saying less, and TINYNV_TAIL_RELEASE=0 brings them back.
   int tail_release;
   int download_sync_first;
   int inline_upload;
@@ -245,7 +246,7 @@ typedef struct {
   // take a compute timeline value in that window. See tinynv_exec_flush.
   int in_chain_flush;
   int hybrid_delivery;
-  int delta_delivery;   // TINYNV_DELTA_DELIVERY=1: diff AR_DESC against last_delivered, patch only what changed
+  int delta_delivery;   // TINYNV_DELTA_DELIVERY: diff AR_DESC against last_delivered, patch only what changed (default on)
   uint32_t delta_gap;   // TINYNV_DELTA_GAP: unchanged bytes two differing runs may straddle and still go as one patch
   uint32_t delta_aggregate_max;   // TINYNV_DELTA_AGGREGATE_KB, in bytes: a flush's patches' pushbuffer footprint,
                                   // headers included, past which the flush takes the full delivery instead
@@ -343,9 +344,14 @@ void tinynv_exec_fini(tinynv_exec_t *ex);
 // hardware: nothing reaches tinynv_exec_init without a booted card. See test_exec_mode.
 int tinynv_exec_sync_mode(const char *async, const char *sync, const char **why);
 int tinynv_exec_chain_depth(const char *e);
-// 0 = every descriptor releases the timeline (the default); 1 = only the chain's tail does. Which one is selected
-// decides which release the profile has to stamp, so it is resolved where it can be tested rather than inline.
+// 1 = only the chain's tail releases the timeline (the default since 2026-09-19); 0 = every descriptor does. Which
+// one is selected decides which release the profile has to stamp, so it is resolved where it can be tested.
 int tinynv_exec_tail_release(const char *e);
+// TINYNV_DELTA_DELIVERY (1 = patch only what changed, the default since 2026-09-19; 0 = the full copy every flush)
+// and TINYNV_DELTA_REWIND (1 = come round at every standstill, the default; 0 = only when the region runs out),
+// the second following the first off. Resolved here so test_exec_mode pins what an empty environment gets.
+int tinynv_exec_delta_delivery(const char *e);
+int tinynv_exec_delta_rewind(int delivery, const char *e);
 // 0 = a download issues its copy immediately and the card waits (the default); 1 = the host waits for compute first,
 // so the copy's acquire is satisfied before the channel is ever looked at.
 int tinynv_exec_download_sync_first(const char *e);

@@ -361,9 +361,9 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
         // Say it plainly rather than reporting a position derived from values that are no longer published. A chain
         // that releases only at its tail cannot be located from the timeline: the number either reached the end or it
         // did not, and everything in between is invisible by construction.
-        snprintf(where, sizeof(where), " [TINYNV_TAIL_RELEASE is set, so only the last launch of each chain reports: "
-                 "the chain covering %llu..%llu %s, and WHERE inside it the engine stopped cannot be known - re-run "
-                 "without that knob to find out]", (unsigned long long)ex->flush_lo,
+        snprintf(where, sizeof(where), " [only the last launch of each chain reports (the default; TINYNV_TAIL_RELEASE=0 "
+                 "releases per launch): the chain covering %llu..%llu %s, and WHERE inside it the engine stopped "
+                 "cannot be known - re-run with TINYNV_TAIL_RELEASE=0 to find out]", (unsigned long long)ex->flush_lo,
                  (unsigned long long)(ex->flush_lo + (uint64_t)ex->flush_n - 1),
                  v >= ex->flush_lo + (uint64_t)ex->flush_n - 1 ? "completed" : "did not complete");
       } else if (ex->flush_n) {
@@ -1651,12 +1651,15 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   // Under TINYNV_TAIL_RELEASE the release is attached at the flush instead, to the last descriptor only. The value is
   // still reserved here, so nothing about how work is numbered changes - only how much of that numbering the engine is
   // asked to report. What is being measured is whether that report is what a launch costs.
-  // THIS is the release the default configuration uses, and it is the one the profile has to stamp. TINYNV_TAIL_RELEASE
-  // is OFF unless asked for, so the flush-time release in tinynv_exec_flush - which I stamped first, and then stamped
-  // again a different way - is not executed on any ordinary run. Both of those "fixes" changed code that does not run,
-  // which is why the number they were meant to fix did not move either time. Every descriptor releasing a four word
-  // report is not a cost: they already all release, they retire in order, and each overwrites the last, so +8 ends up
-  // holding the clock of whichever kernel finished most recently. Which is the definition of the thing being measured.
+  // Until 2026-09-19 THIS was the release the default configuration used, and the one the profile had to stamp:
+  // TINYNV_TAIL_RELEASE was off unless asked for, so the flush-time release in tinynv_exec_flush - which I stamped
+  // first, and then stamped again a different way - was not executed on any ordinary run. Both of those "fixes"
+  // changed code that did not run, which is why the number they were meant to fix did not move either time. The
+  // default has since flipped (tinynv_exec_tail_release says why), so the flush-time release is now the ordinary one
+  // and this branch is the TINYNV_TAIL_RELEASE=0 diagnostic; both are stamped under the profile, and test_exec_mode
+  // pins which one an empty environment takes. Every descriptor releasing a four word report is not a cost: they
+  // retire in order and each overwrites the last, so +8 ends up holding the clock of whichever kernel finished most
+  // recently. Which is the definition of the thing being measured.
   if (!ex->tail_release && !ex->no_chain_deps &&
       tinynv_qmd_release(&q, ex->sem.va + SEM_SLOT(0), at, ex->profile) < 0)
     return tinynv_fail("the descriptor has no free release slot");
@@ -1704,7 +1707,19 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
 // in this file can be asked about without a card - which is what makes "the default is X" a checkable claim instead of
 // a line of code somebody has to find. This one was a getenv buried in the middle of exec_init, and I twice
 // instrumented the release it selects AWAY from while believing I had instrumented the one that runs.
-int tinynv_exec_tail_release(const char *e) { return e && *e && *e != '0'; }
+// On by default since 2026-09-19 (Antonio's word, after the day's measurements): releasing once per chain is what
+// leaves a token's descriptors byte-identical to the previous token's except for what actually changed, which is
+// what lets TINYNV_DELTA_DELIVERY patch ~2 KB a flush instead of ~7 KB and turned the MoE decode from a loss into a
+// gain. TINYNV_TAIL_RELEASE=0 releases per launch again, which is the setting that can locate a stall inside a chain.
+int tinynv_exec_tail_release(const char *e) { return !e || !*e || *e != '0'; }
+
+// TINYNV_DELTA_DELIVERY and TINYNV_DELTA_REWIND, resolved where test_exec_mode can drive them. Both on by default
+// since 2026-09-19: sub-launch runs alone lose 44% on the MoE (every flush ~90 KB of pushbuffer), runs with the
+// token-aligned rewind are a dense win and an MoE loss, and runs + rewind + tail release are a win on both (dense
+// 27B 67.8 -> 70.7 tg128, MoE 35B-A3B ~161 -> ~166), byte-identical output, server and image paths clean
+// (docs/handoff-2026-09-19.md). The rewind is meaningless without delivery, so it follows delivery off.
+int tinynv_exec_delta_delivery(const char *e) { return !e || !*e || *e != '0'; }
+int tinynv_exec_delta_rewind(int delivery, const char *e) { return delivery && (!e || !*e || *e != '0'); }
 
 // Whether a download waits for the compute to finish on the HOST before issuing its copy, instead of issuing the copy
 // straight away and letting it wait on the card.
@@ -1795,23 +1810,32 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   // expert routing as small on-device buffer content, not as changed kernel addresses). The ring already reuses
   // the same physical address a lap later; this diffs the fresh shadow content against what was last actually
   // sent there and patches only the difference, instead of resending a structurally-fresh full chain every time.
-  { const char *e = getenv("TINYNV_DELTA_DELIVERY");
-    ex->delta_delivery = e && *e && *e != '0';
+  { const char *e = getenv("TINYNV_DELTA_DELIVERY"), *r = getenv("TINYNV_DELTA_REWIND");
+    ex->delta_delivery = tinynv_exec_delta_delivery(e);
+    ex->delta_rewind = tinynv_exec_delta_rewind(ex->delta_delivery, r);
     const char *g = getenv("TINYNV_DELTA_GAP"), *a = getenv("TINYNV_DELTA_AGGREGATE_KB");
     ex->delta_gap = tinynv_exec_delta_gap(g);
     ex->delta_aggregate_max = tinynv_exec_delta_aggregate(a);
-    { const char *r = getenv("TINYNV_DELTA_REWIND");
-      ex->delta_rewind = ex->delta_delivery && r && *r && *r != '0';
-      if (ex->delta_rewind)
-        fprintf(stderr, "libtinynv: the descriptor region starts from the bottom at every standstill, so the delta is "
-                        "a launch against its own previous token (TINYNV_DELTA_REWIND was asked for)\n"); }
-    // Both knobs named with what decided them, the way every other line here is: a sweep is read off these lines,
-    // never off what anyone remembers exporting.
+    // Every knob named with what decided it, the way every other line here is: a sweep is read off these lines,
+    // never off what anyone remembers exporting - and a run with an empty environment says "the default" so it can
+    // be told from one whose harness is still exporting things.
     if (ex->delta_delivery)
-      fprintf(stderr, "libtinynv: AR_DESC delivery patches only what changed since the last lap (was asked for): runs "
-                      "of dwords, merged across gaps of up to %u bytes (%s), up to %u KB of pushbuffer a flush (%s)\n",
+      fprintf(stderr, "libtinynv: AR_DESC delivery patches only what changed since the last lap (%s): runs of dwords, "
+                      "merged across gaps of up to %u bytes (%s), up to %u KB of pushbuffer a flush (%s)\n",
+              e && *e ? "TINYNV_DELTA_DELIVERY was asked for" : "the default",
               ex->delta_gap, g && *g ? "TINYNV_DELTA_GAP was asked for" : "the default",
-              ex->delta_aggregate_max / 1024u, a && *a ? "TINYNV_DELTA_AGGREGATE_KB was asked for" : "the default"); }
+              ex->delta_aggregate_max / 1024u, a && *a ? "TINYNV_DELTA_AGGREGATE_KB was asked for" : "the default");
+    else
+      fprintf(stderr, "libtinynv: AR_DESC delivery is the full copy every flush (TINYNV_DELTA_DELIVERY=0 was asked for)\n");
+    if (ex->delta_rewind)
+      fprintf(stderr, "libtinynv: the descriptor region starts from the bottom at every standstill, so the delta is "
+                      "a launch against its own previous token (%s)\n",
+              r && *r ? "TINYNV_DELTA_REWIND was asked for" : "the default");
+    else if (ex->delta_delivery)
+      // The one combination measured to be a loss: without the rewind a launch is diffed against a different
+      // launch of the same kernel and every flush carries ~90 KB of pushbuffer (MoE -44%, 2026-09-19). Said loudly.
+      fprintf(stderr, "libtinynv: WARNING: delta delivery WITHOUT the rewind (TINYNV_DELTA_REWIND=0 was asked for) - "
+                      "measured 44%% slower on the MoE decode; this is a diagnostic setting, not a mode\n"); }
 
   { const char *e = getenv("TINYNV_INLINE_PEND");
     ex->inline_pend_max = tinynv_exec_pend_entries(e);
@@ -1859,11 +1883,15 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   fprintf(stderr, "libtinynv: the command arena is in %s\n",
           ex->arena_vram ? "video memory" : "host memory (TINYNV_ARENA_VRAM=0 was asked for)");
   if (!ex->chain_prefetch) fprintf(stderr, "libtinynv: chain prefetch is off (TINYNV_CHAIN_PREFETCH=0)\n");
-  // Loudly, because it is a measurement mode and not a setting to leave on: it costs the two diagnostics that locate a
-  // stall inside a chain, and a run that hangs with this set will say less about why than the same run without it.
-  if (ex->tail_release)
-    fprintf(stderr, "libtinynv: releasing ONCE PER CHAIN, not per launch (TINYNV_TAIL_RELEASE) - the timeline no longer "
-                    "has a value per launch, so a stall cannot be located inside a chain\n");
+  // Named either way. Per chain is the default since 2026-09-19 (it is what keeps a token's descriptors identical to
+  // the last token's for the delta path); per launch is the setting that can locate a stall inside a chain, so a run
+  // that hangs is worth repeating with TINYNV_TAIL_RELEASE=0 before reading its wait-failure report.
+  { const char *t = getenv("TINYNV_TAIL_RELEASE");
+    if (ex->tail_release)
+      fprintf(stderr, "libtinynv: releasing once per chain (%s); a stall cannot be located inside a chain this way - "
+                      "TINYNV_TAIL_RELEASE=0 releases per launch\n", t && *t ? "TINYNV_TAIL_RELEASE was asked for" : "the default");
+    else
+      fprintf(stderr, "libtinynv: releasing once per launch (TINYNV_TAIL_RELEASE=0 was asked for)\n"); }
   if (ex->no_chain_deps)
     fprintf(stderr, "libtinynv: *** NOTHING ORDERS ONE KERNEL AGAINST THE NEXT (TINYNV_NO_CHAIN_DEPS) *** every\n"
                     "libtinynv: descriptor is launched independently, so dependent kernels run side by side and any\n"

@@ -106,10 +106,10 @@ int main(void) {
   // before anyone checked which branch the default takes.
   {
     static const struct { const char *e; int want; const char *what; } tails[] = {
-      {NULL, 0, "unset: every descriptor releases, which is the path a decode takes"},
-      {"", 0, "empty: same as unset"},
-      {"0", 0, "explicitly off"},
-      {"1", 1, "asked for: only the chain's tail releases"},
+      {NULL, 1, "unset: only the chain's tail releases, the default since 2026-09-19 and the path a decode takes"},
+      {"", 1, "empty: same as unset"},
+      {"0", 0, "explicitly off: every descriptor releases, the setting that can locate a stall inside a chain"},
+      {"1", 1, "asked for: the tail only"},
     };
     for (size_t i = 0; i < sizeof(tails) / sizeof(*tails); i++) {
       int got = tinynv_exec_tail_release(tails[i].e);
@@ -117,9 +117,33 @@ int main(void) {
             tails[i].e ? tails[i].e : "(unset)", got ? "the tail only" : "every descriptor",
             tails[i].want ? "the tail only" : "every descriptor", tails[i].what);
     }
-    CHECK(tinynv_exec_tail_release(NULL) == 0,
-          "the default changed: the per-launch release is no longer the one a decode executes, so whatever the profile "
-          "stamps must move with it");
+    CHECK(tinynv_exec_tail_release(NULL) == 1,
+          "the default changed: the flush-time tail release is no longer the one a decode executes, so whatever the "
+          "profile stamps must move with it - and the delta path's per-token identity of descriptors goes with it");
+  }
+
+  // The delta path's two knobs. On by default since 2026-09-19 because the three together (with the tail release
+  // above) are what measured as a win on both models; delivery without the rewind is the one combination measured
+  // as a loss, and the rewind without delivery is meaningless, so it follows delivery off.
+  {
+    static const struct { const char *d, *r; int want_d, want_r; const char *what; } deltas[] = {
+      {NULL, NULL, 1, 1, "an empty environment patches and rewinds - the shipping default"},
+      {"", "", 1, 1, "empty is not an answer either way"},
+      {"1", "1", 1, 1, "both asked for"},
+      {"0", NULL, 0, 0, "delivery off takes the rewind with it"},
+      {"0", "1", 0, 0, "the rewind cannot be asked for without delivery"},
+      {"1", "0", 1, 0, "delivery without the rewind: allowed, and the startup line warns it is the measured loss"},
+      {NULL, "0", 1, 0, "the rewind alone turned off"},
+    };
+    for (size_t i = 0; i < sizeof(deltas) / sizeof(*deltas); i++) {
+      int d = tinynv_exec_delta_delivery(deltas[i].d), r = tinynv_exec_delta_rewind(d, deltas[i].r);
+      CHECK(d == deltas[i].want_d && r == deltas[i].want_r,
+            "TINYNV_DELTA_DELIVERY=%s TINYNV_DELTA_REWIND=%s resolved to delivery %d rewind %d, expected %d %d (%s)",
+            deltas[i].d ? deltas[i].d : "(unset)", deltas[i].r ? deltas[i].r : "(unset)", d, r, deltas[i].want_d,
+            deltas[i].want_r, deltas[i].what);
+    }
+    CHECK(tinynv_exec_delta_delivery(NULL) == 1 && tinynv_exec_delta_rewind(1, NULL) == 1 && tinynv_exec_tail_release(NULL) == 1,
+          "the three knobs that measured as a win together are no longer all on by default");
   }
 
   // Whether a download drains the compute on the host before issuing its copy. Off by default: it is a test of a
