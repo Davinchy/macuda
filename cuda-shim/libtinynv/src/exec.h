@@ -138,6 +138,10 @@ typedef struct {
     tinynv_qmd_t qmd;    // the descriptor, still being edited: the next launch writes its chain pointer into this one
     uint8_t *host;       // where it will be copied, in the arena the GPU reads
     uint64_t va;         // and that slot's address, which is what the chain pointer and the launch method carry
+    // How many bytes this launch occupies in AR_DESC (the QMD slot plus its own cbuf0, which varies per kernel's
+    // parameter count) - TINYNV_DELTA_DELIVERY diffs this span alone against last_delivered, rather than one
+    // envelope over every launch in the flush. See tinynv_exec_flush.
+    uint32_t len;
   } chain[TINYNV_EXEC_CHAIN_MAX];
   int nchain;
   int chain_max;   // how deep a chain may get before it is handed over; TINYNV_EXEC_CHAIN_MAX unless asked otherwise

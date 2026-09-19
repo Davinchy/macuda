@@ -992,36 +992,73 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
       ex->wraps[AR_DESC] && delta_hi > delta_lo) {
     // Trusted only past the region's first lap (wraps[AR_DESC] set): before that, last_delivered has never been
     // compared against a real prior delivery at this address, so there is nothing yet to diff against honestly.
+    //
+    // Per launch, not one envelope over the whole flush. A flush holds up to chain_max launches before delivering
+    // (n here), and one min-max diff over that much content reads as "almost 100% different" the instant even one
+    // byte differs near each end - measured on hardware 2026-09-18 (TINYNV_DELTA_VERBOSE), which is why the single-
+    // envelope version of this that shipped in a4f9010 was a correctness-safe no-op in practice. Each launch's own
+    // span (its QMD slot plus its own cbuf0, chain[i].len) is where the real per-token delta actually lives, so
+    // diffing there finds it at the granularity it occurs at.
+    //
+    // All-or-nothing per flush, checked before anything is pushed: either every launch's own diff fits inline, or
+    // none of them are pushed here and the flush falls through to the existing full-span paths below untouched.
+    // Committing some launches' diffs here and then letting a fallback path resend the same bytes as part of a
+    // wider copy would deliver a byte twice under two different values of "what's there now" - a correctness bug,
+    // not a slower correct answer - which is why the check pass below commits nothing until it has looked at
+    // every launch in the chain.
     uint8_t *sh = ex->region[AR_DESC].shadow, *ld = ex->region[AR_DESC].last_delivered;
-    uint64_t diff_lo = delta_hi, diff_hi = delta_lo;
-    for (uint64_t i = delta_lo; i < delta_hi; i++)
-      if (sh[i] != ld[i]) { if (i < diff_lo) diff_lo = i; diff_hi = i + 1; }
-    if (diff_hi <= diff_lo) {
-      // Every byte in the span already matches what a past delivery left resident - a decode step can repeat a
-      // cache-hit prefix exactly. Ownership still has to move to this batch; no bytes need to.
+    uint64_t plo[TINYNV_EXEC_CHAIN_MAX], phi[TINYNV_EXEC_CHAIN_MAX];
+    unsigned need_n = 0;
+    uint32_t need_bytes = 0;
+    int all_fit = 1;
+    for (int i = 0; i < n; i++) {
+      uint64_t lo = ex->chain[i].va - ex->region[AR_DESC].mem.va, hi = lo + ex->chain[i].len;
+      uint64_t dlo = hi, dhi = lo;
+      for (uint64_t j = lo; j < hi; j++)
+        if (sh[j] != ld[j]) { if (j < dlo) dlo = j; dhi = j + 1; }
+      plo[i] = dlo;
+      phi[i] = dhi;
+      if (dhi <= dlo) continue;   // this launch is byte-identical to its last delivery - nothing to send for it
+      uint32_t dlen = (uint32_t)(dhi - dlo);
+      unsigned remaining_n = ex->inline_pend_max - ex->inline_pend_n;
+      uint32_t remaining_bytes = ex->inline_pend_bytes_max - ex->inline_pend_bytes;
+      if (dlen > TINYNV_INLINE_MAX || need_n + 1 > remaining_n || need_bytes + dlen > remaining_bytes) {
+        all_fit = 0;
+        if (getenv("TINYNV_DELTA_VERBOSE") && ex->delta_full_n <= 20)
+          fprintf(stderr, "libtinynv: per-launch delta miss #%llu: launch %d of %d, span [%llu,%llu) len %llu\n",
+                  (unsigned long long)ex->delta_full_n + 1, i, n, (unsigned long long)dlo, (unsigned long long)dhi,
+                  (unsigned long long)dlen);
+        break;
+      }
+      need_n++;
+      need_bytes += dlen;
+    }
+    if (all_fit) {
+      // Nothing above touched inline_pend or arena state - safe to commit now that every launch has been checked.
+      for (int i = 0; i < n; i++)
+        if (phi[i] > plo[i])
+          inline_pend_push(ex, ex->region[AR_DESC].mem.va + plo[i], sh + plo[i], (uint32_t)(phi[i] - plo[i]));
+      // Ownership moves over the whole originally-dirty span regardless of how many launches actually had bytes to
+      // send, same as the full-span paths below: every launch in the chain read consistently as of this delivery,
+      // not just the ones that changed.
       tinynv_arena_mark(&ex->region[AR_DESC], delta_lo, delta_hi, chain_upto);
       ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
-      ex->delta_skip_n++;
-      delta_handled = 1;
-    } else if (diff_hi - diff_lo <= TINYNV_INLINE_MAX && inline_pend_fits(ex, (uint32_t)(diff_hi - diff_lo))) {
-      inline_pend_push(ex, ex->region[AR_DESC].mem.va + diff_lo, sh + diff_lo, (uint32_t)(diff_hi - diff_lo));
-      tinynv_arena_mark(&ex->region[AR_DESC], delta_lo, delta_hi, chain_upto);
-      ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
-      ex->hybrid_n++;
-      ex->delta_n++;
-      ex->delta_bytes += diff_hi - diff_lo;
+      if (need_n) {
+        ex->hybrid_n++;
+        ex->delta_n++;
+        ex->delta_bytes += need_bytes;
+      } else {
+        // Every launch in the chain matched its last delivery - a decode step can repeat a cache-hit prefix
+        // exactly. Ownership still has to move; no bytes need to.
+        ex->delta_skip_n++;
+      }
       delta_handled = 1;
     } else {
-      // The genuine diff itself does not fit inline either (an unexpectedly large change, or a chain shape that
+      // At least one launch's own diff did not fit inline (an unexpectedly large change, or a chain shape that
       // does not match what was here last lap) - fall through to the existing full-span paths below, unchanged.
       // Conservative on purpose: this is never worse than today's behaviour, only sometimes not as good as it
       // could be.
       ex->delta_full_n++;
-      if (getenv("TINYNV_DELTA_VERBOSE") && ex->delta_full_n <= 20)
-        fprintf(stderr, "libtinynv: delta miss #%llu: span [%llu,%llu) len %llu, diff [%llu,%llu) len %llu\n",
-                (unsigned long long)ex->delta_full_n, (unsigned long long)delta_lo, (unsigned long long)delta_hi,
-                (unsigned long long)(delta_hi - delta_lo), (unsigned long long)diff_lo, (unsigned long long)diff_hi,
-                (unsigned long long)(diff_hi - diff_lo));
     }
   }
   if (!delta_handled && ex->hybrid_delivery && ex->arena_dma &&
@@ -1476,6 +1513,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   ex->chain[ex->nchain].qmd = q;
   ex->chain[ex->nchain].host = host;
   ex->chain[ex->nchain].va = qmd_va;
+  ex->chain[ex->nchain].len = (uint32_t)(slot + cbuf0_bytes);
   ex->nchain++;
   ex->reserved = at;
 
