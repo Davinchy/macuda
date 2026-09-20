@@ -18,7 +18,12 @@
 set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; cd "$R" || exit 2
 K=/Volumes/512SSD/LocalCode/offline-ai-kit; METAL_BIN=${METAL_BIN:-$K/bin/llama-server}; CARD_BIN=${BIN:-$R/cuda-shim/build/bin/llama-server-null}
-ST=$R/logs/disagg/serve; mkdir -p "$ST"; PIDF=$ST/pids; CTX=${CTX:-40960}; UB=${UB:-24576}; NCPUMOE=${NCPUMOE:-48}
+# STATE is where slot state is written and read: the card saves the KV there and Metal restores it. It is NOT a log
+# directory - the save is hundreds of MB per request and its speed is on the critical path of every handoff. Measured
+# 2026-09-20: on the tree's own volume (100% full, 41 MB/s) an 18,914-token save took 13.5 s, MORE than the 8.4 s of
+# card prefill it was there to enable, which turned an end-to-end win into a loss below ~12k tokens. Put it on the
+# fastest disk available.
+ST=${STATE:-$R/logs/disagg/serve}; mkdir -p "$ST"; PIDF=$ST/pids; CTX=${CTX:-40960}; UB=${UB:-24576}; NCPUMOE=${NCPUMOE:-48}
 CARD_PORT=${CARD_PORT:-8092}; METAL_PORT=${METAL_PORT:-8091}
 # THRESH is the router's CAP: cold tokens at or above it always go to the card (A's window condition was 512, so Metal never
 # prefilled a long prompt). 0 = no cap: the router's cost model routes by predicted seconds (break-even ~5,300 cold tokens).

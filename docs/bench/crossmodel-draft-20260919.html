@@ -5,27 +5,12 @@
 <meta name="robots" content="noindex">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Cross-model Study — macuda</title>
-<meta name="description" content="A research protocol comparing CUDA and Metal prefill across six mixture-of-experts models, with explicit hypotheses, test conditions and results pending.">
+<meta name="description" content="Measured CUDA and Metal prefill across six mixture-of-experts models, with four prompt lengths, documented test conditions and stability observations.">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
 <link rel="stylesheet" href="assets/style.css">
-<style>
-  .pred{border-left:3px solid var(--native);background:var(--surface);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:74ch;box-shadow:var(--shadow)}
-  .meas{border-left:3px solid var(--accent);background:var(--surface);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:74ch;box-shadow:var(--shadow)}
-  .tag2{display:inline-block;font:600 11px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;
-        padding:2px 7px;border-radius:3px;vertical-align:2px;margin-right:8px}
-  .tag2.p{background:var(--native-soft);color:var(--native)}
-  .tag2.m{background:var(--accent-soft);color:var(--accent-ink)}
-  .draft{background:var(--native-soft);color:var(--native);border:1px solid var(--native);border-radius:6px;
-         padding:10px 14px;margin:0 0 22px;font-size:15px;max-width:74ch}
-  .pending{color:var(--muted);font-style:italic}
-  .clock{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin:20px 0 6px}
-  .clock .c{background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:16px 18px;box-shadow:var(--shadow)}
-  .clock .n{font-family:"JetBrains Mono",monospace;font-size:26px;font-weight:600;letter-spacing:-.02em;display:block}
-  .clock .l{font-size:13px;color:var(--muted);display:block;margin-top:4px}
-  .clock .c.good .n{color:var(--good)}
-</style>
+<link rel="stylesheet" href="assets/research.css">
 </head>
-<body>
+<body class="research-page">
 <a class="skip-link" href="#main-content">Skip to content</a>
 
 <header class="topbar">
@@ -45,150 +30,195 @@
 <div class="wrap">
 <main id="main-content" tabindex="-1">
 
+  <nav class="research-nav" aria-label="Research pages">
+    <span class="label">Research</span>
+    <a href="disaggregation.html">Disaggregated inference</a>
+    <a href="crossmodel.html" aria-current="page">Cross-model study</a>
+  </nav>
 
   <section class="hero">
-    <div class="eyebrow">Cross-model study · measured 19–20 September 2026</div>
-    <h1>Six models. One inference question.</h1>
-    <p class="lede">How does the benefit of CUDA prefill change with active parameter count? This study extends the
-    <a href="disaggregation.html">disaggregated-inference experiments</a> to six mixture-of-experts models, spanning
-    3B to 39B active parameters. Each model is evaluated on the RTX 5090 and the Mac's GPU at four prompt lengths.</p>
+    <div class="eyebrow">Cross-model study · 20 September 2026</div>
+    <h1>CUDA prefill across six MoE models</h1>
+    <p class="lede">Six mixture-of-experts models, two backends and four prompt lengths. This study measures how
+    CUDA prompt processing compares with Metal as active parameter count and context length change.</p>
   </section>
 
-    <h2>Model selection</h2>
-  <div class="tablewrap wide"><table>
-    <thead><tr><th>Model</th><th class="r">Size</th><th class="r">Active</th><th class="r">KV / token</th><th>Role in the study</th></tr></thead>
+  <div class="figures" aria-label="Study at a glance">
+    <div class="fig"><div class="n">6 <span>models</span></div><div class="l">the same expert-residency policy across the study</div></div>
+    <div class="fig"><div class="n">3–39<span>B</span></div><div class="l">active parameters per token</div></div>
+    <div class="fig"><div class="n">12k–48k</div><div class="l">tokens across four prompt lengths</div></div>
+    <div class="fig"><div class="n">10.37<span>×</span></div><div class="l">highest measured prefill speedup · Mixtral at 48k</div></div>
+  </div>
+
+  <nav class="toc" aria-label="On this page">
+    <b>Contents</b>
+    <ol>
+      <li><a href="#results">Measured results</a></li>
+      <li><a href="#interpretation">What the results show</a></li>
+      <li><a href="#models">Model selection</a></li>
+      <li><a href="#protocol">Test protocol</a></li>
+      <li><a href="#hypotheses">Hypotheses and limits</a></li>
+      <li><a href="#stability">Stability monitoring</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="results"><span class="section-number" aria-hidden="true">01</span>Measured prefill results</h2>
+  <p class="deck">Metal prefill time divided by RTX 5090 prefill time. Values above 1× favour CUDA.
+  State transfer and token generation are outside this comparison.</p>
+  <p class="note"><b>The 12k runs are cold starts.</b> They are the first prefill after loading each model and include
+  loading expert data from disk. The later runs are warm; use those to compare context lengths.</p>
+  <p class="table-scroll-hint">Scroll the table to view all columns <span aria-hidden="true">→</span></p>
+  <div class="tablewrap wide" role="region" aria-label="Prefill results; scroll horizontally for all columns" tabindex="0"><table>
+    <caption class="sr-only">CUDA prefill speedup relative to Metal, by model and prompt length</caption>
+    <thead><tr><th scope="col">Model</th><th scope="col" class="r">Active</th><th scope="col" class="r">12k<span class="table-label">cold start</span></th><th scope="col" class="r">24k</th><th scope="col" class="r">26k</th><th scope="col" class="r">48k<span class="table-label">warm</span></th><th scope="col" class="r">Expert bytes</th><th scope="col" class="r">24k → 26k</th></tr></thead>
     <tbody>
-      <tr><td class="model">Qwen3-Coder-Next 80B-A3B<small>UD-Q4_K_XL · qwen3next</small></td><td class="r">49.6 GB</td><td class="r">3B</td><td class="r">96 KB</td><td><b>Baseline.</b> The existing cost model and prefill measurements use this model. Results near 24k and 48k tokens provide a consistency check, with prompt-length differences taken into account.</td></tr>
-      <tr><td class="model">gpt-oss-120b<small>MXFP4 · gpt-oss</small></td><td class="r">63.4 GB</td><td class="r">5.1B</td><td class="r">72 KB</td><td>A second model with relatively few active parameters. The study notes include a published Metal figure of 737 tok/s as context; the direct comparison will use this study's own Metal run.</td></tr>
-      <tr><td class="model">Qwen3.5 122B-A10B<small>Q4_K_M · qwen35moe</small></td><td class="r">69.1 GB</td><td class="r">10B</td><td class="r">96 KB</td><td>An intermediate active-parameter count, with 8 of 256 experts selected per token.</td></tr>
-      <tr><td class="model">DeepSeek-V4-Flash<small>UD-Q2_K_XL · deepseek4</small></td><td class="r">96.8 GB</td><td class="r">~10B</td><td class="r">86 KB</td><td>A similar active-parameter count to Qwen3.5, with a different attention architecture: multi-head latent attention (MLA). Differences in quantisation, file size and kernels remain relevant, so this is an architectural comparison rather than a controlled isolation of attention design.</td></tr>
-      <tr><td class="model">Llama-4-Scout 109B-A17B<small>Q4_K_M · llama4</small></td><td class="r">65.4 GB</td><td class="r">17B</td><td class="r">192 KB</td><td>A higher active-parameter count and the second-largest estimated KV cache per token in the set.</td></tr>
-      <tr><td class="model">Mixtral 8x22B<small>Q4_K_S · llama</small></td><td class="r">80.5 GB</td><td class="r"><b>39B</b></td><td class="r">224 KB</td><td>The largest active-parameter count and estimated KV cache per token in the set. It tests both the compute hypothesis and sensitivity to longer context.</td></tr>
+      <tr><th scope="row" class="model">Qwen3-Coder-Next<small>80B-A3B</small></th><td class="r">3B</td><td class="r result-cold">0.68×</td><td class="r">2.77×</td><td class="r">2.09×</td><td class="r result-best">3.86×</td><td class="r">43.7 GiB</td><td class="r">6.9 s</td></tr>
+      <tr><th scope="row" class="model">gpt-oss-120b<small>117B-A5.1B</small></th><td class="r">5.1B</td><td class="r result-cold">0.68×</td><td class="r">3.14×</td><td class="r">2.13×</td><td class="r result-best">4.24×</td><td class="r">56.9 GiB</td><td class="r">9.8 s</td></tr>
+      <tr><th scope="row" class="model">Qwen3.5 122B<small>A10B</small></th><td class="r">10B</td><td class="r result-cold">0.97×</td><td class="r">4.29×</td><td class="r">3.23×</td><td class="r result-best">5.47×</td><td class="r">65.4 GiB</td><td class="r">11.5 s</td></tr>
+      <tr><th scope="row" class="model">DeepSeek-V4-Flash<small>MLA, ~A10B</small></th><td class="r">~10B</td><td class="r result-cold">1.28×</td><td class="r">3.22×</td><td class="r">2.46×</td><td class="r result-best">3.07×</td><td class="r">83.6 GiB</td><td class="r">16.1 s</td></tr>
+      <tr><th scope="row" class="model">Llama-4-Scout<small>109B-A17B</small></th><td class="r">17B</td><td class="r result-cold">1.66×</td><td class="r">5.16×</td><td class="r">3.89×</td><td class="r result-best">5.40×</td><td class="r">54.5 GiB</td><td class="r">9.9 s</td></tr>
+      <tr><th scope="row" class="model">Mixtral 8x22B<small>141B-A39B</small></th><td class="r">39B</td><td class="r result-cold">3.33×</td><td class="r"><b>9.90×</b></td><td class="r">6.76×</td><td class="r result-best"><b>10.37×</b></td><td class="r">71.5 GiB</td><td class="r">14.5 s</td></tr>
     </tbody>
   </table></div>
-  <p class="cap">Active parameters are reported in billions (B), not bytes of model data. KV cache estimates use
-  model-header dimensions and an assumed two bytes per cached value: layers × KV heads × (key dimension + value
-  dimension) × 2. Architecture-specific layouts may differ; the DeepSeek estimate requires runtime confirmation.
-  All model files are stored on the same external drive.</p>
+  <p class="cap">Measured 20 September 2026, 01:23–02:44. Both backends received identical token IDs for each
+  model. “24k → 26k” is the increase in CUDA elapsed time across the microbatch boundary, including the extra
+  2,000 tokens of work. Expert data sizes are in GiB.</p>
+  <p class="note">Every model ran with all experts in host memory. This keeps the residency policy consistent;
+  approximately 20 GiB of card memory remained available for resident experts. Per-model residency tuning was not
+  measured, so these results do not quantify its potential benefit.</p>
 
-    <h2>Test protocol</h2>
-  <p>Each model is scheduled for prefill on <b>both backends</b>: the RTX 5090 through macuda over Thunderbolt,
-  and the Mac's GPU through Metal. Prompt lengths are <b>12,000, 24,000, 26,000 and 48,000 tokens</b>. 24,000 and 26,000 straddle
-  the 24,576-token ubatch boundary, where expert data must be transferred again. The 12,000- and 48,000-token runs
-  extend the context-length comparison.</p>
+  <h2 id="interpretation"><span class="section-number" aria-hidden="true">02</span>What the results show</h2>
+  <h3>Higher active-parameter counts tend to favour CUDA</h3>
+  <p>At 24k tokens, the measured speedup ranges from <b>2.77× for Qwen3-Coder-Next</b> to <b>9.90× for Mixtral</b>.
+  Active weight data per token spans 3.4, 3.9, 5.8, 8.5, 9.8 and 21.3 GiB across the six models. The broad trend
+  supports the compute hypothesis, but the ordering is not strictly monotonic and total model size alone does not
+  explain the results.</p>
+  <div class="callout amber">
+    <span class="status-label">Architecture matters</span>
+    <p><b>DeepSeek is the exception to increasing gains at longer context.</b> Its speedup falls from 3.22× at 24k to
+    3.07× at 48k. Metal throughput remains approximately 178 tok/s out to 48k in the study notes. Its multi-head latent
+    attention (MLA) architecture is a possible explanation; this comparison does not isolate that effect.</p>
+  </div>
 
-  <div class="meas"><span class="tag2 m">method</span><b>Match token counts across models and token IDs across
-  backends.</b> Each model tokenizes the same source text with its own tokenizer, then the token sequence is truncated
-  to the target length. CUDA and Metal receive identical token IDs for that model. This keeps each run on the intended
-  side of the ubatch boundary, even though models tokenize the text differently.</div>
-  <p>The prompt cache is <b>cleared between lengths</b> to prevent shared-prefix reuse from inflating prefill results.
-  Every model uses <b>all experts in host memory</b> (<code>--n-cpu-moe n_layer</code>), matching the configuration
-  used to fit the initial cost model. Per-model residency tuning is outside this study's scope.</p>
+  <h3>Crossing a microbatch boundary adds a measurable cost</h3>
+  <p>The 24k-to-26k step adds <b>6.9–16.1 seconds</b> across expert sets of 43.7–83.6 GiB. That increase is consistent
+  with another transfer of expert data, alongside the extra computation. Dividing expert bytes by the elapsed step
+  gives an implied rate of approximately <b>4.9–6.4 GiB/s</b>; it is not an isolated measurement of link bandwidth.</p>
+  <p class="note">The lower implied rates on larger models may reflect page-cache pressure and additional disk
+  reads. That explanation remains untested.</p>
 
-    <h2>Hypotheses and interpretation limits</h2>
-  <p class="note">These were written down <b>before</b> the measurements and are unedited apart from wording. Where
-  one turned out wrong it is marked wrong below rather than quietly revised.</p>
-  <div class="pred"><span class="tag2 p">hypothesis 1</span><b>Higher active-parameter counts produce larger prefill
-  gains.</b> The proposed ordering places Mixtral at the high end and Qwen3-Coder-Next at the low end. A flat or reversed
-  ordering would challenge that explanation. Differences in transfer volume, quantisation and kernels must also be
-  considered before attributing the result to active parameters alone.</div>
-  <div class="pred"><span class="tag2 p">hypothesis 2</span><b>Relative prefill gains increase with prompt length.</b>
-  The Qwen3-Coder-Next measurements increased from 2.35× near 24k tokens to 5.55× near 48k. The sweep tests whether that
-  direction holds for the other models. Any model with a lower speedup at 48k than at 24k would refute the universal claim.</div>
-  <div class="pred"><span class="tag2 p">hypothesis 3</span><b>Crossing the ubatch boundary adds another expert
-  transfer.</b> The 26,000-token run should take longer than a smooth compute-only extrapolation from 24,000 tokens
-  would predict. The expected additional cost depends on each model's expert data. A smooth transition would challenge
-  this mechanism for that model.</div>
-  <div class="pred"><span class="tag2 p">study limitation</span><b>KV-cache effects are not isolated by this model
-  set.</b> Estimated cache sizes and active-parameter counts vary together, while attention architectures and
-  quantisation also differ. Context sweeps can describe each model's behaviour, but cannot by themselves assign a
-  cause. An earlier hypothesis linked cache growth to displaced resident experts; the all-experts-on-host protocol
-  does not directly test that mechanism.</div>
-  <div class="pred"><span class="tag2 p">open question</span><b>Confirm DeepSeek's runtime cache layout.</b> The
-  86 KB/token estimate assumes an expanded cache. A compressed 512-wide latent plus rotary-position data would give
-  an estimate nearer 48 KB/token. The server's reported KV-buffer allocation at a known context length is needed to
-  resolve the difference.</div>
+  <h3>The cold-start point limits the cost-model fit</h3>
+  <p>A per-model fit of <code>⌈tokens ÷ 24,576⌉ × transfer + tokens ÷ rate + fixed</code> produced residuals of
+  3.5–6.6 seconds and an infinite marginal rate for two models. The cold first point distorted the fitted constant,
+  so those parameter estimates are omitted. The table reports the observed 24k-to-26k timing difference instead.</p>
 
-    <h2>Results</h2>
-  <div class="tablewrap wide"><table>
-    <thead><tr><th>Model</th><th class="r">Active</th><th class="r">12k</th><th class="r">24k</th><th class="r">26k</th><th class="r">48k</th><th class="r">Expert bytes</th><th class="r">Second-ubatch cost</th></tr></thead>
+  <h2 id="models"><span class="section-number" aria-hidden="true">03</span>Model selection</h2>
+  <p class="deck">The set spans active parameter counts, expert data sizes and attention architectures.</p>
+  <p class="table-scroll-hint">Scroll the table to view all columns <span aria-hidden="true">→</span></p>
+  <div class="tablewrap wide" role="region" aria-label="Model selection; scroll horizontally for all columns" tabindex="0"><table class="study-models">
+    <caption class="sr-only">Model files, active parameters, estimated KV cache and study roles</caption>
+    <thead><tr><th scope="col">Model</th><th scope="col" class="r">Size</th><th scope="col" class="r">Active</th><th scope="col" class="r">KV / token</th><th scope="col">Role in the study</th></tr></thead>
     <tbody>
-      <tr><td class="model">Qwen3-Coder-Next<small>80B-A3B</small></td><td class="r">3B</td><td class="r">0.68×</td><td class="r">2.77×</td><td class="r">2.09×</td><td class="r">3.86×</td><td class="r">43.7 GiB</td><td class="r">6.9 s</td></tr>
-      <tr><td class="model">gpt-oss-120b<small>117B-A5.1B</small></td><td class="r">5.1B</td><td class="r">0.68×</td><td class="r">3.14×</td><td class="r">2.13×</td><td class="r">4.24×</td><td class="r">56.9 GiB</td><td class="r">9.8 s</td></tr>
-      <tr><td class="model">Qwen3.5 122B<small>A10B</small></td><td class="r">10B</td><td class="r">0.97×</td><td class="r">4.29×</td><td class="r">3.23×</td><td class="r">5.47×</td><td class="r">65.4 GiB</td><td class="r">11.5 s</td></tr>
-      <tr><td class="model">DeepSeek-V4-Flash<small>MLA, ~A10B</small></td><td class="r">~10B</td><td class="r">1.28×</td><td class="r">3.22×</td><td class="r">2.46×</td><td class="r">3.07×</td><td class="r">83.6 GiB</td><td class="r">16.1 s</td></tr>
-      <tr><td class="model">Llama-4-Scout<small>109B-A17B</small></td><td class="r">17B</td><td class="r">1.66×</td><td class="r">5.16×</td><td class="r">3.89×</td><td class="r">5.40×</td><td class="r">54.5 GiB</td><td class="r">9.9 s</td></tr>
-      <tr><td class="model">Mixtral 8x22B<small>141B-A39B</small></td><td class="r">39B</td><td class="r">3.33×</td><td class="r"><b>9.90×</b></td><td class="r">6.76×</td><td class="r"><b>10.37×</b></td><td class="r">71.5 GiB</td><td class="r">14.5 s</td></tr>
+      <tr><th scope="row" class="model">Qwen3-Coder-Next 80B-A3B<small>UD-Q4_K_XL · qwen3next</small></th><td class="r">49.6 GB</td><td class="r">3B</td><td class="r">96 KB</td><td><b>Baseline.</b> Connects the study to the existing cost model and earlier 24k- and 48k-token measurements.</td></tr>
+      <tr><th scope="row" class="model">gpt-oss-120b<small>MXFP4 · gpt-oss</small></th><td class="r">63.4 GB</td><td class="r">5.1B</td><td class="r">72 KB</td><td>A second model with relatively few active parameters; the comparison uses the study’s own Metal measurements.</td></tr>
+      <tr><th scope="row" class="model">Qwen3.5 122B-A10B<small>Q4_K_M · qwen35moe</small></th><td class="r">69.1 GB</td><td class="r">10B</td><td class="r">96 KB</td><td>An intermediate active-parameter count, selecting 8 of 256 experts per token.</td></tr>
+      <tr><th scope="row" class="model">DeepSeek-V4-Flash<small>UD-Q2_K_XL · deepseek4</small></th><td class="r">96.8 GB</td><td class="r">~10B</td><td class="r">86 KB</td><td>A similar active-parameter count to Qwen3.5, with MLA attention. Quantisation, file size and kernels also differ.</td></tr>
+      <tr><th scope="row" class="model">Llama-4-Scout 109B-A17B<small>Q4_K_M · llama4</small></th><td class="r">65.4 GB</td><td class="r">17B</td><td class="r">192 KB</td><td>A higher active-parameter count and the second-largest estimated KV cache per token in the set.</td></tr>
+      <tr><th scope="row" class="model">Mixtral 8x22B<small>Q4_K_S · llama</small></th><td class="r">80.5 GB</td><td class="r"><b>39B</b></td><td class="r">224 KB</td><td>The largest active-parameter count and estimated KV cache per token; tests compute and context-length sensitivity.</td></tr>
     </tbody>
   </table></div>
-  <p class="cap">Each cell is Metal prefill time divided by RTX 5090 prefill time, on identical token ids; above 1×
-  favours the card. Measured 2026-09-20 01:23–02:44. Every model ran with <b>every expert in host memory</b> — the
-  one configuration identical across all six, which makes the comparison clean and makes each number a floor: roughly
-  20 GiB of card memory sat unused that a tuned deployment would fill with resident experts.</p>
+  <p class="cap">Active parameters are in billions (B); file sizes are in decimal GB. KV-cache estimates use
+  model-header dimensions and two bytes per cached value: layers × KV heads × (key dimension + value dimension) × 2.
+  Architecture-specific layouts may differ. The DeepSeek estimate requires runtime confirmation. All model files
+  were stored on the same external drive.</p>
 
-  <div class="meas"><span class="tag2 m">confirmed</span><b>Active parameters are the lever, and the ordering is
-  monotonic.</b> Rank the six by the bytes a token actually touches — 3.4, 3.9, 5.8, 8.5, 9.8, 21.3 GiB — and the 24k
-  column rises with it. Total size predicts nothing: the largest model in the set sits near the bottom and the
-  smallest sits beside it. <b>DeepSeek-V4-Flash is the one exception</b>, and it is instructive rather than awkward:
-  its MLA attention keeps <i>Metal</i> at a flat ~178 tok/s out to 48k where every other model collapses, and since
-  the card's advantage is manufactured by Metal's degradation, an architecture that protects Metal takes the
-  advantage away.</div>
+  <h2 id="protocol"><span class="section-number" aria-hidden="true">04</span>Test protocol</h2>
+  <div class="setup">
+    <div><span class="k">CUDA backend</span>RTX 5090 through macuda over Thunderbolt</div>
+    <div><span class="k">Metal backend</span>The same Mac’s GPU, using the same model file</div>
+    <div><span class="k">Prompt lengths</span>12,000 · 24,000 · 26,000 · 48,000 tokens</div>
+    <div><span class="k">Expert residency</span>All experts in host memory; no per-model tuning</div>
+  </div>
+  <h3>Match token counts and backend inputs</h3>
+  <p>Each model tokenizes the same source text with its own tokenizer, then the sequence is truncated to the target
+  length. CUDA and Metal receive identical token IDs for that model. Token counts match across models even when
+  their tokenizers differ.</p>
+  <p>The 24k and 26k targets sit on opposite sides of the <b>24,576-token microbatch boundary</b>, where expert data
+  must be transferred again. The 12k and 48k runs extend the context range.</p>
+  <div class="callout">
+    <span class="status-label">Cache and residency controls</span>
+    <p>The prompt cache is cleared between lengths to prevent shared-prefix reuse. All runs use
+    <code>--n-cpu-moe n_layer</code>, matching the initial cost model’s all-experts-on-host configuration.
+    Clearing the prompt cache does not clear the operating system’s file cache.</p>
+  </div>
 
-  <div class="meas"><span class="tag2 m">confirmed</span><b>The second-ubatch cost is the expert stream, measured
-  directly.</b> Going from 24,000 to 26,000 tokens adds 2,000 tokens of work and crosses one ubatch boundary. Across
-  six models whose expert sets span 43.7 to 83.6 GiB, that step costs 6.9 to 16.1 s and tracks the bytes linearly —
-  an implied 4.9 to 6.4 GiB/s over the link. No curve fitting: two measurements per model. <b>The implied rate falls
-  as the model grows</b>, which is what page-cache pressure would look like — at 83.6 GiB of experts the host can no
-  longer hold the whole set in RAM alongside everything else, so part of each stream comes off the disk. Untested.</div>
+  <h2 id="hypotheses"><span class="section-number" aria-hidden="true">05</span>Hypotheses and interpretation limits</h2>
+  <p class="deck">The hypotheses were recorded before measurement. Their outcomes are summarised against the
+  data above.</p>
+  <div class="callout">
+    <span class="status-label">Hypothesis 1 · broadly supported</span>
+    <h3>More active parameters produce larger prefill gains</h3>
+    <p>The predicted ordering placed Mixtral at the high end and Qwen3-Coder-Next at the low end. The 24k results
+    follow that broad pattern, with architectural exceptions. Transfer volume, quantisation and kernel differences
+    prevent attributing the gains to active parameters alone.</p>
+  </div>
+  <div class="callout amber">
+    <span class="status-label">Hypothesis 2 · not universal</span>
+    <h3>Relative prefill gains increase with prompt length</h3>
+    <p>The earlier Qwen3-Coder-Next measurements rose from 2.35× near 24k to 5.55× near 48k. In this sweep,
+    five models improve from 24k to 48k, but DeepSeek falls from 3.22× to 3.07×. That result refutes the universal claim.</p>
+  </div>
+  <div class="callout">
+    <span class="status-label">Hypothesis 3 · consistent with the measurements</span>
+    <h3>A second microbatch requires another expert transfer</h3>
+    <p>Every model takes longer at 26k than at 24k, and the increases broadly track expert-set size. The observed
+    steps support the proposed transfer mechanism, though the timing difference also includes additional computation.</p>
+  </div>
+  <h3>KV-cache effects remain unresolved</h3>
+  <p>Estimated cache size, active parameter count, attention architecture and quantisation vary together. These
+  context sweeps describe model behaviour but do not isolate its cause. Because all experts remain on the host,
+  this study does not test the earlier idea that KV-cache growth displaces resident experts.</p>
+  <p class="note"><b>DeepSeek’s cache layout still needs confirmation.</b> The 86 KB/token estimate assumes an
+  expanded cache. A compressed 512-wide latent plus rotary-position data would imply approximately 48 KB/token.
+  The server’s reported KV-buffer allocation at a known context length is needed to resolve the difference.</p>
 
-  <p class="cap">A three-parameter fit of <code>⌈tokens ÷ 24,576⌉ × transfer + tokens ÷ rate + fixed</code> was
-  attempted per model and is <b>not reported</b>: on four points whose first is a cold-mapping outlier it returned
-  residuals of 3.5–6.6 s and, for two models, an infinite marginal rate. The fit was absorbing the cold point into
-  its constant. The direct two-point step above measures the same quantity without that freedom.</p>
-
-  <p class="cap">The <b>12k column is cold</b>, not slow: it is the first prefill after each model loads, and it
-  faults the entire expert set in from disk. Later points in the same session are warm. It is kept because it is a
-  fair measure of what the first request after a load costs, which a user does feel — but it is not a point on the
-  context curve.</p>
-
-    <h2>Stability monitoring</h2>
-  <p>The observation window opens <b>when the sweep takes the card</b> and the figure reported is elapsed time under
-  load — not the driver extension's total process lifetime. An idle card stays "up" indefinitely and that number
-  carries no information; what the sweep is in a position to measure is how long the device keeps working while being
-  worked. The extension's process lifetime remains the invalidating signal: macOS restarts that process when the
-  device is re-enumerated, so an unbroken instance across the window is the claim that the card never left the bus
-  under load. It must still be interpreted alongside device-enumeration and error logs. The counters below await a
-  completed window.</p>
-
-    <div class="clock">
-    <div class="c good"><span class="n" id="up">1 h 21 min</span><span class="l">unbroken, under load</span></div>
-    <div class="c"><span class="n" id="steps">24</span><span class="l">card prefills, 6 models</span></div>
-    <div class="c good"><span class="n">0</span><span class="l">DART / IOMMU faults</span></div>
-    <div class="c good"><span class="n">0</span><span class="l">re-enumerations under load</span></div>
+  <h2 id="stability"><span class="section-number" aria-hidden="true">06</span>Stability during the sweep</h2>
+  <p class="deck">A completed observation window of 1 hour 21 minutes, measured from the first card prefill.
+  These figures are a recorded snapshot.</p>
+  <div class="figures" aria-label="Recorded stability observations">
+    <div class="fig"><div class="n" id="up">1<span> h </span>21<span> min</span></div><div class="l">unbroken observation window under load</div></div>
+    <div class="fig"><div class="n" id="steps">24</div><div class="l">card prefills across six models</div></div>
+    <div class="fig"><div class="n">0</div><div class="l">recorded DART / IOMMU faults</div></div>
+    <div class="fig"><div class="n">0</div><div class="l">re-enumerations under load</div></div>
   </div>
   <p class="cap"><code>tools/card-uptime.sh</code> samples process information, the I/O registry and the lock file
-  every five minutes. It does not open the device, so monitoring does not create a second hardware client.</p>
-  <div class="pred"><span class="tag2 p">baseline event, resolved</span>The driver instance carrying this sweep began
-  at <b>21:45:40 on 19 September</b>, while the card was idle. Preflight refused on the changed instance, as designed,
-  and it was cleared by hand before the sweep — at which point the cause was not established, and this note said so.
-  It is now established and it was not the card: the host itself rebooted at <b>21:45:12</b>, brought down by a faulty
-  USB device, and the driver extension came up 28 seconds later. <code>kern.boottime</code> and the extension's start
-  time agree to the second. The link never dropped below 16 GT/s ×4, no DART error data was latched, and nothing
-  crossed the Thunderbolt bus abnormally. The instance's age is therefore a fact about host uptime, not about the
-  card — which is why the figure above is measured from the sweep's first card step instead.</div>
+  every five minutes without opening the device or creating a second hardware client.</p>
+  <h3>What the observation window establishes</h3>
+  <p>The reported duration covers the sweep’s work on the card. Extension process lifetime is used as an invalidation
+  signal: macOS restarts the extension when the device is re-enumerated. An unbroken instance is interpreted alongside
+  device-enumeration and error logs, rather than used alone as evidence of stability.</p>
+  <div class="callout amber">
+    <span class="status-label">Baseline event · resolved</span>
+    <p>The host rebooted at <b>21:45:12 on 19 September</b>, attributed in the study notes to a faulty USB device.
+    The driver extension started 28 seconds later, at <b>21:45:40</b>. Preflight detected the changed instance and was
+    cleared manually before the sweep. The host boot time and extension start time explain the change in instance.</p>
+    <p>The notes report a 16 GT/s ×4 link, no latched DART errors and no abnormal Thunderbolt events. The extension’s
+    age therefore reflects host uptime; the duration above begins with the sweep’s first card step.</p>
+  </div>
 
-    <p class="note" style="margin-top:22px">Sources: <code>tools/disagg-crossmodel.sh</code> runs the sweep,
-  <code>tools/disagg-sweep.sh</code> is one half of it, <code>tools/disagg-analyse.py</code> makes these tables,
-  <code>tools/card-uptime.sh</code> keeps the clock, and the rows themselves are in
-  <code>disagg-bench/results.tsv</code> — all in the <a href="https://github.com/Davinchy/macuda">repository</a>.</p>
-
+  <aside class="sources" aria-labelledby="sources-title">
+    <h3 id="sources-title">Source records</h3>
+    <p><code>tools/disagg-crossmodel.sh</code> runs the sweep; <code>tools/disagg-sweep.sh</code> runs one backend;
+    <code>tools/disagg-analyse.py</code> produces the tables; <code>tools/card-uptime.sh</code> records stability.
+    The data is in <code>disagg-bench/results.tsv</code>, in the
+    <a href="https://github.com/Davinchy/macuda">macuda repository</a>.</p>
+  </aside>
 </main>
 
   <footer>
-    <p>Companion: <a href="disaggregation.html">Disaggregated inference</a>, including the measurements
-    that motivated this study.</p>
+    <p>Continue with <a href="disaggregation.html">Disaggregated inference</a> for the workflow and cost model,
+    or <a href="benchmarks.html">Benchmarks</a> for the consolidated performance report.</p>
   </footer>
-
 </div>
 </body>
 </html>

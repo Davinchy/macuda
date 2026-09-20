@@ -8,19 +8,9 @@
 <meta name="description" content="Research notes on RTX 5090 prompt processing and Metal generation for models larger than GPU memory, with measured results and corrected cost-model assumptions.">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
 <link rel="stylesheet" href="assets/style.css">
-<style>
-  .pred{border-left:3px solid var(--native);background:var(--surface);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:74ch;box-shadow:var(--shadow)}
-  .meas{border-left:3px solid var(--accent);background:var(--surface);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:74ch;box-shadow:var(--shadow)}
-  .tag2{display:inline-block;font:600 11px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;
-        padding:2px 7px;border-radius:3px;vertical-align:2px;margin-right:8px}
-  .tag2.p{background:var(--native-soft);color:var(--native)}
-  .tag2.m{background:var(--accent-soft);color:var(--accent-ink)}
-  .draft{background:var(--native-soft);color:var(--native);border:1px solid var(--native);border-radius:6px;
-         padding:10px 14px;margin:0 0 22px;font-size:15px;max-width:74ch}
-  .wrong{text-decoration:line-through;opacity:.55}
-</style>
+<link rel="stylesheet" href="assets/research.css">
 </head>
-<body>
+<body class="research-page">
 <a class="skip-link" href="#main-content">Skip to content</a>
 
 <header class="topbar">
@@ -40,125 +30,231 @@
 <div class="wrap">
 <main id="main-content" tabindex="-1">
 
-  <p class="note" style="max-width:74ch"><b>Two assumptions on this page were revised after testing, and both are
-  shown in their wrong and right versions</b> — the correction is the most useful thing here. Measurements and model
-  estimates are labelled separately throughout.</p>
+  <nav class="research-nav" aria-label="Research pages">
+    <span class="label">Research</span>
+    <a href="disaggregation.html" aria-current="page">Disaggregated inference</a>
+    <a href="crossmodel.html">Cross-model study</a>
+  </nav>
 
   <section class="hero">
-    <div class="eyebrow">Disaggregated inference · 19 September 2026 · 21:20–21:34</div>
-    <h1>Prompt processing on the RTX 5090. Generation on the Mac.</h1>
-    <p class="lede">A model larger than the GPU's 32 GB of memory can still benefit from CUDA prompt processing.
-    Experts stream from host memory over Thunderbolt during prefill, then the model's conversation state transfers to
-    a Metal server for generation. These experiments measure the prefill stage and test the assumptions behind its cost model.</p>
+    <div class="eyebrow">Disaggregated inference · 19–20 September 2026</div>
+    <h1>CUDA prefill.<br>Metal generation.</h1>
+    <p class="lede">Process the prompt on an RTX 5090, then generate the response on the Mac. Split inference lets
+    models larger than the card’s 32 GB of memory benefit from CUDA prompt processing.</p>
   </section>
 
-  <h2>Measured prefill gains at longer context</h2>
-  <div class="meas"><span class="tag2 m">measured, and partly superseded</span><b>The prefill speedup increases with
-  prompt length.</b> That direction has now been measured twice on Qwen3-Coder-Next and holds both times. <b>The
-  magnitude has not replicated.</b> The first run put it at 2.35× → 5.55×; a re-measurement the following night, on
-  the same model and machine, put it at 2.77× → 3.86×. The short end agrees; the long end does not, and the reason is
-  on the Metal side. Both runs are below.</div>
+  <div class="figures" aria-label="Latest Qwen3-Coder-Next prefill measurement at approximately 48k tokens">
+    <div class="fig"><div class="n">3.86<span>×</span></div><div class="l">prefill speedup at ~48k tokens · 20 September</div></div>
+    <div class="fig"><div class="n">27.2 <span>s</span></div><div class="l">RTX 5090 prefill at ~48k tokens</div></div>
+    <div class="fig"><div class="n">104.9 <span>s</span></div><div class="l">Metal prefill on the same prompt</div></div>
+    <div class="fig"><div class="n">49.6 <span>GB</span></div><div class="l">Qwen3-Coder-Next 80B-A3B model file</div></div>
+  </div>
 
-    <div class="tablewrap"><table>
-    <thead><tr><th>Prompt</th><th class="r">RTX 5090</th><th class="r">Mac's GPU</th><th class="r">Mac's rate</th><th class="r">Prefill speedup</th></tr></thead>
+  <nav class="toc" aria-label="On this page">
+    <b>Contents</b>
+    <ol>
+      <li><a href="#workflow">The inference workflow</a></li>
+      <li><a href="#measurements">Measured prefill gains</a></li>
+      <li><a href="#boundary">Microbatch boundary cost</a></li>
+      <li><a href="#cost-model">Revised cost model</a></li>
+      <li><a href="#model-selection">Compute and memory</a></li>
+      <li><a href="#screening">Screening a model</a></li>
+      <li><a href="#what-for">What this is for</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="workflow"><span class="section-number" aria-hidden="true">01</span>One model, two processing stages</h2>
+  <p>During prefill, experts stream from host memory over Thunderbolt to the RTX 5090. The conversation state
+  then transfers to a Metal server for token generation. The model’s experts do not all need to fit in the card’s memory.</p>
+  <ol class="pipeline" aria-label="Split inference workflow">
+    <li><h3>CUDA prefill</h3><p>The RTX 5090 processes the prompt, streaming experts once per microbatch.</p></li>
+    <li><h3>State handoff</h3><p>The conversation state is saved and restored into the Metal server.</p></li>
+    <li><h3>Metal generation</h3><p>The Mac’s GPU generates the response using the transferred state.</p></li>
+  </ol>
+  <p class="cap">The experiments below measure prefill only. State-transfer time and subsequent generation are
+  excluded from the reported speedups.</p>
+
+  <h2 id="measurements"><span class="section-number" aria-hidden="true">02</span>Measured prefill gains</h2>
+  <p class="deck">Qwen3-Coder-Next benefits from CUDA at longer context in both runs. The size of that benefit
+  varies, particularly in the Metal measurements.</p>
+  <div class="callout">
+    <span class="status-label">Latest measurement</span>
+    <p>On 20 September, prefill speedup increased from <b>2.77× near 24k tokens</b> to <b>3.86× near 48k</b>.
+    The earlier run recorded 2.35× and 5.55×. The long-context result has not replicated at the original magnitude;
+    use the more recent <b>3.86×</b> figure when citing this experiment.</p>
+  </div>
+  <p class="table-scroll-hint">Scroll the table to view all columns <span aria-hidden="true">→</span></p>
+  <div class="tablewrap" role="region" aria-label="Prefill measurements; scroll horizontally for all columns" tabindex="0"><table>
+    <caption class="sr-only">Qwen3-Coder-Next prefill measurements on 19 and 20 September 2026</caption>
+    <thead><tr><th scope="col">Prompt</th><th scope="col" class="r">RTX 5090</th><th scope="col" class="r">Metal</th><th scope="col" class="r">Metal rate</th><th scope="col" class="r">Prefill speedup</th></tr></thead>
     <tbody>
-      <tr><td class="model">23,691 tokens<small>19 Sep, first run</small></td><td class="r">15.0 s</td><td class="r">35.2 s</td><td class="r">673 tok/s</td><td class="r">2.35×</td></tr>
-      <tr><td class="model">26,156 tokens<small>19 Sep, first run</small></td><td class="r">22.0 s</td><td class="r">64.6 s</td><td class="r">405 tok/s</td><td class="r">2.94×</td></tr>
-      <tr><td class="model">48,667 tokens<small>19 Sep, first run</small></td><td class="r">28.9 s</td><td class="r">160.3 s</td><td class="r">304 tok/s</td><td class="r">5.55×</td></tr>
-      <tr><td class="model">23,999 tokens<small>20 Sep, re-measured</small></td><td class="r">13.5 s</td><td class="r">37.5 s</td><td class="r">641 tok/s</td><td class="r">2.77×</td></tr>
-      <tr><td class="model">25,999 tokens<small>20 Sep, re-measured</small></td><td class="r">20.4 s</td><td class="r">42.7 s</td><td class="r">610 tok/s</td><td class="r">2.09×</td></tr>
-      <tr><td class="model">47,999 tokens<small>20 Sep, re-measured</small></td><td class="r">27.2 s</td><td class="r">104.9 s</td><td class="r"><b>458 tok/s</b></td><td class="r"><b>3.86×</b></td></tr>
+      <tr><th scope="row" class="model">23,691 tokens<small>19 Sep, first run</small></th><td class="r">15.0 s</td><td class="r">35.2 s</td><td class="r">673 tok/s</td><td class="r result-best">2.35×</td></tr>
+      <tr><th scope="row" class="model">26,156 tokens<small>19 Sep, first run</small></th><td class="r">22.0 s</td><td class="r">64.6 s</td><td class="r">405 tok/s</td><td class="r result-best">2.94×</td></tr>
+      <tr><th scope="row" class="model">48,667 tokens<small>19 Sep, first run</small></th><td class="r">28.9 s</td><td class="r">160.3 s</td><td class="r">304 tok/s</td><td class="r result-best">5.55×</td></tr>
+      <tr class="group-start"><th scope="row" class="model">23,999 tokens<small>20 Sep, re-measured</small></th><td class="r">13.5 s</td><td class="r">37.5 s</td><td class="r">641 tok/s</td><td class="r result-best">2.77×</td></tr>
+      <tr><th scope="row" class="model">25,999 tokens<small>20 Sep, re-measured</small></th><td class="r">20.4 s</td><td class="r">42.7 s</td><td class="r">610 tok/s</td><td class="r result-best">2.09×</td></tr>
+      <tr><th scope="row" class="model">47,999 tokens<small>20 Sep, re-measured</small></th><td class="r">27.2 s</td><td class="r">104.9 s</td><td class="r"><b>458 tok/s</b></td><td class="r result-best"><b>3.86×</b></td></tr>
     </tbody>
   </table></div>
   <p class="cap">Qwen3-Coder-Next 80B-A3B, approximately 46.2 GiB (49.6 GB), with all experts in host memory.
-  Both backends use the same model file and prompts. Timings cover prefill only and exclude state transfer and subsequent
-  token generation.</p>
-  <p>The earlier cost model assumed constant Metal prefill throughput of 660 tok/s, based on a measurement near
-  24,000 tokens. Both runs agree that it is not constant, and both agree closely at the short end — 673 and 641 tok/s.
-  A constant-throughput assumption therefore understates the benefit at longer context in either case.</p>
+  Both backends use the same model file and matching prompts within each run. The first measurements were recorded
+  on 19 September, 21:20–21:34; the repeat comes from the <a href="crossmodel.html">20 September cross-model study</a>.</p>
 
-  <div class="pred"><span class="tag2 p">unresolved discrepancy</span><b>The card side replicated; the Mac side did
-  not.</b> The RTX 5090's times agree across the two runs to within 10% (15.0 → 13.5 s, 28.9 → 27.2 s), and Metal
-  agrees at 24k (35.2 → 37.5 s). At 48k, Metal went from <b>160.3 s to 104.9 s</b> — 53% faster on the second run,
-  and that single figure is the entire difference between a published 5.55× and a measured 3.86×.
-  <b>Leading hypothesis, untested:</b> during the first run the 49.6 GB model was read from an external SSD that was
-  100% full and measured at 41 MB/s; for the second it had been moved to a drive measured at 398 MB/s. A prefill long
-  enough for the page cache to come under pressure would then pay disk reads in the first case and not the second. A
-  same-night A/B on a <i>card-resident</i> model found no disk effect at all — but that case keeps every weight in
-  VRAM after load, so it does not test this one. Until it is tested, <b>the lower figure is the one to quote.</b></div>
-  <div class="pred"><span class="tag2 p">revised assumption</span><b>Earlier prediction:</b> the speedup would fall
-  from 4.2× at 24k tokens to 3.2× at 192k as the key-value (KV) cache displaced resident experts. The measurements above
-  show the opposite direction within the tested range. They do not validate behaviour at 192k tokens, and the
-  all-experts-on-host configuration does not directly test expert displacement.</div>
+  <h3>The long-context difference is on the Metal side</h3>
+  <p>RTX 5090 timings at the short and long endpoints agree within 10% across the two runs:
+  15.0 versus 13.5 seconds, and 28.9 versus 27.2 seconds. Metal is also close near 24k, at 35.2 versus 37.5 seconds.
+  Near 48k, however, Metal elapsed time falls from <b>160.3 to 104.9 seconds</b>, accounting for most of the change
+  in the reported speedup.</p>
+  <div class="callout amber">
+    <span class="status-label">Unresolved discrepancy</span>
+    <p><b>Storage and page-cache pressure are the leading hypothesis.</b> The first run read the 49.6 GB model from
+    a full external SSD measured at 41 MB/s. For the repeat, the model had moved to a drive measured at 398 MB/s.
+    A longer prefill could incur more disk reads if the page cache comes under pressure.</p>
+    <p>A separate A/B test found no disk effect for a model resident entirely in card memory, but that test does
+    not resolve the host-resident case. The storage explanation remains untested.</p>
+  </div>
 
-    <h2>The cost of crossing a microbatch boundary</h2>
+  <h3>The constant-throughput assumption needs revision</h3>
+  <p>The initial cost model assumed Metal prefill stayed at 660 tok/s, based on a measurement near 24k tokens.
+  Both runs show lower throughput near 48k. A constant rate therefore understates the measured long-context benefit.</p>
+  <p class="note">An earlier prediction put speedup at 4.2× at 24k and 3.2× at 192k, assuming KV-cache growth would
+  displace resident experts. The tested range shows the opposite direction. It does not establish behaviour at 192k,
+  and this all-experts-on-host configuration does not directly test expert displacement.</p>
 
-  <p>llama.cpp processes a long prompt in microbatches, called <b>ubatches</b>. In this configuration, each ubatch
-  contains at most 24,576 tokens and requires another transfer of the host-resident experts. The original six-point
-  fit covered only single-ubatch prompts, so the repeated transfer cost had been inferred from source code without
-  a measurement across the boundary.</p>
-
-  <div class="meas"><span class="tag2 m">measured</span><b>A measurable step at the boundary.</b> Two prompts on either side of the boundary,
-  each repeated twice with matching timings: 23,691 tokens (one ubatch) takes <b>15.0 s</b>, and 26,156 tokens (two
-  ubatches) takes <b>22.0 s</b>. The fitted compute rate accounts for approximately 0.8 s of the increase. The remaining 6.2 s is consistent
-  with another expert transfer.</div>
-
-  <div class="tablewrap"><table class="compact">
-    <thead><tr><th>Prompt</th><th class="r">ubatches</th><th class="r">if paid per prompt</th><th class="r">if paid per ubatch</th><th class="r">measured</th></tr></thead>
+  <h2 id="boundary"><span class="section-number" aria-hidden="true">03</span>The cost of a second microbatch</h2>
+  <p>llama.cpp processes long prompts in microbatches, called <b>ubatches</b>. In this configuration, each holds
+  up to <b>24,576 tokens</b> and requires another transfer of host-resident experts. The original six-point fit covered
+  only single-microbatch prompts, so it could not measure the repeated transfer cost.</p>
+  <div class="callout">
+    <span class="status-label">Measured across the boundary</span>
+    <p>A 23,691-token prompt takes <b>15.0 seconds</b>; a 26,156-token prompt takes <b>22.0 seconds</b>. Each was
+    repeated twice with matching timings. The fitted compute rate accounts for approximately 0.8 seconds of the
+    increase; the remaining 6.2 seconds is consistent with another expert transfer.</p>
+  </div>
+  <p class="table-scroll-hint">Scroll the table to view all columns <span aria-hidden="true">→</span></p>
+  <div class="tablewrap" role="region" aria-label="Microbatch timing comparison; scroll horizontally for all columns" tabindex="0"><table class="compact">
+    <caption class="sr-only">Measured prefill times compared with per-prompt and per-microbatch transfer assumptions</caption>
+    <thead><tr><th scope="col">Prompt</th><th scope="col" class="r">Microbatches</th><th scope="col" class="r">Per-prompt model</th><th scope="col" class="r">Per-microbatch model</th><th scope="col" class="r">Measured</th></tr></thead>
     <tbody>
-      <tr><td>23,691 tokens</td><td class="r">1</td><td class="r">15.0 s</td><td class="r">13.5 s</td><td class="r">15.0 s</td></tr>
-      <tr><td>26,156 tokens</td><td class="r">2</td><td class="r">16.2 s</td><td class="r"><b>22.0 s</b></td><td class="r"><b>22.0 s</b></td></tr>
+      <tr><td>23,691 tokens</td><td class="r">1</td><td class="r">15.0 s</td><td class="r">13.5 s</td><td class="r result-best">15.0 s</td></tr>
+      <tr><td>26,156 tokens</td><td class="r">2</td><td class="r">16.2 s</td><td class="r"><b>22.0 s</b></td><td class="r result-best"><b>22.0 s</b></td></tr>
     </tbody>
   </table></div>
   <p class="cap">An earlier test used four evenly spaced prompts that could fit either a step or a smooth slope.
-  Sampling immediately on both sides of a ubatch boundary distinguished the two explanations.</p>
+  Sampling immediately on both sides of the boundary distinguished those explanations.</p>
 
-  <h2>Refitting the RTX 5090 cost model</h2>
-  <div class="meas"><span class="tag2 m">measured</span>Four prefill measurements fit
-  <code>⌈tokens ÷ 24,576⌉ × 6.21 s + tokens ÷ 3,300 + 1.65 s</code> with a root-mean-square residual of 0.10 s. The revised estimates are: the expert stream costs <b>6.21 s</b> per ubatch rather than 8.00, implying the link carries
-  it at <b>7.0 GiB/s</b> rather than 5.46; and a marginal prefill rate of <b>3,300 tok/s</b>, replacing the earlier 5,150 tok/s estimate.
-  These are fitted parameters for this model and configuration, not general hardware limits.</div>
+  <h2 id="cost-model"><span class="section-number" aria-hidden="true">04</span>Revised RTX 5090 cost model</h2>
+  <p>Four prefill measurements fit the expression below with a root-mean-square residual of <b>0.10 seconds</b>.
+  The transfer term is paid once per microbatch.</p>
+  <pre aria-label="Fitted prefill time in seconds"><code>time = ⌈tokens ÷ 24,576⌉ × 6.21 s + tokens ÷ 3,300 + 1.65 s</code></pre>
+  <div class="setup">
+    <div><span class="k">Expert transfer</span><b>6.21 s</b> per microbatch<br>Previously estimated at 8.00 s</div>
+    <div><span class="k">Implied transfer rate</span><b>7.0 GiB/s</b><br>Previously estimated at 5.46 GiB/s</div>
+    <div><span class="k">Marginal prefill rate</span><b>3,300 tok/s</b><br>Previously estimated at 5,150 tok/s</div>
+  </div>
+  <p class="cap">These are fitted parameters for Qwen3-Coder-Next in this configuration, not general hardware limits.
+  The <a href="crossmodel.html#interpretation">cross-model study</a> explains why the same fitting approach was
+  unsuitable for its sweep, which included cold-start measurements.</p>
 
-  <h2>Model selection: compute and memory</h2>
-  <p>Two model properties motivate this research: the amount of computation required per token and the amount of
-  model data that must cross Thunderbolt.</p>
+  <h2 id="model-selection"><span class="section-number" aria-hidden="true">05</span>Choosing a model: compute and memory</h2>
+  <p class="deck">Two properties matter: the computation required per token and the amount of model data that
+  must cross Thunderbolt.</p>
   <h3>Active parameters</h3>
-  <p>In a mixture-of-experts (MoE) model, only a subset of experts is used for each token. Total parameter count
-  therefore gives an incomplete picture of the work involved. The working hypothesis is that models with more active
-  parameters will benefit more from CUDA prefill. The <a href="crossmodel.html">cross-model study</a> is designed
-  to test that relationship beyond the single model measured here.</p>
+  <p>A mixture-of-experts model uses only a subset of its experts for each token. Total parameter count therefore
+  gives an incomplete picture of the work involved. The working hypothesis is that more active parameters increase
+  the benefit of CUDA prefill. The <a href="crossmodel.html">six-model study</a> tests this relationship beyond
+  Qwen3-Coder-Next.</p>
   <h3>Memory requirements</h3>
-  <p>Weights, the KV cache and working buffers all consume memory. A model that fits entirely on the RTX 5090 can use
-  the direct CUDA path. Split inference targets larger MoE models whose experts can be streamed during prefill and
-  whose decode stage fits in the Mac's available memory. File size alone does not establish either fit.</p>
-  <div class="pred"><span class="tag2 p">design consideration</span><b>Expert reuse differs between prefill and
-  decode.</b> A cache policy that benefits token-by-token generation may offer less benefit when processing a long
-  prompt. The configuration measured here transfers every expert per ubatch; it does not assume a particular routing
-  distribution.</div>
+  <p>Weights, the key-value (KV) cache and working buffers all consume memory. A model that fits entirely on the
+  RTX 5090 can use the direct CUDA path. Split inference targets larger MoE models whose experts can stream during
+  prefill and whose generation stage fits in the Mac’s available memory. File size alone does not establish either fit.</p>
+  <div class="callout amber">
+    <span class="status-label">Design consideration</span>
+    <p><b>Expert reuse differs between prefill and generation.</b> A cache policy that helps token-by-token generation
+    may be less effective for a long prompt. This configuration transfers every expert per microbatch and does not
+    assume a particular routing distribution.</p>
+  </div>
 
-    <h2>Screening a model before downloading it</h2>
-  <p><code>tools/disagg-screen.py</code> reads a GGUF's header — a few megabytes at the front of the file, no weights
-  mapped, no card involved — and estimates transfer volume, relative prefill time and a crossover prompt length. It does not score dense models larger than the GPU, because this workflow depends on expert streaming.</p>
-  <p class="note">Two caveats on the tool, both found after it had already ranked candidates. It still uses the
-  constant Metal-throughput assumption discussed above, so its long-context estimates are provisional. And until
-  2026-09-20 it read a <b>sharded</b> GGUF as its first shard alone — which is not a rounding error, since the
-  transfer volume it understates is the fixed cost that sets the whole result: one 69 GB model screened as 37 GB
-  streaming 7.3 GiB at 5.5×, where it is 69 GB streaming 39 GiB at 3.4×. Every model in this size band ships
-  sharded. It also credited the card with its full 30 GiB for resident experts while ignoring the 8–11 GiB compute
-  buffer a 24,576-token ubatch actually reserves; the resident budget is now 21 GiB. Both are fixed, but any ranking
-  produced before that date was flattering.</p>
+  <h2 id="screening"><span class="section-number" aria-hidden="true">06</span>Screening a model before downloading it</h2>
+  <p><code>tools/disagg-screen.py</code> reads the GGUF header to estimate transfer volume, relative prefill
+  time and a crossover prompt length. It reads only a few megabytes, without mapping model weights or opening the
+  card. Dense models larger than the GPU are excluded because this workflow depends on expert streaming.</p>
+  <h3>Corrections to the screening estimates</h3>
+  <p>Two issues were corrected on 20 September. Rankings produced before that date may overstate the benefit:</p>
+  <ul>
+    <li><b>Sharded model files.</b> The tool previously counted only the first shard. One 69 GB model was reported
+    as 37 GB, with 7.3 GiB of expert transfer and a 5.5× estimated gain. The corrected figures were 69 GB, 39 GiB
+    of transfer and a 3.4× estimated gain.</li>
+    <li><b>Compute-buffer reservations.</b> The tool previously assigned the full 30 GiB budget to resident experts,
+    omitting the 8–11 GiB compute buffer reserved for a 24,576-token microbatch. The resident-expert budget is now 21 GiB.</li>
+  </ul>
+  <p class="note">The tool still assumes constant Metal throughput. Its long-context projections remain provisional
+  until that part of the model is revised.</p>
 
-  <p class="note" style="margin-top:22px">Sources: <code>tools/disagg-router.py</code> for the cost model,
-  <code>tools/disagg-screen.py</code> for screening, <code>docs/disagg-inference-state.md</code> for the measured
-  windows, all in the <a href="https://github.com/Davinchy/macuda">repository</a>.</p>
+  <h2 id="what-for"><span class="section-number" aria-hidden="true">07</span>What this is for</h2>
+  <p>Some work cannot leave the building. Court transcripts, patient records, case files, documents under legal
+  hold, an unreleased codebase — the material that most needs careful reading is often exactly the material you are
+  not permitted to send to an API. For that work the choice is not cloud or local. It is <b>local or not at
+  all</b>.</p>
 
+  <p>That constraint has a second edge. When accuracy is what matters, you want the largest model you can run, not
+  the fastest one — and the models worth running for that are 50–100 GB, which an Apple Silicon Mac can hold but
+  cannot process quickly. This is the intersection this path exists for: <b>work that must stay on the machine,
+  against a model chosen for accuracy, on hardware that makes it impractical.</b></p>
+
+  <div class="callout">
+    <span class="status-label">What impractical means, measured</span>
+    <p>Mixtral 8x22B processing a 48,000-token prompt on the Mac's GPU takes <b>615 seconds</b> — ten and a quarter
+    minutes before the first token of the answer. The same prompt on the RTX 5090 takes <b>59 seconds</b>. Nobody
+    waits out the first figure document after document; that is the difference between a workflow and a
+    demonstration.</p>
+  </div>
+
+  <h3>Measured on a real task</h3>
+  <p>Eighteen source files from the VLC codebase, audited for a genuine question — does this file write outside the
+  application folder — with the same model, the same prompts and the same token limits on both halves. Long input,
+  short structured answer, nothing cached between files.</p>
+  <div class="tablewrap"><table class="compact">
+    <thead><tr><th>Input</th><th class="r">Metal only</th><th class="r">Split</th><th class="r">Gain</th></tr></thead>
+    <tbody>
+      <tr><td>23,278 tokens</td><td class="r">33.8 s</td><td class="r">12.6 s</td><td class="r"><b>2.67×</b></td></tr>
+      <tr><td>19,461 tokens</td><td class="r">26.9 s</td><td class="r">9.5 s</td><td class="r">2.83×</td></tr>
+      <tr><td>11,367 tokens</td><td class="r">14.8 s</td><td class="r">7.3 s</td><td class="r">2.03×</td></tr>
+      <tr><td>all eighteen files</td><td class="r">251 s</td><td class="r">146 s</td><td class="r"><b>1.72×</b></td></tr>
+    </tbody>
+  </table></div>
+  <p class="cap">Qwen3-Coder-Next 80B-A3B, 20 September 2026. End-to-end wall time per request, including the
+  state transfer between the two GPUs — not prefill in isolation. Both halves produced identical findings on all
+  eighteen files, including the real one: VLC's media library writes <code>ml.db</code> into the user data
+  directory.</p>
+
+  <div class="callout amber">
+    <span class="status-label">Projected, not measured</span>
+    <p>Extending the same arithmetic to a
+  67,000-token document — the median book in a 1,401-volume scanned corpus — gives roughly <b>3.4×</b> for
+  extraction or flagging, where the answer is short, and <b>2.5×</b> for a written summary, where a couple of
+  thousand generated tokens dilute it. Generation runs on the same GPU in both arrangements, so the advantage
+  survives only while the input dominates the output; it disappears somewhere past 7,000 generated tokens. <b>No
+  legal or medical corpus has been run through this path.</b> The document figures are arithmetic from measured
+    rates, and the VLC row above is the only end-to-end measurement of a real task.</p>
+  </div>
+
+  <p class="cap">One practical note that cost a night to learn: the state handed between the two GPUs is hundreds
+  of megabytes per request, and where it is written is on the critical path. Writing it to a full, slow disk
+  reduced the gain above from 1.72× to <b>1.03×</b> — the entire benefit, erased by a default path.</p>
+
+  <aside class="sources" aria-labelledby="sources-title">
+    <h3 id="sources-title">Source records</h3>
+    <p><code>tools/disagg-router.py</code> contains the cost model; <code>tools/disagg-screen.py</code> handles
+    screening; <code>docs/disagg-inference-state.md</code> records the measured windows. All are in the
+    <a href="https://github.com/Davinchy/macuda">macuda repository</a>.</p>
+  </aside>
 </main>
 
   <footer>
-    <p>Related pages: <a href="benchmarks.html">Benchmarks</a>, <a href="crossmodel.html">Cross-model study</a>
-    and <a href="technicals.html">Architecture</a>.</p>
+    <p>Continue with the <a href="crossmodel.html">Cross-model study</a>, explore the consolidated
+    <a href="benchmarks.html">Benchmarks</a>, or read the <a href="technicals.html">Architecture</a>.</p>
   </footer>
-
 </div>
 </body>
 </html>
