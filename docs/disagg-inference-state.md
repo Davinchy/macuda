@@ -673,3 +673,35 @@ suspects); issue the requests one at a time and read them raw.
 Logs: `logs/disagg/serve/{card,metal,router}-20260916-162122.log` (09-16), `…-20260917-073136.log` (window 1),
 `…-20260917-073431.log` (control), `…-20260917-073533.log` (treatment), `…-20260917-234655-{card,metal,router}.log`
 (window 3), `logs/shim-opverify-20260916-162353.log`.
+
+## Does long context erode the advantage? Yes, and the mechanism is the KV cache (2026-09-19, modelled)
+
+Antonio: "let's also test the premise that context size will diminish returns. large context is the name of the
+game." It does, and not through the attention arithmetic - that scales on both sides and largely cancels in the
+ratio. It is the **KV cache, which lives on the CARD during prefill and takes its room from the resident experts.**
+Every GiB of cache is a GiB of experts that has to cross the link instead, once per ubatch.
+
+`tools/disagg-screen.py` now models it from the header (block_count x head_count_kv x (key+value length) x 2 bytes)
+and sweeps context at exact multiples of the ubatch. The multiples matter: between them the ratio saw-tooths,
+because 32,768 tokens pays the expert stream twice for 1.33 ubatches of work, and that artefact would otherwise be
+mistaken for the effect being measured.
+
+Coder-Next 80B-A3B (96 KB of cache a token):
+
+| context | KV cache on the card | speedup |
+|---:|---:|---:|
+| 24k | 2.2 GiB | 4.2x |
+| 48k | 4.5 GiB | 4.0x |
+| 96k | 9.0 GiB | 3.7x |
+| 192k | 18.0 GiB | 3.2x |
+
+**A quarter of the advantage is gone by 192k**, and it is gone smoothly rather than falling off a cliff - so long
+context remains worth doing on this path, it just costs. The decline is entirely explained by residency: at 192k the
+cache has taken 18 of the card's 30 GiB, so 18 more GiB of experts stream every ubatch.
+
+**Consequence for model selection, and it is a third axis alongside size and active parameters: KV bytes per token.**
+A model with aggressive grouped-query attention has a small cache and holds its advantage out to very long context;
+one with many KV heads degrades fast and can reach the point where the cache alone leaves no room on the card, which
+the screener reports as `oom` rather than as a number. When the workload is long-context, that axis may matter more
+than the other two.
+

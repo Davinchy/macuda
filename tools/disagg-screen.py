@@ -32,7 +32,49 @@ on this path, which is also where a user actually feels the pain.
     python3 tools/disagg-screen.py /Volumes/Models              # rank every .gguf found
     python3 tools/disagg-screen.py a.gguf b.gguf --resident 30  # how much fits on the card, GiB (default 28)
 """
-import argparse, importlib.util, math, os, sys
+import argparse, importlib.util, math, os, struct, sys
+
+
+def read_kv(path):
+    """The GGUF key/value table alone, for the fields the router's expert reader does not return. Header only, like
+    everything else here: a few MB at the front of the file, no weight mapped."""
+    scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+    with open(path, "rb") as f:
+        def rd(n):
+            b = f.read(n)
+            if len(b) != n: raise ValueError("header ends early")
+            return b
+        u32 = lambda: struct.unpack("<I", rd(4))[0]
+        u64 = lambda: struct.unpack("<Q", rd(8))[0]
+        def string(): return rd(u64()).decode("utf-8", "replace")
+        def value(vt):
+            if vt == 8: return string()
+            if vt == 9:
+                et = u32(); n = u64()
+                if et == 8: return [string() for _ in range(n)]
+                if et == 9: return [value(9) for _ in range(n)]
+                fmt = scalar[et]; return list(struct.unpack("<" + fmt * n, rd(struct.calcsize(fmt) * n)))
+            fmt = scalar[vt]; return struct.unpack("<" + fmt, rd(struct.calcsize(fmt)))[0]
+        if rd(4) != b"GGUF": raise ValueError("not a GGUF file")
+        u32(); u64(); n_kv = u64()
+        return {(k := string()): value(u32()) for _ in range(n_kv)}
+
+
+def kv_bytes_per_token(kv, arch):
+    """What one token of context costs in KV cache, at f16. Layers x KV heads x (key + value) head dims x 2 bytes.
+    Returns None when the header does not say, which is reported rather than guessed around."""
+    n_layer = kv.get(f"{arch}.block_count")
+    n_kv_head = kv.get(f"{arch}.attention.head_count_kv")
+    if isinstance(n_kv_head, list): n_kv_head = max(n_kv_head) if n_kv_head else None
+    n_head = kv.get(f"{arch}.attention.head_count")
+    if isinstance(n_head, list): n_head = max(n_head) if n_head else None
+    n_embd = kv.get(f"{arch}.embedding_length")
+    k_len = kv.get(f"{arch}.attention.key_length")
+    v_len = kv.get(f"{arch}.attention.value_length")
+    if k_len is None and n_embd and n_head: k_len = n_embd // n_head
+    if v_len is None: v_len = k_len
+    if not (n_layer and n_kv_head and k_len and v_len): return None
+    return n_layer * n_kv_head * (k_len + v_len) * 2      # 2 bytes an element, f16 cache
 
 GIB = float(1 << 30)
 CARD_VRAM_GIB = 30.0          # what a 32 GB card can actually hold once the driver's own reservations are out
@@ -43,6 +85,7 @@ CARD_UBATCH = 24576           # the card server's -ub: the stream is paid once p
 # The model both rates were measured on: Coder-Next 80B-A3B, whose active bytes a token work out at ~3.35 GiB. Every
 # other model's rates are scaled from these by its own active bytes, because prefill is compute-bound.
 BASE_ACTIVE_GIB = 3.35
+HANDOFF_PER_TOKEN = 3e-5     # seconds a token to save the slot state off the card and restore it into Metal
 
 
 def load_router():
@@ -55,6 +98,15 @@ def load_router():
 
 def card_seconds(tokens, streamed):
     return math.ceil(tokens / CARD_UBATCH) * (streamed / LINK_RATE) + tokens / CARD_RATE
+
+
+def plateau_at(streamed, active, tokens=None):
+    """Speedup at a given prompt length, or the long-prompt plateau when tokens is None."""
+    r = max(active / BASE_ACTIVE_GIB, 1e-6)
+    n = CARD_UBATCH if tokens is None else tokens
+    metal = n / (METAL_RATE / r)
+    card = math.ceil(n / CARD_UBATCH) * (streamed / LINK_RATE) + n / (CARD_RATE / r) + n * HANDOFF_PER_TOKEN
+    return metal / card
 
 
 def screen(router, path, resident_gib):
@@ -94,9 +146,11 @@ def screen(router, path, resident_gib):
     active = non_expert + expert_gib * frac
     row["active"] = active
     r = max(active / BASE_ACTIVE_GIB, 1e-6)
-    metal = CARD_UBATCH / (METAL_RATE / r)
-    card = streamed / LINK_RATE + CARD_UBATCH / (CARD_RATE / r)
-    row["plateau"] = metal / card
+    row["plateau"] = plateau_at(streamed, active)
+    try:
+        row["kv_per_tok"] = kv_bytes_per_token(read_kv(path), row["arch"])
+    except Exception:
+        row["kv_per_tok"] = None
     # Break-even prompt: below this, Metal alone is faster because the stream is not yet amortised.
     per_tok = r / METAL_RATE - r / CARD_RATE
     row["breakeven"] = (streamed / LINK_RATE) / per_tok
@@ -128,6 +182,7 @@ def main():
         if "error" in r:
             print(f"  could not read {os.path.basename(r['path'])}: {r['error']}")
 
+    resident_g = a.resident
     ok.sort(key=lambda r: (-(r["plateau"] if r["plateau"] == r["plateau"] else -1)))
     print(f"\ncard holds {a.resident:.0f} GiB; Metal prefill {METAL_RATE:.0f} tok/s, card {CARD_RATE:.0f} tok/s marginal,")
     print(f"link {LINK_RATE:.2f} GiB/s, expert stream paid once per {CARD_UBATCH} tokens.\n")
@@ -137,6 +192,32 @@ def main():
         be = f"{r['breakeven']:,.0f} tok" if "breakeven" in r else "-"
         ac = f"{r['active']:.1f}G" if "active" in r else "-"
         print(f"{r['name'][:39]:<40}{r['total_gib']:>7.1f}G{ac:>8}{r['streamed']:>7.1f}G{pl:>9}{be:>11}  {r['verdict']}")
+    # Does context erode the advantage? Yes, and not through the attention maths - through the KV cache, which lives
+    # on the CARD during prefill and takes its room from the resident experts. Every GiB of cache is a GiB that has
+    # to stream instead, once per ubatch. This prints the curve rather than asserting the shape.
+    # Contexts chosen as exact multiples of the ubatch on purpose. Between multiples the ratio saw-tooths - 32,768
+    # tokens pays the expert stream TWICE for 1.33 ubatches of work - and that artefact would otherwise be mistaken
+    # for the effect being measured. At multiples the only thing changing is how much cache is displacing experts.
+    ctx_list = [CARD_UBATCH, CARD_UBATCH * 2, CARD_UBATCH * 4, CARD_UBATCH * 8]
+    cands = [r for r in ok if not r["fits"] and r.get("kv_per_tok") and r["n_expert"]]
+    if cands:
+        print("\ncontext sweep - the KV cache lives on the card and displaces resident experts:")
+        print(f"{'model':<30}{'KV/tok':>8}" + "".join(f"{c//1024:>5}k{'cache':>7}{'ratio':>7}" for c in ctx_list))
+        for r in cands:
+            cells = ""
+            for c in ctx_list:
+                kv_gib = r["kv_per_tok"] * c / GIB
+                room = max(r["total_gib"] - r["expert_gib"], 0.0)          # non-expert weight, always resident
+                expert_room = resident_g - room - kv_gib
+                if expert_room < 0:
+                    cells += f"{'':>6}{kv_gib:>6.0f}G{'oom':>7}"
+                    continue
+                streamed = min(max(r["expert_gib"] - expert_room, 0.0), r["expert_gib"])
+                cells += f"{'':>6}{kv_gib:>6.1f}G{plateau_at(streamed, r['active'], c):>6.1f}x"
+            print(f"{r['name'][:29]:<30}{r['kv_per_tok']/1024:>7.0f}K{cells}")
+        print("'oom' = the cache alone no longer leaves room on the card at that context. Falling ratios are the premise")
+        print("confirmed: context eats residency, and residency is the only thing keeping experts off the link.")
+
     print("\nplateau = the speedup a long prompt converges to; break-even = the prompt length below which Metal alone wins.")
     print("active = bytes a token actually touches, which is the lever: more active parameters amortise the fixed expert")
     print("stream against more compute, so the speedup rises toward the ~7.8x card:Metal compute ratio. Total size alone")
