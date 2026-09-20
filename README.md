@@ -238,7 +238,11 @@ models/  logs/                not committed; see models/README.md
   hold-back was a flat 64 MB and the top 161 MB of what the allocator believed it owned was inside WPR2 - never hit only because
   no run had filled the card. `totalGlobalMem` now reports what can actually be handed out (32,285 MB of 32,607); free space is
   still reported as that total. Raising `gspFwHeapSize` without raising the reservation now fails the build.
-- CUDA graphs are compiled out (`GGML_CUDA_USE_GRAPHS` absent); `cudaGraph*` is stubbed. Upstream llama.cpp graphs hang on sm_120 anyway.
+- **CUDA graphs are built but not shipped on.** `libtinycudart` implements the subset ggml uses (capture, instantiate, update,
+  launch) and `libtinynv` can keep a replayed token resident as linked chains (`TINYNV_GRAPH_RESIDENT`), but the shipped
+  `libggml-cuda.a` is the no-graphs build: with graphs on, llama.cpp decode is correct and ~4% faster on the MoE while
+  stable-diffusion.cpp renders a blank image, because a recorded node keeps the kernel parameters marshalled at capture and
+  sd's per-step scalars live in those bytes. Per-node parameter update is the missing piece (`docs/driver/moe-next-steps.md` §12).
 - `test-backend-ops` MUL_MAT with mxfp4/nvfp4 hangs the card; probe it last in a session, if at all.
 - A llama.cpp checkout older than upstream `2f53959` corrupts its own heap in `test-backend-ops` on arm64 (ggml-cpu's rope work buffer)
   and will look like a driver crash; `setup.sh llama` applies that fix.

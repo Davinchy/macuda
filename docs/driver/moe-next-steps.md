@@ -163,3 +163,14 @@ parity. **Next: B' as a resident-chain replay** - capture at ggml's CUDA-graph b
 token's descriptors resident in the driver, link all chains into one, patch the timeline values and the first
 chain's input uploads, one submission a token. Estimated +15% MoE (parity), +3-4% dense. Needs the ggml-cuda host
 halves rebuilt with `-DGGML_CUDA_USE_GRAPHS` (host-only rebuild via the recovered fatbins).
+
+## 12. The graph subset is built, and it needs per-node parameter updates before it can ship (2026-09-19 17:28)
+
+`12734b3` (the runtime layer's capture/replay) and `c179183` (the driver's resident-chain recording) are in the
+tree, both off by default. Measured: capture/replay is +4% on the MoE decode (211.6/214.4 -> 220.8/220.6, texts
+byte-identical) and the resident chain is at parity with it in llama-bench despite being faster on the engine's own
+clock (token 4.39 ms vs 4.82). The gate then caught the blocker: **stable-diffusion.cpp renders a blank image under
+graphs**, because a recorded node keeps the kernel parameters marshalled at capture time and sd's per-step scalars
+live in those bytes. The fix is the piece NVIDIA's graphs have and this subset does not: per-node parameter update,
+so `cudaGraphExecUpdate` (and ggml's own update path) rewrites each node's marshalled bytes from the caller's
+current values before a replay. With that, the +4% and the resident chain underneath it both become gateable.
