@@ -1,7 +1,7 @@
 # Windows reference run 2026-09-14 21:11:26 — RTX 5090 in the AORUS box on the Windows PC, real NVIDIA driver
 
-**The configuration this was taken in, stated because it has already been mis-remembered once (2026-09-19: a peer
-session recorded it as an x16 slot capture and concluded a fresh reference would not be comparable).** The card was
+**The configuration this was taken in, stated because it was mis-remembered once (2026-09-19: a peer session inferred
+an x16 slot capture and concluded a fresh reference would not be comparable; it checked the file and retracted).** The card was
 in the AORUS enclosure, on the Windows PC, over Thunderbolt - not in a PCIe slot. The nvidia-smi line below records
 it: `pcie.link.gen.current` 4 and `pcie.link.width.current` 4, i.e. gen 4 x4, which is the enclosure's link and not
 a slot's x16. That is the same physical path the Mac numbers are taken over, so these ratios isolate the driver and
@@ -67,3 +67,19 @@ code   (ISO-8601 parser):    140.7 tok/s, 57.7% accept
 list   (planets):            153.1 tok/s, 62.3% accept
 greedy (Thunderbolt prompt): 124.7 tok/s, 48.6% accept
 ```
+
+## How far this reference is from the vendored tree, measured (2026-09-19)
+
+Asked because the ratios on the public page depend on it, and "different build era" had been asserted twice without a
+number - once by me. Measured in the vendored checkout:
+
+- Our tree is `git describe` **b10950 plus one commit** (`b906d25`, a ggml-cpu PCH / CACHE_LINE_SIZE heap-corruption fix).
+- This reference ran **b10970**: `git rev-list --count HEAD..b10970` = **20 commits** we do not have.
+- Of those twenty, exactly **one** touches `ggml-cuda`: `bfdc321` "HIP: fattn-mma: use fp32 accumulation on MFMA
+  devices (#28576)". All three of its hunks are AMD-only - the changed flash-attention config case sits inside
+  `ggml_cuda_fattn_mma_get_config_cdna`, and the other two inside `#elif defined(AMD_MFMA_AVAILABLE)` /
+  `AMD_WMMA_AVAILABLE` branches.
+
+**So the CUDA path is the same code on both sides, and the link is the same class (gen 4 x4, enclosure over
+Thunderbolt) on both sides.** The comparison isolates the driver and the host, which is what it is for. A fresh
+capture would confirm rather than correct it, so it is worth having but is not owed anything.
