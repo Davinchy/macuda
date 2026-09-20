@@ -83,3 +83,33 @@ number - once by me. Measured in the vendored checkout:
 **So the CUDA path is the same code on both sides, and the link is the same class (gen 4 x4, enclosure over
 Thunderbolt) on both sides.** The comparison isolates the driver and the host, which is what it is for. A fresh
 capture would confirm rather than correct it, so it is worth having but is not owed anything.
+
+## The attempt to re-take this on Linux, and why it stopped (2026-09-19 ~03:15)
+
+Antonio asked for a fresh native capture on the 5090 box under Linux. Everything was staged and the sweep did not
+run, for a hardware reason worth recording.
+
+Setup that worked: the box came up on a live Ubuntu 24.04.4 (kernel 6.17.0-14), the card enumerated at 07:00.0
+(`10de:2b85`) with `LnkCap 32GT/s x16` but `LnkSta 16GT/s x4 (downgraded)` - the enclosure over Thunderbolt, the
+same link class as this reference. The Windows volume mounted read-only with ntfs3 and holds all six models (four
+under `.lmstudio/models`, two under `egpu-reference/models`), so no copying was needed, and upstream's
+`llama-b10970-bin-ubuntu-cuda-12.8-x64` gave the *same build number* this reference used.
+
+What stopped it: **the machine hangs hard - no ping, no ssh, dead until a power cycle - shortly after the NVIDIA
+driver binds to the card and the GPU is touched.** The first `nvidia-smi` after the bind returned cleanly
+(`NVIDIA GeForce RTX 5090, 580.178.04, 4, 4, 32607 MiB`); the next GPU access killed it, producing no output at all.
+This reproduces on a **stock `nvidia-driver-580-open` (580.178.04)**, having first been seen by a peer session on a
+patched 570.144 - so it is not one driver's fault. The card and the enclosure are cleared by the obvious control:
+the same 5090 in the same AORUS box ran a full six-model sweep on the Mac an hour earlier. What is left is that
+PC's Thunderbolt path.
+
+One related observation, offered with its weight stated: before any driver loaded, that boot logged eight
+`PCIe Bus Error: severity=Uncorrectable (Non-Fatal), type=Transaction Layer` on the root port `0000:00:07.0` at
+80.557 s, all `ACSViol`, all recovered, with the endpoint at `07:00.0` reporting zero uncorrectable errors. On its
+own that reads as an enumeration artifact and I called it benign; with the hang now reproducing on a clean driver
+it deserves more weight than that, and it is recorded here so the next person weighs it themselves.
+
+**Consequence for the ratios on the public page: none.** They were never blocked on this. The 14 September capture
+and the Mac numbers already share the physical path (enclosure, gen 4 x4) and effectively the same CUDA code
+(twenty commits apart, one touching `ggml-cuda`, all its hunks AMD CDNA/MFMA). A Linux re-take would have confirmed
+them, not corrected them.
