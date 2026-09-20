@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Disaggregated Inference — macuda</title>
+<meta name="description" content="Prefill on the RTX 5090, decode on the Mac's own GPU. What was measured on 19 September 2026, including two predictions the measurement overturned.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .pred{border-left:3px solid var(--native);background:var(--surface);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:74ch;box-shadow:var(--shadow)}
+  .meas{border-left:3px solid var(--accent);background:var(--surface);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:74ch;box-shadow:var(--shadow)}
+  .tag2{display:inline-block;font:600 11px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;
+        padding:2px 7px;border-radius:3px;vertical-align:2px;margin-right:8px}
+  .tag2.p{background:var(--native-soft);color:var(--native)}
+  .tag2.m{background:var(--accent-soft);color:var(--accent-ink)}
+  .draft{background:var(--native-soft);color:var(--native);border:1px solid var(--native);border-radius:6px;
+         padding:10px 14px;margin:0 0 22px;font-size:15px;max-width:74ch}
+  .wrong{text-decoration:line-through;opacity:.55}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="inner">
+    <a class="brand" href="index.html"><span class="dot"></span>macuda <small>RTX 5090 · Apple Silicon</small></a>
+    <nav class="nav">
+      <a href="index.html">Overview</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="disaggregation.html" aria-current="page">Disaggregation</a>
+      <a href="technicals.html">Technicals</a>
+      <a class="repo" href="https://github.com/Davinchy/macuda">Repository</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <p class="draft"><b>Draft, not linked from the site.</b> Two of the claims on this page started out as predictions
+  and were overturned by measuring them. Both are shown, wrong version and right version, because the correction is
+  the most useful thing here.</p>
+
+  <section class="hero">
+    <div class="eyebrow">macuda · disaggregated inference · measured 19 September 2026, 21:20–21:34</div>
+    <h1>Prefill on the card, decode on the Mac</h1>
+    <p class="lede">A 50 GB model does not fit the card's 32 GB. It can still use the card for the half it is good
+    at: the card processes the prompt while the experts stream across Thunderbolt, then the conversation's state is
+    handed to the Mac's own GPU to generate from. Here is what that is actually worth.</p>
+  </section>
+
+  <h2>The headline, and it is the opposite of what was expected</h2>
+
+  <div class="meas"><span class="tag2 m">measured</span><b>Long context makes this <i>more</i> valuable, not less.</b>
+  The premise under test was that a longer prompt would erode the advantage. It does the reverse: the advantage more
+  than doubles between a 24k prompt and a 49k one, because the Mac's prefill degrades far faster with context than
+  the card's does.</div>
+
+  <div class="tablewrap"><table>
+    <thead><tr><th>Prompt</th><th class="r">card</th><th class="r">Mac's GPU</th><th class="r">Mac's rate</th><th class="r">advantage</th></tr></thead>
+    <tbody>
+      <tr><td class="model">23,691 tokens</td><td class="r">15.0 s</td><td class="r">35.2 s</td><td class="r">673 tok/s</td><td class="r">2.35×</td></tr>
+      <tr><td class="model">26,156 tokens</td><td class="r">22.0 s</td><td class="r">64.6 s</td><td class="r">405 tok/s</td><td class="r">2.94×</td></tr>
+      <tr><td class="model">48,667 tokens</td><td class="r">28.9 s</td><td class="r">160.3 s</td><td class="r"><b>304 tok/s</b></td><td class="r"><b>5.55×</b></td></tr>
+    </tbody>
+  </table></div>
+  <p class="cap">Qwen3-Coder-Next 80B-A3B, 46.2 GB, every expert on the host. Card half through this driver on the
+  5090 over Thunderbolt; Mac half on Apple's own GPU, same model file, same prompts, prefill only.</p>
+
+  <p>The cost model this project had been using assumed the Mac prefills at a <i>constant</i> 660 tok/s, because that
+  is what it measured once, at 24k. It holds there — 673 measured — and then falls apart: by 49k the Mac is down to
+  304 tok/s. Prompt processing is compute-bound, and an Apple GPU of this generation has no dedicated matrix
+  hardware, so the quadratic part of attention hurts it much more than it hurts the card.</p>
+
+  <div class="pred"><span class="tag2 p">overturned</span><span class="wrong">Predicted: the advantage decays with
+  context, from 4.2× at 24k to 3.2× at 192k, because the KV cache displaces resident experts.</span> The KV
+  displacement is real and does push the other way — but it is swamped several times over by the Mac's own
+  degradation. Modelling one side and assuming the other is what produced a confident number with the sign wrong.</div>
+
+  <h2>The assumption everything rested on, finally tested</h2>
+
+  <p>The card's cost has a ceiling function in it: llama.cpp re-copies every host-resident expert <i>for each ubatch
+  it evaluates</i>, so the expert stream is paid once per 24,576 tokens rather than once per prompt. Every one of the
+  six prefills the cost model was originally fitted to sat <i>inside</i> a single ubatch, so this had never been
+  observed — it had been read out of ggml's source.</p>
+
+  <div class="meas"><span class="tag2 m">measured</span><b>It is real.</b> Two prompts either side of one boundary,
+  each run twice, identical both times: 23,691 tokens (one ubatch) takes <b>15.0 s</b>, and 26,156 tokens (two
+  ubatches) takes <b>22.0 s</b>. Those 2,465 extra tokens are worth 0.8 s of compute. The other 6.2 s is the expert
+  stream being paid a second time.</div>
+
+  <div class="tablewrap"><table class="compact">
+    <thead><tr><th>Prompt</th><th class="r">ubatches</th><th class="r">if paid per prompt</th><th class="r">if paid per ubatch</th><th class="r">measured</th></tr></thead>
+    <tbody>
+      <tr><td>23,691 tokens</td><td class="r">1</td><td class="r">15.0 s</td><td class="r">13.5 s</td><td class="r">15.0 s</td></tr>
+      <tr><td>26,156 tokens</td><td class="r">2</td><td class="r">16.2 s</td><td class="r"><b>22.0 s</b></td><td class="r"><b>22.0 s</b></td></tr>
+    </tbody>
+  </table></div>
+  <p class="cap">A first attempt at this test used four equally-spaced prompts, and could not distinguish a step from
+  a slope — both fit those points. Only a pair straddling one boundary separates them.</p>
+
+  <h2>The card's constants, refit</h2>
+  <div class="meas"><span class="tag2 m">measured</span>Four fresh prefills on the current build fit
+  <code>⌈tokens ÷ 24,576⌉ × 6.21 s + tokens ÷ 3,300 + 1.65 s</code> to within 0.10 s rms. Two of the three shipped
+  constants were wrong: the expert stream costs <b>6.21 s</b> per ubatch rather than 8.00, implying the link carries
+  it at <b>7.0 GiB/s</b> rather than 5.46; and the card's marginal prefill rate is <b>3,300 tok/s</b>, not 5,150.</div>
+
+  <h2>Choosing a model</h2>
+  <p>Two properties decide whether a model belongs on this path, and the first is the one that gets misjudged.</p>
+
+  <h3>Active parameters, not total size</h3>
+  <div class="meas"><span class="tag2 m">measured, published</span>Prefill on an Apple GPU tracks
+  <code>1 ÷ active parameters</code> almost monotonically, across both mixtures and dense models. Published
+  llama.cpp Metal figures: a 3B-active mixture reaches 1,213 tok/s; a 5.1B-active one 737; a dense 22B, 239; a dense
+  70B about 85. Total parameter count barely matters — a 117B model with 5.1B active prefills roughly 8.7× faster
+  than a dense 70B.</div>
+  <p>That is the whole argument for this path. The card's advantage is largest exactly where the Mac is worst, and
+  the Mac is worst when many parameters are active. A mixture with few active parameters is already tolerable on the
+  Mac and has least to gain.</p>
+
+  <h3>Size, as a proxy for what must stream</h3>
+  <p>Whatever does not fit the card's roughly 30 usable GiB streams every ubatch. Below about 30 GB there is no
+  reason to use this path at all — the model fits the card outright, where this project measures 5.5–7.3× over the
+  Mac, beating anything here. Above about 100 GB the model no longer fits the Mac's memory for the decode half.</p>
+
+  <div class="pred"><span class="tag2 p">caution</span>One finding from upstream worth knowing before building on
+  expert streaming: during <i>decode</i>, expert routing is heavily skewed, so a small resident cache catches most
+  hits. During <i>prefill</i> that skew disappears and essentially every expert is touched. A design that assumes
+  routing skew will work for decode and fail for prefill. This project's path streams every expert per ubatch and so
+  never depended on the skew, but a cleverer one would.</div>
+
+  <h2>Screening a model before downloading it</h2>
+  <p><code>tools/disagg-screen.py</code> reads a GGUF's header — a few megabytes at the front of the file, no weights
+  mapped, no card involved — and reports what must stream, the predicted advantage, and the prompt length below
+  which the Mac alone wins. It refuses to score a dense model larger than the card, because expert streaming is the
+  mechanism and a dense model has no experts.</p>
+  <p class="note">Its context sweep still carries the overturned assumption above and reads low at long context. The
+  measured direction is the one on this page.</p>
+
+  <p class="note" style="margin-top:22px">Sources: <code>tools/disagg-router.py</code> for the cost model,
+  <code>tools/disagg-screen.py</code> for screening, <code>docs/disagg-inference-state.md</code> for the measured
+  windows, all in the <a href="https://github.com/Davinchy/macuda">repository</a>.</p>
+
+  <footer>
+    <p>Draft page — the companion pages are <a href="benchmarks.html">Benchmarks</a>, which is all measurement, and
+    <a href="technicals.html">Technicals</a>.</p>
+  </footer>
+
+</div>
+</body>
+</html>

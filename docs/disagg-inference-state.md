@@ -705,3 +705,42 @@ one with many KV heads degrades fast and can reach the point where the cache alo
 the screener reports as `oom` rather than as a number. When the workload is long-context, that axis may matter more
 than the other two.
 
+## Measured 2026-09-19 21:20-21:34: the ubatch step is real, the constants were wrong, and long context HELPS
+
+Antonio asked for these numbers to be thoroughly tested. Three results, two of which overturn what this project
+believed a few hours earlier.
+
+**1. The expert stream IS paid once per ubatch.** Every one of the six prefills the cost model was fitted to sits
+inside a single ubatch (longest 23,691 tokens; the ubatch is 24,576), so the ceiling function in
+`ceil(n/ub)*fixed + n/rate` had never been observed - it was read out of ggml's source. Two prompts either side of
+one boundary, each run twice, identical both times: **23,691 tokens 15.0 s, 26,156 tokens 22.0 s**. Those 2,465
+extra tokens are worth 0.8 s of compute; the other 6.2 s is the stream a second time. A first attempt used four
+equally-spaced prompts (23,691 / 48,667 / 72,795) and could NOT discriminate - a step and a slope both fit them to
+0.1 s. Only a pair straddling a boundary separates the two.
+
+**2. Two of the three card-side constants were wrong.** Refit on four fresh prefills, current build, 0.10 s rms:
+
+    card_seconds = ceil(tokens/24576) * 6.21 + tokens/3300 + 1.65
+
+against the shipped `* 8.00 + tokens/5150`. The stream costs 6.21 s not 8.00, implying the link carries the 43.69
+GiB at **7.0 GiB/s** rather than the assumed 5.46; and the marginal prefill rate is **3,300 tok/s**, not 5,150.
+
+**3. The context premise is inverted, and this is the important one.** The model assumed Metal prefills at a
+constant 660 tok/s. Measured on the same model and prompts:
+
+| tokens | card | Metal | Metal rate | advantage |
+|---:|---:|---:|---:|---:|
+| 23,691 | 15.0 s | 35.2 s | 673 tok/s | 2.35x |
+| 26,156 | 22.0 s | 64.6 s | 405 tok/s | 2.94x |
+| 48,667 | 28.9 s | 160.3 s | **304 tok/s** | **5.55x** |
+
+660 holds at 24k and then collapses. Prefill is compute-bound and an Apple GPU of this generation has no matrix
+hardware, so attention's quadratic term hurts it far more than it hurts the card. **The advantage therefore RISES
+with context - 2.35x to 5.55x between 24k and 49k - rather than decaying.** The KV-displacement model written
+earlier the same day is physically real but is swamped several times over; its predicted decay from 4.2x to 3.2x has
+the sign wrong. The lesson is the ordinary one: modelling one side of a ratio and assuming the other produces a
+confident number that can be wrong in direction, not just magnitude.
+
+`tools/disagg-screen.py`'s context sweep still carries the old assumption and reads low at long context. It has not
+been refitted because a proper refit wants Metal points at more than three lengths.
+
