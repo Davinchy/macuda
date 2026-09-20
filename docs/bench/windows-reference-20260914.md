@@ -1,4 +1,11 @@
 # Windows reference run 2026-09-14 21:11:26 — RTX 5090 in the AORUS box on the Windows PC, real NVIDIA driver
+
+**The configuration this was taken in, stated because it has already been mis-remembered once (2026-09-19: a peer
+session recorded it as an x16 slot capture and concluded a fresh reference would not be comparable).** The card was
+in the AORUS enclosure, on the Windows PC, over Thunderbolt - not in a PCIe slot. The nvidia-smi line below records
+it: `pcie.link.gen.current` 4 and `pcie.link.width.current` 4, i.e. gen 4 x4, which is the enclosure's link and not
+a slot's x16. That is the same physical path the Mac numbers are taken over, so these ratios isolate the driver and
+the host, not the link. A fresh capture in the enclosure IS comparable to this file.
 ```
 name, driver_version, pcie.link.gen.current, pcie.link.width.current, clocks.max.sm [MHz], memory.total [MiB]
 NVIDIA GeForce RTX 5090, 595.79, 4, 4, 3090 MHz, 32607 MiB
