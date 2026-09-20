@@ -23,13 +23,19 @@ def screen_mod():
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
 
 
+COLS = ["when", "side", "model", "prompt", "tokens", "prefill_s", "tok_s", "wall_s", "load_s"]
+
+
 def read_rows(path):
+    """Rows by SHAPE, not by trusting line 1 to be the header. Another tool writing its own header into this file
+    (tools/card-uptime.sh did, when it inherited an exported OUT) used to make the whole parse read the wrong
+    columns and fail on a KeyError far from the cause."""
     rows = []
     with open(path) as fh:
-        head = fh.readline().rstrip("\n").split("\t")
+        head = COLS
         for line in fh:
             f = line.rstrip("\n").split("\t")
-            if len(f) != len(head): continue
+            if len(f) != len(head) or f[0] == "when" or f[1] not in ("card", "metal"): continue
             d = dict(zip(head, f))
             for k in ("tokens", "prefill_s", "tok_s", "wall_s", "load_s"):
                 try: d[k] = float(d[k])
@@ -79,7 +85,9 @@ def main():
             cs = min(r["prefill_s"] for r in c) if c else float("nan")
             ms = min(r["prefill_s"] for r in m) if m else float("nan")
             a = ms / cs if c and m and cs > 0 else float("nan")
-            if a == a: adv.setdefault(mdl, {})[n] = a
+            # bucket to the nearest thousand: a slice asked for as 24,000 tokens is recorded as 23,999 (the last
+            # token is left for the decode side), and keying on the exact count silently empties the table
+            if a == a: adv.setdefault(mdl, {})[round(n / 1000) * 1000] = a
             f = lambda v, w, p=1: (f"{v:>{w}.{p}f}" if v == v else f"{'-':>{w}}")
             print(f"   {n:>8}{math.ceil(n/UB):>10}{f(cs,9)}{f(ms,9)}{f(n/cs if cs==cs and cs>0 else float('nan'),12,0)}"
                   f"{f(n/ms if ms==ms and ms>0 else float('nan'),13,0)}{(f'{a:.2f}x' if a==a else '-'):>11}")

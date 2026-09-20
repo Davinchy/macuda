@@ -39,6 +39,11 @@ deepseek-v4-flash-q2|$M/DeepSeek-V4-Flash-0731-GGUF/DeepSeek-V4-Flash-0731-UD-Q2
 mixtral-8x22b-a39b|$M/Mixtral-8x22B-Instruct-v0.1-GGUF/Mixtral-8x22B-Instruct-v0.1.Q4_K_S-00001-of-00002.gguf"
 
 echo "disagg-crossmodel: $(date '+%F %T') tokens: $TOKENS; results $OUT; log $LOG" | tee -a "$LOG"
+# start the stability clock here: what is worth knowing is how long the card keeps working while being worked, so the
+# window opens when the sweep takes it, not when the driver happened to load.
+# OUT is exported for the sweep's rows; card-uptime.sh reads $OUT too, so it has to be told its own file or the
+# clock's header lands in results.tsv ahead of the sweep's - which is exactly what happened on the first run.
+OUT=$B/card-uptime.tsv sh "$R/tools/card-uptime.sh" mark crossmodel-sweep 2>&1 | tee -a "$LOG"
 echo "$models" | while IFS='|' read -r tag model; do
   [ -f "$model" ] || { echo "== $tag: NO FILE at $model - skipped" | tee -a "$LOG"; continue; }
   # --n-cpu-moe wants a layer count; read it out of the header rather than carrying a table that can go stale

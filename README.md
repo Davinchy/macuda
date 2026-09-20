@@ -254,7 +254,21 @@ The 19 September prefill-only measurements extended the comparison:
 | 26,156 tokens | 22.0 s | 64.6 s | 2.94× |
 | 48,667 tokens | 28.9 s | 160.3 s | 5.55× |
 
-These timings exclude state transfer and generation. The configured microbatch size is 24,576 tokens, and expert data is transferred once per microbatch. Longer-context gains in this model do not establish the same behaviour across all models. The screening tool's constant Metal-throughput assumption remains provisional at longer context.
+**Re-measured 20 September, same model and machine — the direction replicated, the magnitude did not:**
+
+| Prompt length | RTX 5090 prefill | Metal prefill | Prefill speedup |
+|---|---:|---:|---:|
+| 23,999 tokens | 13.5 s | 37.5 s | 2.77× |
+| 25,999 tokens | 20.4 s | 42.7 s | 2.09× |
+| 47,999 tokens | 27.2 s | 104.9 s | **3.86×** |
+
+The RTX 5090 times agree across both runs to within 10%, and Metal agrees at 24k. At 48k Metal went from 160.3 s to
+104.9 s, and that single figure is the whole difference between 5.55× and 3.86×. The leading hypothesis is untested:
+the first run read the 49.6 GB model from an external SSD that was 100% full and measured at 41 MB/s, the second from
+one measured at 398 MB/s. **Quote 3.86× until that is resolved.** A same-night A/B found no disk effect on a
+card-resident model, but that case keeps every weight in VRAM after load and does not test this one.
+
+These timings exclude state transfer and generation. The configured microbatch size is 24,576 tokens, and expert data is transferred once per microbatch. A [six-model sweep](docs/bench/crossmodel-draft-20260919.html) since confirmed that the speedup tracks **active parameters** rather than model size, from 2.77× on this model to 10.37× on Mixtral 8x22B at 48k. The screening tool's constant Metal-throughput assumption remains provisional at longer context.
 
 Placement flags and saving state one token early are required by this implementation; see [tools/disagg-prefill.sh](tools/disagg-prefill.sh). Split generation can differ from Metal-only greedy output on near-ties because the backends use different activation numerics. See the [inference state and measurement record](docs/disagg-inference-state.md) for the full configuration and corrected cost model.
 

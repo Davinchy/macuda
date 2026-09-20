@@ -3,7 +3,13 @@
 #
 #   sh tools/card-uptime.sh sample            one row into $OUT
 #   sh tools/card-uptime.sh watch [seconds]   sample forever (default every 300 s)
+#   sh tools/card-uptime.sh mark <label>      stamp the moment the work starts; the clock runs FROM HERE
 #   sh tools/card-uptime.sh report            what the rows add up to
+#
+# THE CLOCK MEASURES TIME UNDER LOAD, not time since the driver loaded. A card sitting idle on a desk stays "up"
+# indefinitely and that number is worth nothing; what is worth knowing is how long it keeps working while being
+# worked. So the window opens at the `mark` a run writes when it takes the card, and the headline is the elapsed time
+# since then - with the driver instance's own age underneath, because a restart there is what would invalidate it.
 #
 # Everything here is read-only and card-free: ps, ioreg and the lock file. Nothing opens the device, because the
 # point is to measure a card that is busy with something else - a sampler that had to open it would be measuring
@@ -35,32 +41,40 @@ sample() {
   dart=clean; ioreg -l -w0 2>/dev/null | grep -q 'pci-dart-error-data' && dart=PRESENT
   if [ -f "$L" ]; then lock=$(sed -n 's/.*what=\([^ ]*\).*/\1/p' "$L" | tr -d '\n'); lock=${lock:-held}; else lock=free; fi
   busy=0; pgrep -qf 'llama-server-null|llama-bench-null|sd-cli-null|llama-speculative-simple-null' && busy=1
-  [ -f "$OUT" ] || printf 'when\tuptime_s\tdext_pid\tdext_started\tdart\tlock\tcard_busy\n' > "$OUT"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Iseconds)" "$up" "$pid" "$started" "$dart" "$lock" "$busy" >> "$OUT"
+  [ -f "$OUT" ] || printf 'when\tuptime_s\tdext_pid\tdext_started\tdart\tlock\tcard_busy\tmark\n' > "$OUT"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Iseconds)" "$up" "$pid" "$started" "$dart" "$lock" "$busy" "${1:-}" >> "$OUT"
 }
 
 report() {
   [ -f "$OUT" ] || { echo "no samples at $OUT"; exit 1; }
-  # macOS awk has no strftime, so the one date it needs is formatted here and passed in
+  # The window opens at the first mark, or failing that at the first sample that caught a card process running - a run
+  # that forgot to mark still gets a defensible start, just one rounded to the sampling interval.
+  ms=$(awk -F'\t' 'NR>1 && $8 != "" {print $1; exit}' "$OUT"); src="marked start"
+  [ -n "$ms" ] || { ms=$(awk -F'\t' 'NR>1 && $7 == 1 {print $1; exit}' "$OUT"); src="first sample that saw the card busy"; }
+  [ -n "$ms" ] || { echo "the card has not been worked since sampling began - no clock to report yet"; return 0; }
+  m0=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$(echo "$ms" | cut -c1-19)" +%s 2>/dev/null || echo 0)
+  el=$(( $(date +%s) - m0 ))
+  # macOS awk has no strftime, so the dates it needs are formatted here and passed in
   st=$(tail -1 "$OUT" | cut -f4); st_h=$(date -r "${st:-0}" '+%F %T' 2>/dev/null || echo "?")
-  awk -F'\t' -v st_h="$st_h" 'NR>1 {
-      n++; if (!first) { first=$1; start0=$4 } last=$1; up=$2; startN=$4; pid=$3
+  printf "card under load %d h %02d min, unbroken (from %s, %s)\n" $((el/3600)) $(((el%3600)/60)) "$(date -r $m0 '+%F %T')" "$src"
+  awk -F'\t' -v m0="$m0" -v st_h="$st_h" 'NR>1 {
+      n++; last=$1; pid=$3; if (!start0) start0=$4
       if ($4 != start0 && $4 != 0 && start0 != 0) reenum++
       if ($5 != "clean") faults++
       if ($7 == 1) busy++
     } END {
       if (!n) { print "no samples"; exit }
-      h = int(up/3600); m = int((up%3600)/60)
-      printf "card up %d h %02d min, unbroken (dext pid %s since %s)\n", h, m, pid, st_h
-      printf "%d samples between %s and %s\n", n, first, last
-      printf "%d re-enumerations, %d DART faults, %d samples (%.0f%%) with a card process live\n",
-             reenum+0, faults+0, busy+0, 100*busy/n
+      printf "   %d re-enumerations, %d DART faults in the window\n", reenum+0, faults+0
+      printf "   the driver instance has not restarted since %s (pid %s)\n", st_h, pid
+      printf "   %d samples, %d (%.0f%%) with a card process live; latest %s\n", n, busy+0, 100*busy/n, last
     }' "$OUT"
 }
 
 case "${1:-report}" in
   sample) sample ;;
+  mark)   sample "${2:?say what is starting, e.g. crossmodel-sweep}"
+          echo "marked '${2}' at $(date '+%F %T') - the clock runs from here" ;;
   watch)  iv=${2:-300}; echo "card-uptime: sampling every $iv s into $OUT"; while :; do sample; sleep "$iv"; done ;;
   report) report ;;
-  *) echo "usage: $0 sample|watch [seconds]|report"; exit 2 ;;
+  *) echo "usage: $0 sample|watch [seconds]|mark <label>|report"; exit 2 ;;
 esac

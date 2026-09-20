@@ -13,13 +13,18 @@ export TINYCC_ARCH=${ARCH:-sm_120a}
 ONLY=${ONLY:-}
 if [ -z "$ONLY" ]; then rm -rf "$OBJ" "$LOGD"; fi; mkdir -p "$OBJ" "$LOGD"
 export INC="-I$G/include -I$G/src -I$G/src/ggml-cuda"
-# docs/03-cuda-shim-plan.md §1: quantized matmul forced onto MMQ (cuBLAS only for residual GEMMs), no virtual memory
-# management, and CUDA graphs compiled OUT (USE_CUDA_GRAPH needs GGML_CUDA_USE_GRAPHS, which is deliberately absent:
-# ggml wraps cudaStreamBeginCapture in CUDA_CHECK, so a refused capture would abort rather than fall back)
-# DEFS_EXTRA adds to these (e.g. -DGGML_CUDA_USE_GRAPHS once the runtime layer answers the graph API); TINYCC_HOST_OPT sets
+# docs/03-cuda-shim-plan.md §1: quantized matmul forced onto MMQ (cuBLAS only for residual GEMMs) and no virtual
+# memory management. Graphs were compiled OUT until 2026-09-19 for a good reason - ggml wraps cudaStreamBeginCapture
+# in CUDA_CHECK, so a capture the runtime layer refused would abort rather than fall back - and they are IN now
+# because the runtime layer answers the graph API and the build was gated on it.
+# DEFS_EXTRA adds to these; TINYCC_HOST_OPT sets
 # the host optimisation level (tinycc, -O2 by default since 2026-09-19); TINYCC_REUSE_FATBIN=1 with the fatbins in /tmp
 # rebuilds the host halves alone, without the Linux box.
-export DEFS="-DGGML_CUDA_FORCE_MMQ -DGGML_CUDA_NO_VMM -DNDEBUG ${DEFS_EXTRA:-}"
+# GGML_CUDA_USE_GRAPHS is IN THE DEFAULT because the shipped archive is a graphs build (+4% MoE, gated 2026-09-19) -
+# it used to arrive only through DEFS_EXTRA, so a fresh clone running `sh setup.sh cuda` silently built without graphs
+# and lost that, with nothing to say why. GGML_CUDA_FORCE_MMQ is kept for the feature string but is a NO-OP on
+# Blackwell: ggml_cuda_should_use_mmq returns true at turing_mma_available(cc) (mmq.cu:320), above the #ifdef.
+export DEFS="-DGGML_CUDA_FORCE_MMQ -DGGML_CUDA_NO_VMM -DGGML_CUDA_USE_GRAPHS -DNDEBUG ${DEFS_EXTRA:-}"
 FA=""; for k in F16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16; do for v in F16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16; do FA="$FA -DGGML_CUDA_FA_${k}_${v}=1"; done; done
 export FA
 ls "$G"/src/ggml-cuda/*.cu "$G"/src/ggml-cuda/template-instances/*.cu > "$LOGD/tus.txt"

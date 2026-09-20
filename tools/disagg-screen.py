@@ -77,7 +77,12 @@ def kv_bytes_per_token(kv, arch):
     return n_layer * n_kv_head * (k_len + v_len) * 2      # 2 bytes an element, f16 cache
 
 GIB = float(1 << 30)
-CARD_VRAM_GIB = 30.0          # what a 32 GB card can actually hold once the driver's own reservations are out
+# What is left for RESIDENT EXPERTS, which is not the card's size. Measured from a real prefill server's own memory
+# breakdown (logs/disagg/prefill-server-20260916-134123.log): of 32,607 MiB the compute buffer alone took 11,169 at
+# ub=32768 (~8.4 GiB at the 24,576 this path uses), non-expert weight 2,249 and the KV reservation ~1,000. Screening
+# against the full 30 GiB credited every candidate with ~10 GiB of residency that does not exist, which flatters the
+# plateau of every model ranked so far. --resident overrides for a different ubatch or context.
+CARD_VRAM_GIB = 21.0
 METAL_RATE = 660.0            # Metal prefill tok/s at 24k. It does NOT hold: 673 at 24k, 405 at 26k, 304 at 49k
                               # (measured 2026-09-19). Prefill is compute-bound and Apple has no matrix hardware, so
                               # the quadratic term bites Metal far harder than the card. Every number below that uses
