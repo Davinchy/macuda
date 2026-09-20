@@ -384,6 +384,9 @@ typedef struct {
   // - sixteen launches into the next chain, or at the next wait or announcement, whichever comes first. The round
   // trip (~25 us to the server process) then overlaps descriptor building instead of blocking it.
   int ring_async;
+  // TINYNV_DTOD_VIA_COMPUTE: serve device-to-device copies with the lent copy kernel so they join the launch chain
+  // instead of handing it over. See dtod_by_kernel in tinynv.c for the measurement that motivated it.
+  int dtod_via_compute;
   int graph_resident;           // TINYNV_GRAPH_RESIDENT: record a caller's token and replay it as one chain
   int graph_pace;               // TINYNV_GRAPH_PACE: a measurement knob, hand chains over one ahead instead of all at once
   // Under the launch profile, every resident chain's batch ends with a clocked release into a slot of its own, and the
@@ -487,6 +490,7 @@ int tinynv_exec_download_sync_first(const char *e);
 int tinynv_exec_kernel_profile(const char *e);
 // TINYNV_KEEPALIVE and TINYNV_KEEPALIVE_US: off unless asked; 2,000 us of spin at most unless asked.
 int tinynv_exec_ring_async(const char *e);
+int tinynv_exec_dtod_via_compute(const char *e);
 int tinynv_exec_graph_resident(const char *e);
 // Record a token (1 = the driver will not record: the knob is off or the chain shape is wrong), seal and run it
 // once, run it again, let it go.

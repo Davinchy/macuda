@@ -2233,6 +2233,15 @@ int tinynv_exec_kernel_profile(const char *e) { return e && *e && *e != '0'; }
 // spin's ceiling (the watchdog), 2,000 us unless asked, never under 50 or over 20,000.
 // TINYNV_RING_ASYNC: off until measured on both decodes and soaked.
 int tinynv_exec_ring_async(const char *e) { return e && *e && *e != '0'; }
+// ON by default since 2026-09-19: a device-to-device copy on the copy queue makes batch_begin hand the launch chain
+// over first, and a Mamba-hybrid token is 81 such copies among 611 launches - so its chain averaged 8 launches and it
+// paid ~74 seams worth 3.7 ms of a 10 ms token. Served by the lent copy kernel the copy joins the chain instead.
+// Measured interleaved: Nemotron Nano 9B 111.3/109.7 -> 143.5/144.0 tg128 (+30%, and past its native 140.6) with
+// prefill 6,422 -> 7,159; the MoE and the dense 27B unchanged, which is the shape a targeted fix should have. Gated:
+// op-verify 450/450 at three depths, both greedy texts and all three images byte-identical, a five-minute MTP soak
+// clean. TINYNV_DTOD_VIA_COMPUTE=0 puts these copies back on the copy engine.
+int tinynv_exec_dtod_via_compute(const char *e) { return !e || !*e || *e != '0'; }
+
 // TINYNV_GRAPH_RESIDENT: off until measured on both decodes and soaked.
 int tinynv_exec_graph_resident(const char *e) { return e && *e && *e != '0'; }
 int tinynv_exec_keepalive(const char *e) { return e && *e && *e != '0'; }
@@ -2552,6 +2561,11 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   { const char *e5 = getenv("TINYNV_LAUNCH_PROFILE"); ex->profile = e5 && *e5 && *e5 != '0'; }
   ex->kprof = tinynv_exec_kernel_profile(getenv("TINYNV_KERNEL_PROFILE"));
   ex->ring_async = tinynv_exec_ring_async(getenv("TINYNV_RING_ASYNC"));
+  ex->dtod_via_compute = tinynv_exec_dtod_via_compute(getenv("TINYNV_DTOD_VIA_COMPUTE"));
+  fprintf(stderr, "libtinynv: device-to-device copies are served by a caller's kernel on the compute queue (%s), so they join "
+                  "the launch chain instead of handing it over%s\n",
+          ex->dtod_via_compute ? "the default" : "TINYNV_DTOD_VIA_COMPUTE=0: back on the copy engine",
+          ex->dtod_via_compute ? "" : " - NOT in effect");
   ex->graph_resident = tinynv_exec_graph_resident(getenv("TINYNV_GRAPH_RESIDENT"));
   { const char *e = getenv("TINYNV_GRAPH_PACE"); ex->graph_pace = e && *e && *e != '0'; }
   if (ex->graph_resident)

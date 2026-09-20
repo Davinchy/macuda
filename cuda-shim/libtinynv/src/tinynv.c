@@ -718,6 +718,34 @@ tinynv_status_t tinynv_memcpy_dtoh(tinynv_stream_t s, void *dst, tinynv_devptr_t
   return TINYNV_OK;
 }
 
+// A device-to-device copy served by the lent copy kernel on the COMPUTE queue instead of the copy engine.
+//
+// Why it matters, measured 2026-09-19 on Nemotron Nano 9B (a Mamba hybrid): its token is 611 launches with 81 of
+// these copies interleaved among them, and every copy that goes to the copy queue makes batch_begin hand over the
+// launch chain first - so the chain averages 8 launches instead of 128, the token pays ~74 chain seams, and those
+// seams are 3.7 ms of a 10 ms token. Expressed as a kernel the copy simply joins the chain: it is ordered after the
+// launches before it because the chain orders them, the engine never switches queues, and nothing is handed over.
+// The bytes still move at the same rate; what goes away is the seam.
+static tinynv_status_t dtod_by_kernel(tinynv_stream_t s, tinynv_devptr_t dst, tinynv_devptr_t src, size_t n) {
+  tinynv_device_t d = s->dev;
+  tinynv_kernel_info_t info;
+  if (tinynv_kernel_info(d->download_kernel, &info) != TINYNV_OK) return TINYNV_ERR_DRIVER;
+  uint8_t params[64];
+  memset(params, 0, sizeof(params));
+  uint64_t a = (uint64_t)dst, b = (uint64_t)src, c = (uint64_t)n;
+  memcpy(params + info.params[0].offset, &a, 8);
+  memcpy(params + info.params[1].offset, &b, 8);
+  memcpy(params + info.params[2].offset, &c, 8);
+  uint64_t per_block = (uint64_t)d->download_block * d->download_bpt;
+  uint64_t blocks = (n + per_block - 1) / per_block;
+  if (!blocks || blocks > 0xffffffffull)
+    return tinynv_fail("a %zu byte device-to-device copy needs %llu blocks", n, (unsigned long long)blocks), TINYNV_ERR_INVALID;
+  // Deliberately NOT marked internal: this is the caller's work, it belongs in the caller's chain, and marking it
+  // internal would take it out of the very chain this exists to keep together.
+  return tinynv_launch(s, d->download_kernel, (unsigned)blocks, 1, 1, d->download_block, 1, 1, 0,
+                       params, (size_t)info.params[2].offset + 8);
+}
+
 tinynv_status_t tinynv_memcpy_dtod(tinynv_stream_t s, tinynv_devptr_t dst, tinynv_devptr_t src, size_t n) {
   if (ON_GPU(s)) {
     NEED_GPU(s);
@@ -726,6 +754,7 @@ tinynv_status_t tinynv_memcpy_dtod(tinynv_stream_t s, tinynv_devptr_t dst, tinyn
     if (dst != src && dst < src + n && src < dst + n)
       return tinynv_fail("device to device copy of %zu bytes overlaps: the copy engine has no defined order for that", n),
              TINYNV_ERR_INVALID;
+    if (s->dev->exec.dtod_via_compute && s->dev->download_kernel && n) return dtod_by_kernel(s, dst, src, n);
     return WITH_LOCK(tinynv_exec_copy(&s->dev->exec, (uint64_t)dst, (uint64_t)src, n)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
   }
   memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
