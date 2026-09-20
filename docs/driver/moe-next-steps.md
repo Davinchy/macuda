@@ -174,3 +174,14 @@ graphs**, because a recorded node keeps the kernel parameters marshalled at capt
 live in those bytes. The fix is the piece NVIDIA's graphs have and this subset does not: per-node parameter update,
 so `cudaGraphExecUpdate` (and ggml's own update path) rewrites each node's marshalled bytes from the caller's
 current values before a replay. With that, the +4% and the resident chain underneath it both become gateable.
+
+## 13. Graphs are the default (2026-09-19 18:04): +4% MoE, and what the blank image actually was
+
+Not stale kernel parameters. Two holes in the capture, both in this tree: `cudaMemcpy2DAsync` was not a recorded
+node kind (16 a capture), and **libtinycublas called `tinynv_launch` directly**, so every unquantized GEMM - most of
+stable-diffusion.cpp's arithmetic - ran once during the capture and never on a replay. Both were found by making the
+capture account for what it could not record rather than by reasoning about it; a one-step render being wrong is what
+ruled staleness out. With both fixed the whole gate is clean at graphs-on (op-verify x3, both texts, three images
+byte-identical, MTP soak) and interleaved tg128 reads MoE 211.4/216.7 -> 223.5/221.7, dense at parity. MoE is ~91% of
+native. The resident-chain replay underneath (`TINYNV_GRAPH_RESIDENT`) is still at parity and still off; it is now
+the thing to re-measure, since the caller's per-launch cost above it has just been removed.

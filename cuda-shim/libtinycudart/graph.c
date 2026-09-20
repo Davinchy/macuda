@@ -23,6 +23,7 @@
 #undef cudaGraphLaunch
 #undef cudaMemcpyAsync
 #undef cudaMemsetAsync
+#undef cudaMemcpy2DAsync
 
 extern tinynv_stream_t tinycudart_default_stream(void);
 extern void tinycudart_set_error(int e);
@@ -32,7 +33,7 @@ extern double tinycudart_now_ns(void);
 extern int tinycudart_trace(void);
 
 typedef struct {
-  int kind;   // 0 a launch, 1 a copy, 2 a fill
+  int kind;   // 0 a launch, 1 a copy, 2 a fill, 3 a strided copy
   tinynv_kernel_t k;
   const char *name;   // the registered name, which lives as long as the process
   unsigned g[3], b[3], smem;
@@ -42,6 +43,7 @@ typedef struct {
   const void *src;
   size_t n;
   int mkind, value;
+  size_t dpitch, spitch, width, height;   // kind 3: a strided copy, which stable-diffusion.cpp issues inside a capture
 } gnode_t;
 
 struct CUgraph_st { gnode_t *nodes; size_t n, cap; };
@@ -55,6 +57,12 @@ static cudaError_t E(cudaError_t e) { tinycudart_set_error(e); return e; }
 
 // Is this (driver) stream the one being captured? Called on the launch and copy paths before they touch the driver.
 int tinycudart_capturing_nv(tinynv_stream_t s) { return cap.active && s == cap.nvs; }
+// Work issued on a DIFFERENT stream while a capture is active: it runs now and is never replayed, which is the same
+// silent hole the unrecorded strided copy was. Counted by name so it cannot hide.
+void tinycudart_capture_offstream(const char *what, tinynv_stream_t s) {
+  extern void tinycudart_capture_note(const char *);
+  if (cap.active && s != cap.nvs) tinycudart_capture_note(what);
+}
 
 static gnode_t *node_new(void) {
   struct CUgraph_st *g = cap.g;
@@ -91,11 +99,33 @@ cudaError_t tinycudart_capture_memcpy(void *dst, const void *src, size_t n, int 
   nd->kind = 1; nd->dst = dst; nd->src = src; nd->n = n; nd->mkind = kind;
   return E(cudaSuccess);
 }
+// The strided copy, recorded rather than run. Not recording it is what rendered a blank image on 2026-09-19: sixteen
+// of these ran once during the capture and never again, so every replayed step was missing them.
+cudaError_t tinycudart_capture_memcpy2d(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+                                        size_t height, int kind) {
+  gnode_t *nd = node_new();
+  if (!nd) { cap.invalid = 1; return E(cudaErrorMemoryAllocation); }
+  nd->kind = 3; nd->dst = dst; nd->src = src; nd->mkind = kind;
+  nd->dpitch = dpitch; nd->spitch = spitch; nd->width = width; nd->height = height;
+  return E(cudaSuccess);
+}
 cudaError_t tinycudart_capture_memset(void *p, int v, size_t n) {
   gnode_t *nd = node_new();
   if (!nd) { cap.invalid = 1; return E(cudaErrorMemoryAllocation); }
   nd->kind = 2; nd->dst = p; nd->value = v; nd->n = n;
   return E(cudaSuccess);
+}
+// Something happened on the captured stream that this subset does not record. Counted by name and reported, because
+// the failure it causes is silent: the call runs once, during the capture, and never again on a replay - so the
+// replayed token is missing work and the result is wrong with nothing in the log to say why.
+#define CAPTURE_UNRECORDED 12
+static struct { const char *what; unsigned long n; } g_unrec[CAPTURE_UNRECORDED];
+void tinycudart_capture_note(const char *what) {
+  if (!cap.active) return;
+  for (int i = 0; i < CAPTURE_UNRECORDED; i++) {
+    if (!g_unrec[i].what) { g_unrec[i].what = what; g_unrec[i].n = 1; return; }
+    if (g_unrec[i].what == what) { g_unrec[i].n++; return; }
+  }
 }
 // A synchronise on the capturing stream cannot be honoured: refused, and the capture is spoiled.
 cudaError_t tinycudart_capture_refuse(void) { cap.invalid = 1; return E(cudaErrorStreamCaptureUnsupported); }
@@ -136,7 +166,17 @@ cudaError_t cudaStreamEndCapture(cudaStream_t s, cudaGraph_t *pGraph) {
   cap.active = 0;
   cap.g = NULL;
   if (cap.invalid) { free_nodes(g->nodes, g->n); free(g); if (pGraph) *pGraph = NULL; return E(cudaErrorStreamCaptureInvalidated); }
-  if (tinycudart_trace()) fprintf(stderr, "[trace] graph capture ends: %zu nodes\n", g->n);
+  // Which part of the caller this capture is, named by its kernels: a wrong replay is localised to a stage this way
+  // (on 2026-09-19 the question was whether stable-diffusion.cpp was graphing its diffusion steps or its decoder).
+  { size_t launches = 0, copies = 0, fills = 0, strided = 0;
+    for (size_t i = 0; i < g->n; i++)
+      switch (g->nodes[i].kind) { case 0: launches++; break; case 1: copies++; break; case 2: fills++; break; default: strided++; }
+    fprintf(stderr, "[tinycudart] graphs: capture %lu holds %zu launches, %zu copies, %zu fills, %zu strided copies; first:", g_captures, launches, copies, fills, strided);
+    size_t shown = 0;
+    for (size_t i = 0; i < g->n && shown < 3; i++) if (g->nodes[i].kind == 0) { fprintf(stderr, " %s", g->nodes[i].name); shown++; }
+    fprintf(stderr, " ... last:");
+    for (size_t i = g->n, shown2 = 0; i-- > 0 && shown2 < 3; ) if (g->nodes[i].kind == 0) { fprintf(stderr, " %s", g->nodes[i].name); shown2++; }
+    fprintf(stderr, "\n"); }
   if (pGraph) *pGraph = (cudaGraph_t)g;
   return E(cudaSuccess);
 }
@@ -197,7 +237,9 @@ cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t s) {
     for (size_t i = 0; i < e->n; i++) {
       gnode_t *nd = &e->nodes[i];
       cudaError_t r = nd->kind == 1 ? cudaMemcpyAsync(nd->dst, nd->src, nd->n, (enum cudaMemcpyKind)nd->mkind, s)
-                    : nd->kind == 2 ? cudaMemsetAsync(nd->dst, nd->value, nd->n, s) : cudaSuccess;
+                    : nd->kind == 2 ? cudaMemsetAsync(nd->dst, nd->value, nd->n, s)
+                    : nd->kind == 3 ? cudaMemcpy2DAsync(nd->dst, nd->dpitch, nd->src, nd->spitch, nd->width, nd->height, (enum cudaMemcpyKind)nd->mkind, s)
+                                    : cudaSuccess;
       if (r != cudaSuccess) return r;
     }
     tinynv_status_t st = tinynv_graph_launch(nvs, e->drv);
@@ -223,6 +265,9 @@ cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t s) {
       if (r != cudaSuccess) return r;
     } else if (nd->kind == 1) {
       cudaError_t r = cudaMemcpyAsync(nd->dst, nd->src, nd->n, (enum cudaMemcpyKind)nd->mkind, s);
+      if (r != cudaSuccess) return r;
+    } else if (nd->kind == 3) {
+      cudaError_t r = cudaMemcpy2DAsync(nd->dst, nd->dpitch, nd->src, nd->spitch, nd->width, nd->height, (enum cudaMemcpyKind)nd->mkind, s);
       if (r != cudaSuccess) return r;
     } else {
       cudaError_t r = cudaMemsetAsync(nd->dst, nd->value, nd->n, s);
@@ -256,6 +301,9 @@ cudaError_t cudaGraphExecDestroy(cudaGraphExec_t exec) {
 // At exit, whenever a capture happened: how much of the run was replayed rather than issued by the caller.
 void tinycudart_graph_stats(void) {
   if (!g_captures) return;
+  for (int i = 0; i < CAPTURE_UNRECORDED && g_unrec[i].what; i++)
+    fprintf(stderr, "[tinycudart] graphs: %lu call%s to %s happened DURING a capture and were not recorded - a replay is missing that work\n",
+            g_unrec[i].n, g_unrec[i].n == 1 ? "" : "s", g_unrec[i].what);
   fprintf(stderr, "[tinycudart] graphs: %lu captures recorded %lu nodes; %lu graph launches replayed %lu nodes (%.1f a launch); "
                   "%lu tokens kept resident by the driver, %lu replays as one batch\n",
           g_captures, g_nodes_recorded, g_graph_launches, g_nodes_replayed,

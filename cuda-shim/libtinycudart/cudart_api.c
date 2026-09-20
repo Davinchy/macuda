@@ -43,6 +43,9 @@ extern cudaError_t tinycudart_capture_launch(tinynv_kernel_t k, const char *name
 extern cudaError_t tinycudart_capture_memcpy(void *dst, const void *src, size_t n, int kind);
 extern cudaError_t tinycudart_capture_memset(void *p, int v, size_t n);
 extern cudaError_t tinycudart_capture_refuse(void);
+extern void tinycudart_capture_note(const char *what);   // something a capture could not record happened anyway
+extern cudaError_t tinycudart_capture_memcpy2d(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height, int kind);
+extern void tinycudart_capture_offstream(const char *what, tinynv_stream_t s);
 #define TRACE(...) do { if (tinycudart_trace()) { fprintf(stderr, "[trace] %.1f ", tinycudart_now_ns() / 1e3); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 // functions, not macros: the argument carries the driver call, and it must run exactly once
@@ -88,7 +91,7 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t s, cudaEvent_t e, unsigned flags) {
 cudaError_t cudaEventCreateWithFlags(cudaEvent_t *e, unsigned flags) { (void)flags; tinynv_event_t t = NULL; tinynv_status_t r = tinynv_event_create(tinycudart_device(), &t); *e = (cudaEvent_t)t; return S(r); }
 cudaError_t cudaEventDestroy(cudaEvent_t e) { (void)e; return E(cudaSuccess); } // the contract has no event destroy; a timeline value is a few bytes, kept for the process lifetime
 cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t s) { if (tinycudart_capturing_nv(st(s))) return E(cudaSuccess); double _t0=tinycudart_now_ns(); cudaError_t _r; { _r=S(tinynv_event_record((tinynv_event_t)e, st(s))); } tinycudart_time_api(4, tinycudart_now_ns()-_t0); return _r; }
-cudaError_t cudaEventSynchronize(cudaEvent_t e) { double _t0=tinycudart_now_ns(); cudaError_t _r; { tinycudart_count_sync(); TRACE("eventSynchronize %p", (void *)e); _r=S(tinynv_event_sync((tinynv_event_t)e)); } tinycudart_time_api(6, tinycudart_now_ns()-_t0); return _r; }
+cudaError_t cudaEventSynchronize(cudaEvent_t e) { tinycudart_capture_note("cudaEventSynchronize"); double _t0=tinycudart_now_ns(); cudaError_t _r; { tinycudart_count_sync(); TRACE("eventSynchronize %p", (void *)e); _r=S(tinynv_event_sync((tinynv_event_t)e)); } tinycudart_time_api(6, tinycudart_now_ns()-_t0); return _r; }
 
 // --- copies and fills ---
 // cudaMemcpyDefault needs to know which side a pointer is on; the only host memory we can vouch for is the pinned pool
@@ -102,8 +105,8 @@ static tinynv_status_t copy(tinynv_stream_t s, void *dst, const void *src, size_
     default: return TINYNV_ERR_INVALID;
   }
 }
-cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t n, enum cudaMemcpyKind kind, cudaStream_t s) { if (tinycudart_capturing_nv(st(s))) return tinycudart_capture_memcpy(dst, src, n, (int)kind); double _t0=tinycudart_now_ns(); cudaError_t _r; { TRACE("memcpyAsync kind=%d %zu bytes stream=%p", (int)kind, n, (void *)s); tinycudart_count_copy((int)kind, n); _r=S(copy(st(s), dst, src, n, kind)); } tinycudart_time_api(0, tinycudart_now_ns()-_t0); return _r; }
-cudaError_t cudaMemcpyPeerAsync(void *dst, int ddev, const void *src, int sdev, size_t n, cudaStream_t s) { (void)ddev; (void)sdev; return S(copy(st(s), dst, src, n, cudaMemcpyDeviceToDevice)); } // one device
+cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t n, enum cudaMemcpyKind kind, cudaStream_t s) { if (tinycudart_capturing_nv(st(s))) return tinycudart_capture_memcpy(dst, src, n, (int)kind); tinycudart_capture_offstream("cudaMemcpyAsync on another stream", st(s)); double _t0=tinycudart_now_ns(); cudaError_t _r; { TRACE("memcpyAsync kind=%d %zu bytes stream=%p", (int)kind, n, (void *)s); tinycudart_count_copy((int)kind, n); _r=S(copy(st(s), dst, src, n, kind)); } tinycudart_time_api(0, tinycudart_now_ns()-_t0); return _r; }
+cudaError_t cudaMemcpyPeerAsync(void *dst, int ddev, const void *src, int sdev, size_t n, cudaStream_t s) { (void)ddev; (void)sdev; tinycudart_capture_note("cudaMemcpyPeerAsync"); return S(copy(st(s), dst, src, n, cudaMemcpyDeviceToDevice)); } // one device
 // A strided device-to-device copy is ONE kernel launch (libtinycudart/copy2d.cu); anything else - a host side, or the
 // null device, which runs no kernels - is `height` row copies. The row loop was the whole of SD 1.5's host time: one
 // copy-engine batch and one socket round trip per row (docs/SHARED-STATUS.md 2026-09-15). The kernel is loaded once, on
@@ -134,7 +137,15 @@ static tinynv_status_t copy2d_kernel(tinynv_stream_t s, void *dst, size_t dpitch
   }
   return TINYNV_OK;
 }
+static cudaError_t cudaMemcpy2DAsync_noted(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+                                           size_t height, enum cudaMemcpyKind kind, cudaStream_t s);
+// The strided copy: a capture cannot record it (there is no 2-D node here), so it says so and runs, which is a
+// wrong replay rather than a wrong result now - the counter above is what makes that visible.
 cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height, enum cudaMemcpyKind kind, cudaStream_t s) {
+  if (tinycudart_capturing_nv(st(s))) return tinycudart_capture_memcpy2d(dst, dpitch, src, spitch, width, height, (int)kind);
+  return cudaMemcpy2DAsync_noted(dst, dpitch, src, spitch, width, height, kind, s);
+}
+static cudaError_t cudaMemcpy2DAsync_noted(void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height, enum cudaMemcpyKind kind, cudaStream_t s) {
   TRACE("memcpy2DAsync kind=%d %zux%zu (dpitch %zu spitch %zu)", (int)kind, width, height, dpitch, spitch); tinycudart_count_copy((int)kind, (unsigned long long)width * height);
   if (width > dpitch || width > spitch) return E(cudaErrorInvalidValue);
   if (dpitch == width && spitch == width) return S(copy(st(s), dst, src, width * height, kind));
@@ -144,7 +155,7 @@ cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t 
   return E(cudaSuccess);
 }
 cudaError_t cudaMemsetAsync(void *p, int v, size_t n, cudaStream_t s) { if (tinycudart_capturing_nv(st(s))) return tinycudart_capture_memset(p, v, n); double _t0=tinycudart_now_ns(); cudaError_t _r; { TRACE("memsetAsync %zu bytes = %d", n, v); tinycudart_count_copy(0, n); _r=S(tinynv_memset(st(s), (tinynv_devptr_t)p, v, n)); } tinycudart_time_api(2, tinycudart_now_ns()-_t0); return _r; }
-cudaError_t cudaMemset(void *p, int v, size_t n) { tinynv_status_t r = tinynv_memset(tinycudart_default_stream(), (tinynv_devptr_t)p, v, n); if (r == TINYNV_OK) r = tinynv_stream_sync(tinycudart_default_stream()); return S(r); }
+cudaError_t cudaMemset(void *p, int v, size_t n) { tinycudart_capture_note("cudaMemset (synchronous)"); tinynv_status_t r = tinynv_memset(tinycudart_default_stream(), (tinynv_devptr_t)p, v, n); if (r == TINYNV_OK) r = tinynv_stream_sync(tinycudart_default_stream()); return S(r); }
 cudaError_t cudaMallocManaged(void **p, size_t n, unsigned flags) { (void)p; (void)n; (void)flags; return E(cudaErrorNotSupported); } // only under GGML_CUDA_ENABLE_UNIFIED_MEMORY
 cudaError_t cudaMemGetInfo(size_t *free_, size_t *total) { tinynv_device_props_t p = props(); if (total) *total = p.total_mem; if (free_) *free_ = p.total_mem; return E(cudaSuccess); } // TODO: subtract live cudaMalloc bytes
 
@@ -265,6 +276,7 @@ static cudaError_t launch_args(tinynv_stream_t s, const void *fn, dim3 g, dim3 b
   TRACE("launchEx %s grid=(%u,%u,%u) block=(%u,%u,%u) smem=%zu params=%zu", tinycudart_kernel_name(fn), g.x, g.y, g.z, b.x, b.y, b.z, dyn, len);
   if (tinycudart_capturing_nv(s))
     return tinycudart_capture_launch(k, tinycudart_kernel_name(fn), g.x, g.y, g.z, b.x, b.y, b.z, (unsigned)dyn, blob, len);
+  tinycudart_capture_offstream("a kernel launch on another stream", s);
   tinycudart_count_launch(tinycudart_kernel_name(fn));
   if ((int)dyn > dyn_smem_limit(fn)) fprintf(stderr, "[tinycudart] %s: %zu bytes of dynamic shared memory exceeds the %d the kernel opted in to\n", tinycudart_kernel_name(fn), dyn, dyn_smem_limit(fn));
   double t0 = tinycudart_now_ns();

@@ -25,7 +25,7 @@ with NVIDIA's own structure definitions from `open-gpu-kernel-modules` pinned to
 | Qwen3.8-27B Q4_K_M, pp256 | ~2550 tok/s | 2447 | prefill at parity (the SASS is identical) |
 | Qwen3.8-27B + its MTP draft head, greedy | **124 tok/s** first request, 112 mean over a 62-minute soak | 124.7 | `llama-server`, `--spec-type draft-mtp` |
 | `llama-server`, 8 slots, 27B + MTP, temp 0.6 | **~207 tok/s aggregate** | — | 20-minute soaks at eight slots: 440 requests, 0 errors |
-| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **216 tok/s** | 245.0 | ~1,600 launches a token; was host-bound until the ggml-cuda host code was built at -O2 |
+| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **223 tok/s** | 245.0 | ~1,600 launches a token; CUDA graphs on, and the ggml-cuda host code built at -O2 |
 | SDXL-Turbo, 4 steps, 512², cfg 1.0 | **2.72 s** | 4.11 s | stable-diffusion.cpp |
 | SD 1.5 (fp32), 20 steps, 512² | **3.72 s** | 3.86 s | |
 | Z-Image-Turbo, 8 steps, 1024² | **9.67 s** | 9.46 s | Q8 DiT + Qwen3-4B encoder + FLUX VAE |
@@ -238,11 +238,12 @@ models/  logs/                not committed; see models/README.md
   hold-back was a flat 64 MB and the top 161 MB of what the allocator believed it owned was inside WPR2 - never hit only because
   no run had filled the card. `totalGlobalMem` now reports what can actually be handed out (32,285 MB of 32,607); free space is
   still reported as that total. Raising `gspFwHeapSize` without raising the reservation now fails the build.
-- **CUDA graphs are built but not shipped on.** `libtinycudart` implements the subset ggml uses (capture, instantiate, update,
-  launch) and `libtinynv` can keep a replayed token resident as linked chains (`TINYNV_GRAPH_RESIDENT`), but the shipped
-  `libggml-cuda.a` is the no-graphs build: with graphs on, llama.cpp decode is correct and ~4% faster on the MoE while
-  stable-diffusion.cpp renders a blank image, because a recorded node keeps the kernel parameters marshalled at capture and
-  sd's per-step scalars live in those bytes. Per-node parameter update is the missing piece (`docs/driver/moe-next-steps.md` §12).
+- **CUDA graphs are on.** `libtinycudart` implements the subset ggml uses (capture, instantiate, update, launch) and the shipped
+  `libggml-cuda.a` is built with `GGML_CUDA_USE_GRAPHS`: MoE decode +4% interleaved, everything else at parity, with the whole
+  gate clean. A capture has to see every piece of work the caller issues, which cost two bugs to learn - the strided copy was
+  not a recorded node, and libtinycublas launched straight into the driver - so the runtime layer now reports by name anything
+  that happens during a capture without being recorded. `libtinynv` can also keep a replayed token resident as linked chains
+  (`TINYNV_GRAPH_RESIDENT`, off: at parity so far).
 - `test-backend-ops` MUL_MAT with mxfp4/nvfp4 hangs the card; probe it last in a session, if at all.
 - A llama.cpp checkout older than upstream `2f53959` corrupts its own heap in `test-backend-ops` on arm64 (ggml-cpu's rope work buffer)
   and will look like a driver crash; `setup.sh llama` applies that fix.

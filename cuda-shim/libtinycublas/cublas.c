@@ -6,6 +6,20 @@
 #include <stdint.h>
 #include "tinynv.h"
 #include <cublas_v2.h>   // cuBLAS types (handle/status/operation/computeType) from the CUDA-13 tree; C-compatible
+
+// A GEMM launch goes through the capture when one is running on this stream, exactly as a ggml kernel does.
+// Without this the GEMMs are invisible to a graph: they run once, while the caller is capturing, and never on a
+// replay - which on 2026-09-19 rendered every stable-diffusion image blank, because sd's text encoder and
+// diffusion model are mostly unquantized matmuls and all of them arrive here rather than through libtinycudart.
+extern int tinycudart_capturing_nv(tinynv_stream_t s);
+extern int tinycudart_capture_launch(tinynv_kernel_t k, const char *name, unsigned gx, unsigned gy, unsigned gz,
+                                     unsigned bx, unsigned by, unsigned bz, unsigned smem, const void *params, size_t plen);
+static tinynv_status_t blas_launch(tinynv_stream_t s, tinynv_kernel_t k, const char *name, unsigned gx, unsigned gy,
+                                   unsigned gz, unsigned bx, unsigned by, unsigned bz, const void *p, size_t plen) {
+  if (tinycudart_capturing_nv(s))
+    return tinycudart_capture_launch(k, name, gx, gy, gz, bx, by, bz, 0, p, plen) == 0 ? TINYNV_OK : TINYNV_ERR_LAUNCH;
+  return tinynv_launch(s, k, gx, gy, gz, bx, by, bz, 0, p, plen);
+}
 extern tinynv_device_t tinycudart_device(void);       // provided by libtinycudart
 extern tinynv_stream_t tinycudart_default_stream(void);
 extern int tinycudart_trace(void); extern void tinycudart_count_launch(const char*); extern void tinycudart_time_launch(const char*, double); extern double tinycudart_now_ns(void);   // the runtime's trace/stats, so cuBLAS launches are seen too
@@ -76,7 +90,7 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
       q.A=(uint64_t)((const char*)A+(long long)b0*sA*2); q.B=(uint64_t)((const char*)B+(long long)b0*sB*2); q.C=(uint64_t)((char*)C+(long long)b0*sC*osz);
       if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%d) block=(%d,1,1) m=%d n=%d k=%d out=%d\n",kname,gx,gy,nb,nthreads,m,n,k,out_dtype);
       tinycudart_count_launch(kname); double t0=tinycudart_now_ns();
-      tinynv_status_t st = tinynv_launch(h?h->stream:tinycudart_default_stream(), kern, gx,gy,(unsigned)nb, (unsigned)nthreads,1,1, 0, &q, sizeof(q));
+      tinynv_status_t st = blas_launch(h?h->stream:tinycudart_default_stream(), kern, kname, gx,gy,(unsigned)nb, (unsigned)nthreads,1,1, &q, sizeof(q));
       tinycudart_time_launch(kname, tinycudart_now_ns()-t0);
       if (st!=TINYNV_OK) return CUBLAS_STATUS_EXECUTION_FAILED;
     }
@@ -96,7 +110,7 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
     p.A=(uint64_t)((const char*)A+(long long)b0*sA*esz); p.B=(uint64_t)((const char*)B+(long long)b0*sB*esz); p.C=(uint64_t)((char*)C+(long long)b0*sC*osz);
     if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%d) block=(128,1,1) m=%d n=%d k=%d out=%d\n",kname,gx,gy,nb,m,n,k,out_dtype);
     tinycudart_count_launch(kname); double t0=tinycudart_now_ns();
-    tinynv_status_t s = tinynv_launch(h?h->stream:tinycudart_default_stream(), kern, gx,gy,(unsigned)nb, 128,1,1, 0, &p, sizeof(p));
+    tinynv_status_t s = blas_launch(h?h->stream:tinycudart_default_stream(), kern, kname, gx,gy,(unsigned)nb, 128,1,1, &p, sizeof(p));
     tinycudart_time_launch(kname, tinycudart_now_ns()-t0);
     if (s!=TINYNV_OK) return CUBLAS_STATUS_EXECUTION_FAILED;
   }
@@ -116,7 +130,7 @@ static cublasStatus_t launch_gemm(struct tinyblas_handle* h, cublasOperation_t o
   unsigned bx=16, by=16, gx=(m+bx-1)/bx, gy=(n+by-1)/by;
   if (tinycudart_trace()) fprintf(stderr,"[trace] launch tinyblas_gemm_f32 grid=(%u,%u,1) block=(%u,%u,1) m=%d n=%d k=%d in=%d out=%d\n",gx,gy,bx,by,m,n,k,in_dtype,out_dtype);
   tinycudart_count_launch("tinyblas_gemm_f32"); double t0=tinycudart_now_ns();
-  tinynv_status_t s = tinynv_launch(h?h->stream:tinycudart_default_stream(), kern, gx,gy,1, bx,by,1, 0, &p, sizeof(p));
+  tinynv_status_t s = blas_launch(h?h->stream:tinycudart_default_stream(), kern, "tinyblas_gemm_f32", gx,gy,1, bx,by,1, &p, sizeof(p));
   tinycudart_time_launch("tinyblas_gemm_f32", tinycudart_now_ns()-t0);
   return s==TINYNV_OK ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_EXECUTION_FAILED;
 }
@@ -201,7 +215,7 @@ cublasStatus_t cublasStrsmBatched(cublasHandle_t h, cublasSideMode_t side, cubla
       unsigned bx=256, gx=(unsigned)((m+255)/256);
       if (tinycudart_trace()) fprintf(stderr,"[trace] launch tinyblas_trsm_rupn_f32 grid=(%u,1,1) block=(%u,1,1) k=%d n=%d batch %d/%d\n",gx,bx,m,n,i+1,batch);
       tinycudart_count_launch("tinyblas_trsm_rupn_f32");
-      if (tinynv_launch(s,kern, gx,1,1, bx,1,1, 0, &p, sizeof(p))!=TINYNV_OK) rc=CUBLAS_STATUS_EXECUTION_FAILED;
+      if (blas_launch(s,kern, "tinyblas_trsm_rupn_f32", gx,1,1, bx,1,1, &p, sizeof(p))!=TINYNV_OK) rc=CUBLAS_STATUS_EXECUTION_FAILED;
     }
   }
   free(Ah); free(Bh); return rc;

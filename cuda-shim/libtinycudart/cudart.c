@@ -228,7 +228,8 @@ cudaError_t cudaLaunch(const void* func){
     fprintf(stderr,"[tinycudart] cudaLaunch: kernel '%s' (%p) was registered but not found in its module\n",nm,func); return g_lasterr=cudaErrorUnknown; }
   if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%u) block=(%u,%u,%u) smem=%zu params=%zu\n", f->name, g_grid.x,g_grid.y,g_grid.z, g_block.x,g_block.y,g_block.z, g_shmem, g_params_len);
   { extern int tinycudart_capturing_nv(tinynv_stream_t); extern cudaError_t tinycudart_capture_launch(tinynv_kernel_t, const char*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, const void*, size_t);
-    if (tinycudart_capturing_nv(g_stream)) return g_lasterr=tinycudart_capture_launch(k, f->name, g_grid.x,g_grid.y,g_grid.z, g_block.x,g_block.y,g_block.z, (unsigned)g_shmem, g_params, g_params_len); }
+    if (tinycudart_capturing_nv(g_stream)) return g_lasterr=tinycudart_capture_launch(k, f->name, g_grid.x,g_grid.y,g_grid.z, g_block.x,g_block.y,g_block.z, (unsigned)g_shmem, g_params, g_params_len);
+    extern void tinycudart_capture_offstream(const char *, tinynv_stream_t); tinycudart_capture_offstream("a classic-ABI launch on another stream", g_stream); }
   tinycudart_count_launch(f->name);
   double t0=stats_on()?tinycudart_now_ns():0;
   tinynv_status_t s=tinynv_launch(g_stream,k, g_grid.x,g_grid.y,g_grid.z, g_block.x,g_block.y,g_block.z,
@@ -237,12 +238,12 @@ cudaError_t cudaLaunch(const void* func){
   if (s!=TINYNV_OK){ char what[1200]; snprintf(what,sizeof what,"cudaLaunch(%s grid=%u,%u,%u block=%u,%u,%u smem=%zu params=%zu)",f->name,g_grid.x,g_grid.y,g_grid.z,g_block.x,g_block.y,g_block.z,g_shmem,g_params_len); drv(what,s); }
   return g_lasterr = (s==TINYNV_OK? cudaSuccess : cudaErrorUnknown);
 }
-cudaError_t cudaMalloc(void** p, size_t sz){ ensure_init(); tinynv_devptr_t d=0; tinynv_status_t s=tinynv_malloc(g_dev,sz,&d); *p=(void*)d;
+cudaError_t cudaMalloc(void** p, size_t sz){ { extern void tinycudart_capture_note(const char*); tinycudart_capture_note("cudaMalloc"); } ensure_init(); tinynv_devptr_t d=0; tinynv_status_t s=tinynv_malloc(g_dev,sz,&d); *p=(void*)d;
   if (tinycudart_trace()) fprintf(stderr,"[trace] malloc %zu -> %#llx\n", sz, (unsigned long long)d);
   return g_lasterr=drv("cudaMalloc",s); }
-cudaError_t cudaFree(void* p){ if (tinycudart_trace()) fprintf(stderr,"[trace] free %#llx\n",(unsigned long long)(tinynv_devptr_t)p);
+cudaError_t cudaFree(void* p){ { extern void tinycudart_capture_note(const char*); tinycudart_capture_note("cudaFree"); } if (tinycudart_trace()) fprintf(stderr,"[trace] free %#llx\n",(unsigned long long)(tinynv_devptr_t)p);
   return g_lasterr=(tinynv_free(g_dev,(tinynv_devptr_t)p)==TINYNV_OK?cudaSuccess:cudaErrorUnknown); }
-cudaError_t cudaMemcpy(void* dst,const void* src,size_t n,int kind){ tinycudart_count_sync();
+cudaError_t cudaMemcpy(void* dst,const void* src,size_t n,int kind){ { extern void tinycudart_capture_note(const char*); tinycudart_capture_note("cudaMemcpy (synchronous)"); } tinycudart_count_sync();
   if (tinycudart_trace()) fprintf(stderr,"[trace] memcpy kind=%d %zu bytes (sync)\n", kind, n);
   tinycudart_count_copy(kind, n);
   tinynv_status_t s=TINYNV_ERR_INVALID;
@@ -253,7 +254,7 @@ cudaError_t cudaMemcpy(void* dst,const void* src,size_t n,int kind){ tinycudart_
   if (s==TINYNV_OK) tinynv_stream_sync(g_default_stream);
   return g_lasterr=(s==TINYNV_OK?cudaSuccess:cudaErrorUnknown);
 }
-cudaError_t cudaDeviceSynchronize(void){ tinycudart_count_sync(); return g_lasterr=(tinynv_stream_sync(g_default_stream)==TINYNV_OK?cudaSuccess:cudaErrorUnknown); }
+cudaError_t cudaDeviceSynchronize(void){ { extern void tinycudart_capture_note(const char*); tinycudart_capture_note("cudaDeviceSynchronize"); } tinycudart_count_sync(); return g_lasterr=(tinynv_stream_sync(g_default_stream)==TINYNV_OK?cudaSuccess:cudaErrorUnknown); }
 cudaError_t cudaGetLastError(void){ cudaError_t e=g_lasterr; g_lasterr=cudaSuccess; return e; }
 const char* cudaGetErrorString(cudaError_t e){
   switch(e){ case cudaSuccess: return "no error"; case cudaErrorInvalidValue: return "invalid argument";
