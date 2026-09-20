@@ -5,9 +5,11 @@
 #   sh setup.sh llama      clone llama.cpp at the pinned commit and build its CPU-only static tree (llama.cpp/build-null)
 #   sh setup.sh sd         clone stable-diffusion.cpp at the pinned commit, point it at llama.cpp's ggml, apply the patch, build
 #   sh setup.sh shim       make libtinynv.a + libtinycudart.a + libtinycublas.a (no GPU needed)
-#   sh setup.sh link       link the *-null binaries against the shim (needs cuda-shim/build/libggml-cuda.a — see README §Build)
-# Environment: LLAMA_SRC / SD_SRC name a local clone to copy from instead of GitHub; TINYCC_HOST / TINYCC_KEY name the Linux
-# box with nvcc (device compile + CUDA headers); JOBS caps the parallel build (default: all cores).
+#   sh setup.sh cuda       compile ggml's CUDA backend: device code through nvcc, host code through clang
+#   sh setup.sh link       link the *-null binaries against the shim (needs cuda-shim/build/libggml-cuda.a from the step above)
+# Environment: LLAMA_SRC / SD_SRC name a local clone to copy from instead of GitHub; JOBS caps the parallel build (default:
+# all cores). The device compile needs nvcc, which is Linux-only: set TINYCC_HOST / TINYCC_KEY to use a Linux box over ssh,
+# or leave them unset and it runs in a CUDA container on this Mac (see cuda-shim/build/tinycc, and install.sh).
 set -eu
 R=$(cd "$(dirname "$0")" && pwd); cd "$R"
 LLAMA_URL=https://github.com/ggml-org/llama.cpp.git
@@ -61,8 +63,9 @@ sd() {
   echo "stable-diffusion.cpp/build-null built"
 }
 shim() { ( cd cuda-shim && rm -rf build/shim/nv && make -s ) && echo "shim built: libtinynv build id $(strings cuda-shim/build/shim/nv/libtinynv.a | grep -oE '^[0-9a-f]{7}(-dirty)?$|^nogit(-dirty)?$' | head -1)"; }
+cuda() { sh cuda-shim/build/build-ggml-cuda.sh; }
 link() {
-  test -f cuda-shim/build/libggml-cuda.a || { echo "no cuda-shim/build/libggml-cuda.a: build it with sh cuda-shim/build/build-ggml-cuda.sh (needs the nvcc box) — see README"; exit 1; }
+  test -f cuda-shim/build/libggml-cuda.a || { echo "no cuda-shim/build/libggml-cuda.a: build it with  sh setup.sh cuda  (nvcc in a container here, or on TINYCC_HOST)"; exit 1; }
   cd cuda-shim
   for t in 'tests test-backend-ops' 'examples/simple llama-simple' 'examples/speculative-simple llama-speculative-simple' 'tools/server llama-server' 'tools/mtmd llama-mtmd-cli' 'tools/llama-bench llama-bench'; do
     d=${t%% *}; n=${t##* }; sh build/link-null.sh "$d" "$n" "$R/cuda-shim/build/bin/$n-null" 2>&1 | grep -vE 'duplicate|warning' | tail -1
@@ -73,7 +76,7 @@ link() {
   ls -1 build/bin
 }
 case "$step" in
-  all)   deps; llama; sd; shim; link ;;
-  deps)  deps ;; llama) llama ;; sd) sd ;; shim) shim ;; link) link ;;
-  *) echo "usage: sh setup.sh [all|deps|llama|sd|shim|link]"; exit 2 ;;
+  all)   deps; llama; sd; shim; cuda; link ;;
+  deps)  deps ;; llama) llama ;; sd) sd ;; shim) shim ;; cuda) cuda ;; link) link ;;
+  *) echo "usage: sh setup.sh [all|deps|llama|sd|shim|cuda|link]"; exit 2 ;;
 esac

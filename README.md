@@ -65,6 +65,26 @@ device halves unchanged, interleaved tg128 MoE 139.7/142.8 -> 214.4/217.4 and de
 load 6-7, texts and images byte-identical, op-verify 450/450 x3, soak clean. The table carries these numbers. Dropping the per-launch
 cache invalidates was also measured and produces a wrong greedy text: `TINYNV_QMD_INVALIDATE` stays a diagnostic.
 
+## Quick start
+
+```sh
+git clone https://github.com/Davinchy/macuda && cd macuda
+sh install.sh check        # what is present, what is missing, and what to do about each — installs nothing
+sh install.sh              # installs the missing pieces (asking first) and builds everything
+```
+
+`install.sh check` is safe to run on any Mac: it reads, reports and exits. The full run installs Homebrew packages,
+optionally Docker Desktop and tinygrad's TinyGPU.app, then builds llama.cpp, the shim and ggml's CUDA backend.
+
+Two things it cannot do for you, and says so: **approving the DriverKit extension** (macOS asks you, in System
+Settings → General → Login Items & Extensions), and **the card itself** — an RTX 5090 in a Thunderbolt enclosure,
+which a wedged GSP will occasionally need you to physically replug.
+
+The one Linux-only step is `nvcc`, which compiles ggml's ~190 CUDA translation units for the card. It runs in a CUDA
+container on the Mac — `nvidia/cuda` publishes arm64 images, so it is native, not emulated, and since it only ever
+compiles device code (`--fatbin`, never executed there) the container needs no GPU, no NVIDIA driver and no special
+runtime. If you have a Linux box with CUDA 13, `export TINYCC_HOST=user@box` uses it instead and is faster.
+
 ## What you need
 
 **Hardware.** An Apple Silicon Mac (built and measured on an M4 Max, macOS 27.0) and an RTX 5090 in a Thunderbolt enclosure. The
@@ -84,10 +104,15 @@ Read `tools/preflight.sh` and the protocol in §Run before touching it.
   driver was developed against — see `env.sh` for which tool needs which) in `tinygrad/` and `tinygrad-stable/`, with a Python 3.12
   venv in `venv/` that has tinygrad installed editable.
 
-**A Linux box with CUDA 13 (`nvcc`) reachable over ssh**, for the device side of every CUDA compile (ggml-cuda's ~190 translation
-units, and the shim's own three kernels). Nothing NVIDIA runs on the Mac; the cubins are your own build output. Set `TINYCC_HOST`
-(and `TINYCC_KEY` if needed) before any step that compiles device code. A prebuilt `libggml-cuda.a` for the pinned llama.cpp commit is
-enough to link and run without that box (see §Build).
+**`nvcc`, which is Linux-only**, for the device side of every CUDA compile (ggml-cuda's ~190 translation units; the shim's own
+three kernels ship as committed cubins). Either is fine:
+- **Docker on this Mac** (the default): `cuda-shim/build/tinycc` runs `nvcc --fatbin` inside `nvidia/cuda:13.0.3-devel-ubuntu24.04`,
+  which has an arm64 image, so it compiles natively on Apple Silicon. No GPU, no NVIDIA driver and no container GPU runtime are
+  involved — device code is *compiled* there and only ever *executed* on the card, through this project's own driver.
+- **A Linux box with CUDA 13 over ssh**: `export TINYCC_HOST=user@box` (`TINYCC_KEY=~/.ssh/...` if it needs an identity file).
+  Faster if you have one, and the way every published number here was built.
+
+Nothing NVIDIA runs on the Mac; the cubins are your own build output.
 
 **Fetched by `setup.sh deps`, not in the repository:** NVIDIA's `open-gpu-kernel-modules` headers at commit `81fe4fb` (release
 570.86.16, the one that added the RTX 5090; the build asserts the driver's structure sizes against them), the three signed GSP
@@ -97,21 +122,25 @@ firmware images for 570.144 from linux-firmware (hash-pinned), and the CUDA Tool
 ## Build
 
 ```sh
-export TINYCC_HOST=user@linux-box            # the nvcc box (TINYCC_KEY=~/.ssh/... if it needs an identity file)
 sh setup.sh deps                            # NVIDIA headers + firmware (hash-checked) + CUDA headers
 sh setup.sh llama                           # llama.cpp at ad6c668 + upstream fix 2f53959, CPU-only static build in llama.cpp/build-null
 sh setup.sh sd                              # stable-diffusion.cpp at 59c23bc on llama.cpp's ggml (+ patches/), build-null
 sh setup.sh shim                            # libtinynv.a + libtinycudart.a + libtinycublas.a (no GPU; ~3 s)
+sh setup.sh cuda                            # ggml's CUDA backend: nvcc in a container (or on TINYCC_HOST), clang on the Mac
 sh setup.sh link                            # the *-null binaries in cuda-shim/build/bin
 ```
+
+`export TINYCC_HOST=user@linux-box` before `deps` and `cuda` to use a Linux box for the device compile instead of the container.
 
 `setup.sh` is the whole sequence; each step is idempotent. `LLAMA_SRC=` / `SD_SRC=` copy from a local clone instead of GitHub.
 
 **The ggml-cuda archive.** `cuda-shim/build/libggml-cuda.a` (plus `ggml-backend-reg.cuda.o`) is every ggml-cuda translation unit
 compiled for `sm_120a` with the shim's configuration (`-DGGML_CUDA_FORCE_MMQ -DGGML_CUDA_NO_VMM`, CUDA graphs compiled out) through
 `cuda-shim/build/tinycc`: device compile on the Linux box, host compile on the Mac, one Mach-O object each. It is a build output
-(gitignored) and it belongs to the pinned llama.cpp commit. To rebuild it, sync `llama.cpp/ggml` to `~/ggml` on the box
-(`rsync -a llama.cpp/ggml/ $TINYCC_HOST:ggml/`) and run `JOBS=8 sh cuda-shim/build/build-ggml-cuda.sh` (about an hour). The shim's
+(gitignored) and it belongs to the pinned llama.cpp commit. Rebuild it with `sh setup.sh cuda` (or `JOBS=8 sh
+cuda-shim/build/build-ggml-cuda.sh`): with the container backend the tree is bind-mounted and nothing needs copying; with
+`TINYCC_HOST` set, sync it to the box first (`rsync -a llama.cpp/ggml/ $TINYCC_HOST:ggml/`). About an hour either way.
+`TINYCC_REUSE_FATBIN=1` rebuilds only the host halves, from fatbins a previous run left in `/tmp`. The shim's
 own kernels (`libtinycudart/copy1d.cu`, `copy2d.cu`, `libtinycublas/gemm.cu`) ship as committed cubins with the `nvcc -arch=sm_120`
 line that built them in each source file.
 
@@ -205,7 +234,9 @@ do not; it is numerics, not a wrong cache. The Metal half maps the whole model a
 ## Layout
 
 ```
-setup.sh                      fetch + build sequence (deps | llama | sd | shim | link)
+install.sh                    one-command setup for a fresh Mac: checks every prerequisite, installs what is missing, builds
+                              (`sh install.sh check` reports and touches nothing)
+setup.sh                      fetch + build sequence (deps | llama | sd | shim | cuda | link)
 env.sh                        paths for the operating tools (tinygrad checkout, venv, nvcc host)
 cuda-shim/                    the driver and the shim — snapshot of the working tree's main at 09e9cdb (2026-09-15)
   libtinynv/                  the C driver: src/ (gsp.c boot + RM, mmu.c/pt.c/tlsf.c memory, submit.c ring + doorbell, qmd.c launch +

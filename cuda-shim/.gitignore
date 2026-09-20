@@ -1,4 +1,14 @@
-build/
+# Build OUTPUTS are not committed - but the scripts that produce them are. A bare `build/` rule stops git descending
+# into the directory at all, so negations inside it never match, which is how build/sdk.sh (the Makefile calls it),
+# build/link-null.sh and build/fetch-cuda-headers.sh (setup.sh calls both) came to be missing from every clone: the
+# tree could not build itself and said so only at the first `make`.
+build/*
+!build/*.sh
+!build/tinycc
+# a rule with a slash in it is anchored here, so nested build directories need saying separately - the old bare
+# `build/` had covered them by matching any directory of that name at any depth
+libtinynv/build/
+libtinynv/test/build/
 *.o
 *.a
 *.dSYM/

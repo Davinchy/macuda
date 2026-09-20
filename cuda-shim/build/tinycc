@@ -1,0 +1,63 @@
+#!/bin/sh
+# tinycc — the split CUDA "compiler" for the shim build: device-compile a .cu to an sm_120 fatbin on the Linux box,
+# host-compile it on the Mac with clang --cuda-host-only --offload-arch=<same arch>, embedding the fatbin. The offload arch
+# matters on the HOST side too: it sets __CUDA_ARCH_LIST__, which ggml's dispatch reads to decide which kernels exist, and
+# which CUB/thrust bake into their inline namespace (and so into kernel names). Without it clang assumes sm_52. Output one Mach-O .o, ready to link
+# against libtinycudart/libtinycublas/libtinynv. Usage:  tinycc <src.cu> -o <out.o> [-I<dir> ...] [-D<x> ...] [-std=..]
+# Requires the ggml tree synced: Mac $TINYCC_GGML_MAC  <->  Linux $TINYCC_GGML_LINUX (default ~/ggml on $TINYCC_HOST).
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd); R=${EGPU_ROOT:-$(cd "$ROOT/.." && pwd)}
+CLANG=/opt/homebrew/opt/llvm/bin/clang++
+# TWO DEVICE BACKENDS, same output. `ssh` sends the .cu to a Linux box with nvcc (TINYCC_HOST); `docker` runs nvcc in a
+# CUDA container on this Mac, which is the default when no host is set. The container needs no GPU, no NVIDIA driver and
+# no container runtime hooks: --fatbin compiles DEVICE code for sm_120 and never executes it. nvidia/cuda publishes
+# arm64 images, so on Apple Silicon this runs natively rather than under emulation.
+BACKEND=${TINYCC_BACKEND:-$([ -n "${TINYCC_HOST:-}" ] && echo ssh || echo docker)}
+CUDA_IMAGE=${TINYCC_CUDA_IMAGE:-nvidia/cuda:13.0.3-devel-ubuntu24.04}
+DOCKER=${DOCKER:-docker}
+if [ "$BACKEND" = ssh ]; then
+  HOST=${TINYCC_HOST:?set TINYCC_HOST=user@host, the Linux box with nvcc}; KEY=${TINYCC_KEY:-}   # TINYCC_KEY: ssh identity file, optional
+fi
+ARCH=${TINYCC_ARCH:-sm_120a}
+# SASS only, no portable PTX (what ggml's own CMake ships as 120a-real): nvcc expands -arch=sm_120a into an sm_120a pass
+# PLUS a compute_120 PTX pass compiled without the architecture-specific feature macro, and ggml's Blackwell gate checks
+# only the architecture number, so that PTX carries the block-scaled MMA and ptxas rejects it. The explicit -gencode
+# form has no such second pass. The fatbin then holds exactly one ELF, which is what the shim's loader expects.
+GMAC=${TINYCC_GGML_MAC:-$R/llama.cpp/ggml}
+# where the ggml tree is seen from the device side: a path on the Linux box, or the bind mount inside the container.
+# The -I rewriting below keys off this, so it has to be set before the argument loop either way.
+if [ "$BACKEND" = docker ]; then GLIN=/ggml; else GLIN=${TINYCC_GGML_LINUX:-ggml}
+  SSH="ssh ${KEY:+-i $KEY} -o BatchMode=yes -o ControlMaster=auto -o ControlPath=$ROOT/.cache/cc-%C -o ControlPersist=300"
+fi
+src=""; out=""; hostI=""; devI=""; defs=""; std="-std=c++17"
+while [ $# -gt 0 ]; do case "$1" in
+  *.cu) src="$1";;
+  -o) out="$2"; shift;;
+  -I*) d="${1#-I}"; hostI="$hostI -I$d"; case "$d" in "$GMAC"*) devI="$devI -I$GLIN${d#$GMAC}";; esac;;
+  -D*) defs="$defs $1";;
+  -std=*) std="$1";;
+esac; shift; done
+[ -n "$src" ] && [ -n "$out" ] || { echo "tinycc: need <src.cu> -o <out.o>" >&2; exit 2; }
+rel="${src#$GMAC/}"; base=$(basename "$src" .cu); fat="/tmp/tinycc_$base.fatbin"
+# 1) device compile on the Linux box (source already synced under $GLIN)
+# TINYCC_REUSE_FATBIN=1 skips the device compile when the fatbin from a previous run is still here (host-only rebuilds)
+NVCC_ARGS="--fatbin -gencode arch=compute_${ARCH#sm_},code=$ARCH --extended-lambda --expt-relaxed-constexpr"
+if [ "${TINYCC_REUSE_FATBIN:-0}" = 1 ] && [ -s "$fat" ]; then :
+elif [ "$BACKEND" = docker ]; then
+  # /ggml is the source tree read-only; /out is where the fatbin lands, so it is on the Mac the moment nvcc exits and
+  # nothing has to be copied back. --network=none because a compile that reaches the network is a compile to distrust.
+  mkdir -p /tmp/tinycc-fatbin
+  $DOCKER run --rm --network=none -v "$GMAC:/ggml:ro" -v /tmp/tinycc-fatbin:/out "$CUDA_IMAGE" \
+    nvcc $NVCC_ARGS $devI $defs -o "/out/tinycc_$base.fatbin" "/ggml/$rel" >&2
+  mv "/tmp/tinycc-fatbin/tinycc_$base.fatbin" "$fat"
+else
+$SSH "$HOST" "export PATH=/usr/local/cuda/bin:\$PATH; nvcc $NVCC_ARGS $devI $defs -o /tmp/tinycc_$base.fatbin '$GLIN/$rel'"
+scp -q ${KEY:+-i "$KEY"} -o "ControlPath=$ROOT/.cache/cc-%C" "$HOST:/tmp/tinycc_$base.fatbin" "$fat"
+fi
+# 2) host compile on the Mac, embed the fatbin. Optimised: until 2026-09-19 this line carried no -O at all, so every ggml-cuda
+# dispatcher ran at -O0 - the per-kernel profile put the caller's cost above the runtime layer at 2.38 us a launch and the
+# MoE decode's loss at the engine waiting for the host. TINYCC_HOST_OPT overrides (-O0 for a debug build).
+HOSTOPT=${TINYCC_HOST_OPT:--O2}
+$CLANG $std $HOSTOPT -DNDEBUG -x cuda --cuda-host-only --offload-arch=$ARCH --cuda-path=$ROOT/cuda-13 -nocudalib -Wno-unknown-cuda-version \
+  -include $ROOT/spike/tinycudart_compat.h -I$ROOT/cuda-13/include/cccl $hostI $defs \
+  -Xclang -fcuda-include-gpubinary -Xclang "$fat" -c "$src" -o "$out"
