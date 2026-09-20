@@ -17,9 +17,17 @@ have to cross the link:
 
     plateau = (card_ubatch / metal_rate) / (streamed_gib / link_rate + card_ubatch / card_rate)
 
-So the whole game is minimising streamed_gib - the expert bytes that do NOT stay resident on the card's 32 GB. A
-model small enough to live on the card entirely does not want this path at all: card-only measured 5.5-7.3x over
+A model small enough to live on the card entirely does not want this path at all: card-only measured 5.5-7.3x over
 Metal, which beats any disaggregated figure here.
+
+The trap, and it reverses the obvious conclusion: metal_rate and card_rate were BOTH measured on one model
+(Coder-Next 80B-A3B, ~3.35 GB of active bytes a token). Prefill is compute-bound, so both scale down together as a
+model's ACTIVE parameters rise - but the expert stream is fixed seconds and does not scale at all. More active
+parameters therefore amortise the stream against more compute, and the speedup climbs toward the raw card:Metal
+compute ratio of ~7.8x. Judging candidates by total size alone says "smaller is better"; judging them properly says
+the opposite, because active parameters are the lever. Two 60 GB models, one with 8 GB active and one with 17 GB,
+screen at 5.3x and 6.4x. So the models a Mac is WORST at - high active-parameter mixtures - are the best ones to put
+on this path, which is also where a user actually feels the pain.
 
     python3 tools/disagg-screen.py /Volumes/Models              # rank every .gguf found
     python3 tools/disagg-screen.py a.gguf b.gguf --resident 30  # how much fits on the card, GiB (default 28)
@@ -32,6 +40,9 @@ METAL_RATE = 660.0            # Metal prefill tok/s, measured
 CARD_RATE = 5150.0            # card marginal prefill tok/s, measured (driver ad308bd)
 LINK_RATE = 5.46              # GiB/s the expert stream crosses Thunderbolt at, measured
 CARD_UBATCH = 24576           # the card server's -ub: the stream is paid once per ubatch
+# The model both rates were measured on: Coder-Next 80B-A3B, whose active bytes a token work out at ~3.35 GiB. Every
+# other model's rates are scaled from these by its own active bytes, because prefill is compute-bound.
+BASE_ACTIVE_GIB = 3.35
 
 
 def load_router():
@@ -76,9 +87,18 @@ def screen(router, path, resident_gib):
         row["plateau"] = float("nan")
         row["verdict"] = "DENSE and bigger than the card: this path does not apply"
         return row
-    row["plateau"] = (CARD_UBATCH / METAL_RATE) / (streamed / LINK_RATE + CARD_UBATCH / CARD_RATE)
+    # Active bytes a token: everything that is not an expert, plus the fraction of experts actually routed to. This is
+    # what both prefill rates scale with, and it is readable straight out of the header.
+    non_expert = max(total_gib - expert_gib, 0.0)
+    frac = (row["used"] / row["n_expert"]) if row["n_expert"] else 1.0
+    active = non_expert + expert_gib * frac
+    row["active"] = active
+    r = max(active / BASE_ACTIVE_GIB, 1e-6)
+    metal = CARD_UBATCH / (METAL_RATE / r)
+    card = streamed / LINK_RATE + CARD_UBATCH / (CARD_RATE / r)
+    row["plateau"] = metal / card
     # Break-even prompt: below this, Metal alone is faster because the stream is not yet amortised.
-    per_tok = 1.0 / METAL_RATE - 1.0 / CARD_RATE
+    per_tok = r / METAL_RATE - r / CARD_RATE
     row["breakeven"] = (streamed / LINK_RATE) / per_tok
     row["verdict"] = ("strong" if row["plateau"] >= 3.0 else "useful" if row["plateau"] >= 1.8 else "marginal")
     return row
@@ -111,13 +131,16 @@ def main():
     ok.sort(key=lambda r: (-(r["plateau"] if r["plateau"] == r["plateau"] else -1)))
     print(f"\ncard holds {a.resident:.0f} GiB; Metal prefill {METAL_RATE:.0f} tok/s, card {CARD_RATE:.0f} tok/s marginal,")
     print(f"link {LINK_RATE:.2f} GiB/s, expert stream paid once per {CARD_UBATCH} tokens.\n")
-    print(f"{'model':<44}{'size':>8}{'experts':>9}{'stream':>8}{'plateau':>9}{'break-even':>11}  verdict")
+    print(f"{'model':<40}{'size':>8}{'active':>8}{'stream':>8}{'plateau':>9}{'break-even':>11}  verdict")
     for r in ok:
         pl = "-" if r["plateau"] != r["plateau"] else f"{r['plateau']:.1f}x"
         be = f"{r['breakeven']:,.0f} tok" if "breakeven" in r else "-"
-        print(f"{r['name'][:43]:<44}{r['total_gib']:>7.1f}G{r['expert_gib']:>8.1f}G{r['streamed']:>7.1f}G{pl:>9}{be:>11}  {r['verdict']}")
+        ac = f"{r['active']:.1f}G" if "active" in r else "-"
+        print(f"{r['name'][:39]:<40}{r['total_gib']:>7.1f}G{ac:>8}{r['streamed']:>7.1f}G{pl:>9}{be:>11}  {r['verdict']}")
     print("\nplateau = the speedup a long prompt converges to; break-even = the prompt length below which Metal alone wins.")
-    print("A model that fits the card entirely is not a disaggregation candidate - run it card-only instead.")
+    print("active = bytes a token actually touches, which is the lever: more active parameters amortise the fixed expert")
+    print("stream against more compute, so the speedup rises toward the ~7.8x card:Metal compute ratio. Total size alone")
+    print("is misleading. A model that fits the card entirely is not a candidate - run it card-only instead.")
     return 0
 
 
