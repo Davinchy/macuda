@@ -29,7 +29,7 @@ R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 BIN=${BIN:-$R/cuda-shim/build/bin/llama-server-null}
 MODEL=${MODEL:-/Volumes/512SSD/LocalCode/offline-ai-kit/models/Qwen3-Coder-Next-UD-Q4_K_XL.gguf}
 PROMPT=${1:-$R/logs/disagg/prompt-24k.txt}; NAME=${2:-coder-next-24k.bin}
-STATE=$R/logs/disagg; PORT=${PORT:-8092}; CTX=${CTX:-40960}; UB=${UB:-24576}; NCPUMOE=${NCPUMOE:-48}   # NCPUMOE=0 puts the experts on the device (null-device rehearsals only)
+STATE=${STATE:-$R/logs/disagg}; PORT=${PORT:-8092}; CTX=${CTX:-40960}; UB=${UB:-24576}; NCPUMOE=${NCPUMOE:-48}   # NCPUMOE=0 puts the experts on the device (null-device rehearsals only)
 mkdir -p "$STATE"; ts=$(date +%Y%m%d-%H%M%S); SLOG=$STATE/prefill-server-$ts.log
 test -f "$PROMPT" || { echo "no prompt at $PROMPT"; exit 2; }; test -x "$BIN" || { echo "no binary at $BIN"; exit 2; }
 test -f "$MODEL" || { echo "no model at $MODEL"; exit 2; }

@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Six Models, One Card — macuda</title>
+<meta name="description" content="Does the disaggregation advantage track active parameters? Six MoE models from 3B to 39B active, prefilled on both halves at four prompt lengths — and how long the card stayed up while it happened.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<style>
+  .pred{border-left:3px solid var(--native);background:var(--surface);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:74ch;box-shadow:var(--shadow)}
+  .meas{border-left:3px solid var(--accent);background:var(--surface);padding:12px 16px;border-radius:0 6px 6px 0;margin:16px 0;max-width:74ch;box-shadow:var(--shadow)}
+  .tag2{display:inline-block;font:600 11px 'JetBrains Mono',monospace;letter-spacing:.08em;text-transform:uppercase;
+        padding:2px 7px;border-radius:3px;vertical-align:2px;margin-right:8px}
+  .tag2.p{background:var(--native-soft);color:var(--native)}
+  .tag2.m{background:var(--accent-soft);color:var(--accent-ink)}
+  .draft{background:var(--native-soft);color:var(--native);border:1px solid var(--native);border-radius:6px;
+         padding:10px 14px;margin:0 0 22px;font-size:15px;max-width:74ch}
+  .pending{color:var(--muted);font-style:italic}
+  .clock{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin:20px 0 6px}
+  .clock .c{background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:16px 18px;box-shadow:var(--shadow)}
+  .clock .n{font-family:"JetBrains Mono",monospace;font-size:26px;font-weight:600;letter-spacing:-.02em;display:block}
+  .clock .l{font-size:13px;color:var(--muted);display:block;margin-top:4px}
+  .clock .c.good .n{color:var(--good)}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="inner">
+    <a class="brand" href="index.html"><span class="dot"></span>macuda <small>RTX 5090 · Apple Silicon</small></a>
+    <nav class="nav">
+      <a href="index.html">Overview</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="disaggregation.html">Disaggregation</a>
+      <a href="crossmodel.html" aria-current="page">Six models</a>
+      <a href="technicals.html">Technicals</a>
+      <a class="repo" href="https://github.com/Davinchy/macuda">Repository</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <p class="draft"><b>Draft — the run is in progress.</b> The method, the model list and the predictions below were
+  written before the measurements came back, and are left exactly as written. Result cells read
+  <span class="pending">pending</span> until the run fills them; nothing on this page is a prediction dressed up as a
+  measurement.</p>
+
+  <section class="hero">
+    <div class="eyebrow">macuda · cross-model sweep · 19–20 September 2026</div>
+    <h1>Six models, one card</h1>
+    <p class="lede">The <a href="disaggregation.html">disaggregation page</a> argues that active parameters, not total
+    size, decide whether a model belongs on this path — that the card's advantage is largest exactly where an Apple GPU
+    is worst. That argument was made from one model and a pile of published figures. These six test it directly:
+    3B to 39B active parameters at roughly the same total size, both halves, same prompts.</p>
+  </section>
+
+  <h2>The six</h2>
+  <div class="tablewrap wide"><table>
+    <thead><tr><th>Model</th><th class="r">Size</th><th class="r">Active</th><th class="r">KV / token</th><th>Why it is in the set</th></tr></thead>
+    <tbody>
+      <tr><td class="model">Qwen3-Coder-Next 80B-A3B<small>UD-Q4_K_XL · qwen3next</small></td><td class="r">49.6 GB</td><td class="r">3B</td><td class="r">96 KB</td><td><b>The anchor.</b> Every constant in the cost model was fitted on this model, and the disaggregation page's headline table is its data. If this rig does not reproduce 2.35× at 24k and 5.55× at 48k, the other five rows mean nothing.</td></tr>
+      <tr><td class="model">gpt-oss-120b<small>MXFP4 · gpt-oss</small></td><td class="r">63.4 GB</td><td class="r">5.1B</td><td class="r">72 KB</td><td>The one model in the set with a <i>published</i> Metal prefill figure (737 tok/s) to check the rig against. By the page's own argument it is the control, not the star: few active parameters means least to gain.</td></tr>
+      <tr><td class="model">Qwen3.5 122B-A10B<small>Q4_K_M · qwen35moe</small></td><td class="r">69.1 GB</td><td class="r">10B</td><td class="r">96 KB</td><td>The middle of the lever, and already on the drive. 256 experts, 8 used.</td></tr>
+      <tr><td class="model">DeepSeek-V4-Flash<small>UD-Q2_K_XL · deepseek4</small></td><td class="r">96.8 GB</td><td class="r">~10B</td><td class="r">86 KB</td><td>Same position on the lever as the Qwen above, reached a completely different way: one KV head and a 512-wide compressed latent (MLA) instead of 2 heads of 256. The two of them are a near-duplicate pair on both axes and a deliberate architecture control — if they diverge, it is the attention design doing it, not size or active parameters.</td></tr>
+      <tr><td class="model">Llama-4-Scout 109B-A17B<small>Q4_K_M · llama4</small></td><td class="r">65.4 GB</td><td class="r">17B</td><td class="r">192 KB</td><td>High active parameters at ordinary size, and the second-worst KV cache in the set.</td></tr>
+      <tr><td class="model">Mixtral 8x22B<small>Q4_K_S · llama</small></td><td class="r">80.5 GB</td><td class="r"><b>39B</b></td><td class="r">224 KB</td><td>The extreme end of the lever, and the worst KV cache in the set. If active parameters are what matter, this is where the advantage is largest; if the KV cache is what matters, this is where long context hurts most. It is in the set to be pulled in both directions at once.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="cap">KV per token is layers × KV heads × (key + value) × 2 bytes, from each header. Active is the GiB a token actually touches — everything that is not an expert, plus the routed
+  fraction of the experts — read from each file's own header, not from the model card. KV bytes a token are computed
+  from the header the same way: layers × KV heads × (key + value) × 2. Every file lives on one external drive so that
+  load time is a property of the rig and not of which disk a model happened to be on.</p>
+
+  <h2>What is actually run</h2>
+  <p>Each model is prefilled on <b>both halves</b> — the card through this driver over Thunderbolt, and the Mac's own
+  GPU through the kit's Metal build — at <b>12,000, 24,000, 26,000 and 48,000 tokens</b>. 24,000 and 26,000 straddle
+  the 24,576-token ubatch boundary, where the expert stream is paid a second time; 12,000 and 48,000 give the context
+  curve its ends.</p>
+
+  <div class="meas"><span class="tag2 m">method</span><b>The lengths are token counts, not prompt files.</b> The same
+  267 KB of text is 71,504 tokens to one tokenizer and rather fewer to another, so "the same prompt" would land on
+  different sides of the ubatch boundary for different models and the step would become an artefact of vocabulary.
+  Each server tokenizes one base text with its own tokenizer and the ids are sliced to exactly the length asked for.</div>
+
+  <p>Two more things the rig does on purpose. The slot is <b>erased between lengths</b>, because these prompts are
+  prefixes of one text and a cache hit would be recorded as an impossibly fast prefill. And every model runs with
+  <b>every expert in host memory</b> (<code>--n-cpu-moe n_layer</code>): that is the configuration the cost model's
+  constants were fitted on, and the only one identical across models — tuning residency per model would measure the
+  tuning rather than the model.</p>
+
+  <h2>Predictions, before the data</h2>
+  <div class="pred"><span class="tag2 p">prediction</span><b>1. The advantage rises with active parameters.</b> The
+  card's fixed cost is the expert stream, in seconds, and it does not care how much arithmetic a token needs; Metal's
+  cost is all arithmetic. So Mixtral at 39B active should show the largest advantage in the set and Coder-Next at 3B
+  the smallest, with the others ordered between them. <b>Refutation:</b> if the ordering is flat or inverted, the
+  page's central claim is wrong and total size or something else is doing the work.</div>
+  <div class="pred"><span class="tag2 p">prediction</span><b>2. The advantage rises with context, for every model.</b>
+  Measured on one model on 19 September: 2.35× at 24k to 5.55× at 48k, because Metal's prefill rate collapses from 673
+  to 304 tok/s while the card's holds. <b>Refutation:</b> a model whose advantage falls between 24k and 48k. Mixtral is
+  the most likely place to see one, because its 229 KB/token cache is the one that can displace enough resident weight
+  to bite back.</div>
+  <div class="pred"><span class="tag2 p">prediction</span><b>3. The ubatch step is real on models it was not found on.</b>
+  Going from 24,000 to 26,000 tokens — 2,000 more tokens of work — should cost each model roughly its own expert stream
+  again, several seconds, not the fraction of a second the extra tokens are worth. <b>Refutation:</b> a smooth slope
+  through that boundary on any model.</div>
+  <div class="pred"><span class="tag2 p">prediction</span><b>4. The KV axis shows up inside each model's curve, not
+  across the set.</b> This one was rewritten before the run, and the reason is worth keeping: the set was assembled
+  believing DeepSeek-V4-Flash's MLA cache was about 1 KB a token against Mixtral's 229. Read out of the headers it is
+  <b>86 KB</b> against <b>224</b> — a factor of 2.6, not a hundred, and the six models' KV sizes turn out to be
+  correlated with their active parameters (72 KB at 5.1B active, 224 KB at 39B). A cross-model comparison therefore
+  cannot separate the two axes at all. What can is each model's own curve from 12k to 48k: active parameters set how
+  high it sits, the KV cache sets how much it sags, because the cache is what displaces resident experts. So the
+  prediction is that the <i>ordering</i> of the six holds at every length, while Mixtral and Scout — 224 and 192 KB —
+  lose more of their advantage between 24k and 48k than gpt-oss and DeepSeek do at 72 and 86.</div>
+  <div class="pred"><span class="tag2 p">open question the run answers</span>Whether llama.cpp caches DeepSeek's MLA
+  latent compressed or expanded. The header arithmetic that gives 86 KB a token assumes expanded; if the cache is the
+  512-wide latent plus rope instead, it is nearer 48. The server prints its own KV buffer size at a known context, so
+  the run settles it rather than leaving it to the header.</div>
+
+  <h2>Results</h2>
+  <div class="tablewrap wide"><table>
+    <thead><tr><th>Model</th><th class="r">Active</th><th class="r">12k</th><th class="r">24k</th><th class="r">26k</th><th class="r">48k</th><th class="r">Card fit: stream / rate</th></tr></thead>
+    <tbody>
+      <tr><td class="model">Qwen3-Coder-Next<small>80B-A3B</small></td><td class="r">3B</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td></tr>
+      <tr><td class="model">gpt-oss-120b<small>117B-A5.1B</small></td><td class="r">5.1B</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td></tr>
+      <tr><td class="model">Qwen3.5 122B<small>A10B</small></td><td class="r">10B</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td></tr>
+      <tr><td class="model">DeepSeek-V4-Flash<small>MLA, ~A10B</small></td><td class="r">~10B</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td></tr>
+      <tr><td class="model">Llama-4-Scout<small>109B-A17B</small></td><td class="r">17B</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td></tr>
+      <tr><td class="model">Mixtral 8x22B<small>141B-A39B</small></td><td class="r">39B</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r pending">pending</td></tr>
+    </tbody>
+  </table></div>
+  <p class="cap">Each cell is Metal's prefill time divided by the card's, at that length, both halves measured on the
+  same token ids. The last column refits the card's own cost model per model — ⌈tokens ÷ 24,576⌉ × stream + tokens ÷
+  rate + fixed — on that model's four points, and is reported with its residual rather than asserted.</p>
+
+  <h2>How long does the card stay up?</h2>
+  <p>A long sweep is also an endurance test, so this one is timed. The clock is the <b>driver extension instance's
+  lifetime</b>: macOS restarts that process when the card is re-enumerated — a replug, a sleep/wake, a bus reset — so
+  "same instance, same start time" is exactly the claim that the card has not gone away, and it is the same signal
+  preflight refuses on.</p>
+
+  <div class="clock">
+    <div class="c good"><span class="n" id="up">pending</span><span class="l">unbroken card uptime</span></div>
+    <div class="c"><span class="n" id="steps">pending</span><span class="l">card steps in that window</span></div>
+    <div class="c good"><span class="n">0</span><span class="l">DART faults</span></div>
+    <div class="c good"><span class="n">0</span><span class="l">re-enumerations under load</span></div>
+  </div>
+  <p class="cap">Sampled every five minutes by <code>tools/card-uptime.sh</code>, which is deliberately read-only —
+  ps, ioreg and the lock file, nothing that opens the device. A sampler that had to open the card would be measuring
+  its own interference, and on this stack a second opener is how you get two drivers on one card.</p>
+
+  <div class="pred"><span class="tag2 p">honest about the clock's start</span>The clock starts at
+  <b>21:45:40 on 19 September</b>, which is when the current driver instance began — while the card was <i>idle</i>,
+  seventeen minutes after the last run of the evening finished. The link stayed up at 16 GT/s ×4 throughout and no
+  DART error data was latched, so nothing was damaged, but the instance did restart and the cause is not established.
+  Preflight refused on it, as designed, and it was cleared by hand before this sweep began. An uptime figure that
+  quietly began after a restart nobody mentioned would not be worth printing.</div>
+
+  <p class="note" style="margin-top:22px">Sources: <code>tools/disagg-crossmodel.sh</code> runs the sweep,
+  <code>tools/disagg-sweep.sh</code> is one half of it, <code>tools/disagg-analyse.py</code> makes these tables,
+  <code>tools/card-uptime.sh</code> keeps the clock, and the rows themselves are in
+  <code>disagg-bench/results.tsv</code> — all in the <a href="https://github.com/Davinchy/macuda">repository</a>.</p>
+
+  <footer>
+    <p>Draft page — its companion is <a href="disaggregation.html">Disaggregation</a>, which is where the argument
+    being tested here was made.</p>
+  </footer>
+
+</div>
+</body>
+</html>

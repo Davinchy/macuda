@@ -15,7 +15,7 @@ R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 K=/Volumes/512SSD/LocalCode/offline-ai-kit; BIN=${METAL_BIN:-$K/bin/llama-server}
 MODEL=${MODEL:-$K/models/Qwen3-Coder-Next-UD-Q4_K_XL.gguf}
 mode=${1:?baseline|restore}; PROMPT=${2:-$R/logs/disagg/prompt-24k.txt}; N=${3:-128}; NAME=${4:-coder-next-24k.bin}
-STATE=$R/logs/disagg; PORT=${PORT:-8091}; CTX=${CTX:-40960}
+STATE=${STATE:-$R/logs/disagg}; PORT=${PORT:-8091}; CTX=${CTX:-40960}
 mkdir -p "$STATE"; ts=$(date +%Y%m%d-%H%M%S); SLOG=$STATE/metal-$mode-server-$ts.log; OUT=$STATE/metal-$mode-$ts
 test -f "$PROMPT" || { echo "no prompt at $PROMPT"; exit 2; }; test -x "$BIN" || { echo "no Metal server at $BIN"; exit 2; }
 [ "$mode" = restore ] && { test -f "$STATE/$NAME" || { echo "no state file at $STATE/$NAME (run the prefill half first)"; exit 2; }; }

@@ -32,7 +32,7 @@ on this path, which is also where a user actually feels the pain.
     python3 tools/disagg-screen.py /Volumes/Models              # rank every .gguf found
     python3 tools/disagg-screen.py a.gguf b.gguf --resident 30  # how much fits on the card, GiB (default 28)
 """
-import argparse, importlib.util, math, os, struct, sys
+import argparse, importlib.util, math, os, re, struct, sys
 
 
 def read_kv(path):
@@ -78,9 +78,13 @@ def kv_bytes_per_token(kv, arch):
 
 GIB = float(1 << 30)
 CARD_VRAM_GIB = 30.0          # what a 32 GB card can actually hold once the driver's own reservations are out
-METAL_RATE = 660.0            # Metal prefill tok/s, measured
-CARD_RATE = 5150.0            # card marginal prefill tok/s, measured (driver ad308bd)
-LINK_RATE = 5.46              # GiB/s the expert stream crosses Thunderbolt at, measured
+METAL_RATE = 660.0            # Metal prefill tok/s at 24k. It does NOT hold: 673 at 24k, 405 at 26k, 304 at 49k
+                              # (measured 2026-09-19). Prefill is compute-bound and Apple has no matrix hardware, so
+                              # the quadratic term bites Metal far harder than the card. Every number below that uses
+                              # a constant Metal rate therefore reads LOW at long context - the real advantage RISES.
+CARD_RATE = 3300.0            # card marginal prefill tok/s, refit 2026-09-19 on four fresh prefills (was 5150)
+LINK_RATE = 7.04              # GiB/s the expert stream crosses Thunderbolt at: 43.69 GiB in 6.21 s (was 5.46)
+CARD_FIXED = 1.65             # seconds a prefill pays regardless of length, from the same fit
 CARD_UBATCH = 24576           # the card server's -ub: the stream is paid once per ubatch
 # The model both rates were measured on: Coder-Next 80B-A3B, whose active bytes a token work out at ~3.35 GiB. Every
 # other model's rates are scaled from these by its own active bytes, because prefill is compute-bound.
@@ -97,7 +101,7 @@ def load_router():
 
 
 def card_seconds(tokens, streamed):
-    return math.ceil(tokens / CARD_UBATCH) * (streamed / LINK_RATE) + tokens / CARD_RATE
+    return math.ceil(tokens / CARD_UBATCH) * (streamed / LINK_RATE) + tokens / CARD_RATE + CARD_FIXED
 
 
 def plateau_at(streamed, active, tokens=None):
@@ -109,13 +113,48 @@ def plateau_at(streamed, active, tokens=None):
     return metal / card
 
 
-def screen(router, path, resident_gib):
-    """Header only: the key/value table and the tensor directory, a few MB at the front of the file."""
+SPLIT_RE = re.compile(r"^(?P<base>.*)-(?P<no>\d{5})-of-(?P<count>\d{5})\.gguf$")
+
+
+def shard_sets(files):
+    """Group a GGUF split (`name-00001-of-00003.gguf`) back into the one model llama.cpp loads. Screening a shard on
+    its own is not a small error: it reads the first shard's bytes as the whole model, so the expert stream - the
+    fixed cost that sets the plateau - comes out several times too small and every verdict is flattering. Every model
+    in the size band this path is for ships sharded, so this is the common case, not the corner. Returns
+    [(representative, [shards in order]), ...]; the representative is shard 1, which carries the full KV table."""
+    groups, singles = {}, []
+    for f in files:
+        m = SPLIT_RE.match(os.path.basename(f))
+        if m: groups.setdefault(os.path.join(os.path.dirname(f), m.group("base")), []).append((int(m.group("no")), f))
+        else: singles.append((f, [f]))
+    out = [(paths[0][1], [p for _, p in paths]) for paths in
+           (sorted(v) for v in groups.values())]
+    return sorted(out + singles, key=lambda t: t[0])
+
+
+def merged_layout(router, shards):
+    """expert_layout over every shard of one model, added up. Only shard 1 carries the architecture and expert counts;
+    the others carry their share of the expert tensors, which is what has to be summed."""
+    lay = {"arch": "?", "n_expert": None, "n_expert_used": None, "blocks": [], "total": 0}
+    for i, sh in enumerate(shards):
+        one = router.expert_layout(sh)
+        if i == 0 or lay["arch"] == "?":
+            for k in ("arch", "n_expert", "n_expert_used"):
+                if one.get(k) not in (None, "?"): lay[k] = one[k]
+        lay["blocks"] += one.get("blocks") or []
+        lay["total"] += one.get("total") or 0
+    lay["blocks"].sort()
+    return lay
+
+
+def screen(router, path, resident_gib, shards=None):
+    """Header only: the key/value table and the tensor directory, a few MB at the front of each shard."""
+    shards = shards or [path]
     try:
-        lay = router.expert_layout(path)
+        lay = merged_layout(router, shards)
     except Exception as e:
         return {"path": path, "error": str(e)[:60]}
-    total_bytes = os.path.getsize(path)
+    total_bytes = sum(os.path.getsize(s) for s in shards)
     total_gib = total_bytes / GIB
     expert_gib = lay["total"] / GIB if lay.get("total") else 0.0
     nblocks = len(lay.get("blocks") or [])
@@ -123,7 +162,9 @@ def screen(router, path, resident_gib):
     # card holds (resident - non_expert) GiB of experts and the rest crosses the link every ubatch.
     streamed = max(total_gib - resident_gib, 0.0)
     fits = total_gib <= resident_gib
-    row = {"path": path, "name": os.path.basename(path), "total_gib": total_gib, "expert_gib": expert_gib,
+    name = os.path.basename(path)
+    if len(shards) > 1: name = SPLIT_RE.match(name).group("base") + f" ({len(shards)} shards)"
+    row = {"path": path, "name": name, "shards": shards, "total_gib": total_gib, "expert_gib": expert_gib,
            "blocks": nblocks, "n_expert": lay.get("n_expert") or 0, "used": lay.get("n_expert_used") or 0,
            "arch": lay.get("arch") or "?", "streamed": streamed, "fits": fits}
     if fits:
@@ -168,7 +209,10 @@ def main():
     for p in a.paths:
         if os.path.isdir(p):
             for root, _, names in os.walk(p):
-                files += [os.path.join(root, n) for n in names if n.endswith(".gguf")]
+                # ._name is macOS's AppleDouble sidecar, written on exFAT drives: a few KB of resource fork that
+                # starts with the wrong magic and is not a model. Skipping them is not cosmetic - every external
+                # drive holding GGUFs has one per file, and each becomes a "could not read" line.
+                files += [os.path.join(root, n) for n in names if n.endswith(".gguf") and not n.startswith("._")]
         elif p.endswith(".gguf"):
             files.append(p)
     files = sorted(set(files))
@@ -176,7 +220,7 @@ def main():
         print("no .gguf files found"); return 2
 
     router = load_router()
-    rows = [screen(router, f, a.resident) for f in files]
+    rows = [screen(router, rep, a.resident, sh) for rep, sh in shard_sets(files)]
     ok = [r for r in rows if "error" not in r]
     for r in rows:
         if "error" in r:
