@@ -1,317 +1,300 @@
-# macuda — CUDA on an Apple Silicon Mac, over Thunderbolt, with no NVIDIA driver
+# macuda — CUDA inference on Apple Silicon
 
-Unmodified **llama.cpp (CUDA backend)** and **stable-diffusion.cpp** run on an **RTX 5090 (GB202, sm_120)** in a Thunderbolt
-eGPU enclosure on **macOS**, correct and fast, with no NVIDIA driver on the Mac. Three libraries replace the vendor stack:
+**macuda runs CUDA workloads on an NVIDIA RTX 5090 connected to an Apple Silicon Mac over Thunderbolt.** A C userspace driver and CUDA compatibility libraries support llama.cpp and stable-diffusion.cpp with their CUDA backends, without an NVIDIA macOS GPU driver.
 
+The project combines GPU driver development, runtime compatibility and inference profiling. In the 19 September 2026 language-model batch, decode throughput reached **91–101% of the Windows reference**, using the same physical GPU and Thunderbolt enclosure. The three dense models reached **97–98%**. Results, configuration differences and validation criteria are documented below.
+
+This is a research implementation for the tested applications and hardware. It does not provide general CUDA compatibility or established support for PyTorch and vLLM.
+
+## Architecture
+
+```text
+llama.cpp / stable-diffusion.cpp with ggml-cuda
+        │
+libtinycudart.a     CUDA runtime compatibility: modules, launches, memory, streams, events and graphs
+        │
+libtinycublas.a     The cuBLAS entry points used by ggml, backed by tensor-core GEMM kernels
+        │
+libtinynv.a         C userspace driver: firmware initialisation, memory management and GPU submission
+        │
+TinyGPU.app        tinygrad's signed DriverKit extension and Unix-socket hardware interface
+        │
+RTX 5090           GB202, 32 GB VRAM, connected through an AORUS AI BOX over Thunderbolt
 ```
-llama.cpp + ggml-cuda        host code compiled on the Mac by clang (--cuda-host-only); device .cu compiled to sm_120a
-        │                    cubins by nvcc on a Linux box, embedded in the host objects (cuda-shim/build/tinycc)
-  libtinycudart.a            the cudart ABI ggml-cuda links against: fatbin/module loading, kernel launch, memcpy, streams, events
-  libtinycublas.a            the cuBLAS entry points ggml uses, on one tensor-core GEMM cubin (f16 wmma / TF32, strided-batched)
-  libtinynv.a                a C userspace NVIDIA driver: GSP-RM boot (firmware 570.144), RM object model over RPC, MMU v3 page
-        │                    tables, GPFIFO channels + doorbell, QMD launch with chaining, copy engine, timeline semaphores
-  TinyGPU.app + DriverKit dext (tinygrad's)   PCI config/BAR/DMA access over a unix socket
-  RTX 5090 over Thunderbolt
-```
 
-`libtinynv` is a C port of the userspace driver in [tinygrad](https://github.com/tinygrad/tinygrad) (`tinygrad/runtime/ops_nv.py`),
-with NVIDIA's own structure definitions from `open-gpu-kernel-modules` pinned to the release that added the 5090.
+`libtinynv` is a C port of the userspace NVIDIA driver in [tinygrad](https://github.com/tinygrad/tinygrad), using NVIDIA's published `open-gpu-kernel-modules` definitions. It boots the GPU's signed GSP firmware, manages MMU page tables and submits kernels through hardware queues.
 
-## Measured (this Mac, RTX 5090 in an AORUS AI BOX; "native" = the same card in a Windows PC, driver 595.79, same llama.cpp build era, byte-identical models)
+The build separates CPU and GPU compilation. Homebrew clang compiles host code into native macOS objects; Linux `nvcc` compiles GPU kernels for `sm_120a`. Linux compilation can run in a Docker container on the Mac or on a separate machine over SSH. The resulting kernels are embedded in the macOS application. Inference uses macuda's driver and runtime; NVIDIA's firmware executes on the GPU.
 
-| workload | this shim | native | notes |
-|---|---|---|---|
-| Qwen3.8-27B Q4_K_M, tg128 | **74.0 tok/s** | 75.3 | dense decode, kernel-bound at ~1.27 TB/s; the token boundary is what remains |
-| Qwen3.8-27B Q4_K_M, pp256 | ~2550 tok/s | 2447 | prefill at parity (the SASS is identical) |
-| Qwen3.8-27B + its MTP draft head, greedy | **124 tok/s** first request, 112 mean over a 62-minute soak | 124.7 | `llama-server`, `--spec-type draft-mtp` |
-| `llama-server`, 8 slots, 27B + MTP, temp 0.6 | **~207 tok/s aggregate** | — | 20-minute soaks at eight slots: 440 requests, 0 errors |
-| Qwen3.5-35B-A3B MoE Q4_K_M, tg128 | **223 tok/s** | 245.0 | ~1,600 launches a token; CUDA graphs on, and the ggml-cuda host code built at -O2 |
-| SDXL-Turbo, 4 steps, 512², cfg 1.0 | **2.72 s** | 4.11 s | stable-diffusion.cpp |
-| SD 1.5 (fp32), 20 steps, 512² | **3.72 s** | 3.86 s | |
-| Z-Image-Turbo, 8 steps, 1024² | **9.67 s** | 9.46 s | Q8 DiT + Qwen3-4B encoder + FLUX VAE |
-
-Every number above was taken with the standard gate: a clean driver build whose build id is verified in each binary, `test-backend-ops`
-value-checked 450/450 at three chain depths, both decodes at the driver defaults, and a 96-token greedy text byte-compared against a
-reference file. Per-launch host cost is ~1.3 µs at chain depth 128 (the vendor's is ~1). Decode numbers move a few percent with host
-load; MoE numbers move more (see `docs/03-cuda-shim-plan.md` and the log excerpts in `docs/bench/`).
-
-**Re-verified 2026-09-18** against `main`'s tip (`a988ec7`) via `tools/wtgate.sh` (dense/MoE tg128) and three repeats of the standard
-`sd` step (Z-Image, 9.66/9.68/9.68 s): the three previously-published numbers above (65.3, 134.3, 10.16 s) had all gone stale relative
-to what the gated build actually does — MoE tg128 in particular is genuinely ~163 tok/s now (confirmed by a second, independent build),
-not 134.3, closing a meaningful chunk of what looked like a driver deficiency; Z-Image's number was also traced to having been captured
-on a pre-gate build, and a separate later reading of 16-17 s came from an uncommitted, dirty tree — neither is what `main` does. Always
-check `strings <binary> | grep -c '^<expected-id>$'` before trusting any number pulled from an old log.
-
-**Defaults changed 2026-09-19 (`4714f86`):** descriptors are now delivered as delta patches against a token-aligned copy of the
-previous token's descriptors, and the timeline is released once per chain (`TINYNV_DELTA_DELIVERY`, `TINYNV_DELTA_REWIND`,
-`TINYNV_TAIL_RELEASE`, each off with `=0`). The copy engine no longer delivers descriptors at all, which removes the token-boundary
-runlist switch named under "Known limits". Measured on the day, interleaved off/on in the same minutes at driver `74fcfe7`: dense
-27B 67.8 → 70.6-70.8, MoE 35B-A3B 160-165 → 165-168; byte-identical output on both, a five-minute `llama-server` + MTP soak, two
-slots under load and all three image models clean (`docs/handoff-2026-09-19.md`, `docs/driver/libtinynv-design.md` §4h). The
-re-gate of the flipped defaults at `4714f86` read op-verify 450/450 and the text byte-identical, but tg128 68.5-68.8 / 138.9-141.7
-with the opt-out path in the same minutes at 135-136: the whole card was ~16% slower on the MoE than an hour earlier on the same
-code paths, unexplained at the time of writing (see the handoff) - the numbers in the table are the interleaved measurement above.
-
-**Two more defaults changed later the same day (`f7a65d6`):** the inline-upload cap is the pushbuffer method's real
-ceiling, 32,764 bytes (`TINYNV_INLINE_MAX`; the one 8 KB upload every decode token makes now rides the pushbuffer instead
-of the copy engine), and descriptors that release nothing end without a memory barrier (`TINYNV_QMD_MEMBAR=none`; the
-oracle's system-scope barrier stays on releasing descriptors, and `=sys` restores it everywhere). Interleaved against
-the morning's defaults in the same minutes at host load 4-7: MoE 140.3/140.5 -> 142.5/145.0, dense 70.9/70.6 ->
-71.7/71.3; op-verify 450/450 at three depths, both greedy texts byte-identical, all three image models byte-identical
-PNGs at equal times, a five-minute `llama-server` + MTP soak clean.
-
-**And the ggml-cuda host code at -O2 (14:35):** the build's host compile carried no `-O` flag; rebuilt at -O2 with the
-device halves unchanged, interleaved tg128 MoE 139.7/142.8 -> 214.4/217.4 and dense 71.5/70.7 -> 74.0/73.9 at host
-load 6-7, texts and images byte-identical, op-verify 450/450 x3, soak clean. The table carries these numbers. Dropping the per-launch
-cache invalidates was also measured and produces a wrong greedy text: `TINYNV_QMD_INVALIDATE` stays a diagnostic.
+For implementation details, see the [architecture and integration plan](docs/03-cuda-shim-plan.md), [driver design record](docs/driver/libtinynv-design.md) and [DriverKit transport](docs/driver/architecture.md).
 
 ## Quick start
 
+Run the prerequisite check before installing or building:
+
 ```sh
-git clone https://github.com/Davinchy/macuda && cd macuda
-sh install.sh check        # what is present, what is missing, and what to do about each — installs nothing
-sh install.sh              # installs the missing pieces (asking first) and builds everything
+git clone https://github.com/Davinchy/macuda
+cd macuda
+sh install.sh check
 ```
 
-`install.sh check` is safe to run on any Mac: it reads, reports and exits. The full run installs Homebrew packages,
-optionally Docker Desktop and tinygrad's TinyGPU.app, then builds llama.cpp, the shim and ggml's CUDA backend.
-
-Then get a model — any GGUF llama.cpp can read. These are the ones every number on this page was measured with, and
-each line was checked against the repository it names (`hf` is `pip install huggingface_hub`; no token needed):
+Check mode reports missing prerequisites without installing packages or building the project. Install Homebrew and Xcode Command Line Tools first if requested. The full installer prompts before supported dependency installations and then builds the stack:
 
 ```sh
-# the dense model most numbers here use, with its MTP draft head for speculative decode — 16.5 + 1.4 GB
+DEFS_EXTRA=-DGGML_CUDA_USE_GRAPHS sh install.sh
+```
+
+The explicit graph flag matches the published graph-enabled benchmark configuration. The current build script does not enable `GGML_CUDA_USE_GRAPHS` unless it is supplied through `DEFS_EXTRA`.
+
+The installer can install missing CMake and LLVM packages, Docker Desktop and TinyGPU.app. Start Docker Desktop if using the local compiler container. TinyGPU's DriverKit extension still requires user approval through macOS; after the app is installed, run:
+
+```sh
+/Applications/TinyGPU.app/Contents/MacOS/TinyGPU install
+```
+
+Follow the macOS approval prompt in System Settings. Building does not require the GPU, but inference requires the connected enclosure and an approved, running extension.
+
+Download one of the validated GGUF models. These commands use the `hf` CLI from `huggingface_hub`:
+
+```sh
+# Dense model and its multi-token prediction (MTP) head
 hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_M.gguf MTP/mtp-Qwen3.8-27B-Q4_0.gguf --local-dir models/
-hf download unsloth/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q4_K_M.gguf --local-dir models/          # the MoE row, 22.0 GB
-hf download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF Meta-Llama-3.1-8B-Instruct-Q8_0.gguf --local-dir models/   # 8.5 GB
+
+# Additional validated models
+hf download unsloth/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q4_K_M.gguf --local-dir models/
+hf download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF Meta-Llama-3.1-8B-Instruct-Q8_0.gguf --local-dir models/
 ```
 
-If you take only one, take the 27B: `tools/serve.sh`, `tools/soak.sh` and the greedy byte-compare all use it, and its
-MTP head is what makes the speculative-decode numbers reproducible. Keeping the files on an external drive is fine —
-symlink them in (`ln -s /Volumes/<drive>/<model>.gguf models/`), every tool resolves symlinks — but a nearly-full
-external SSD reading at 40 MB/s turns a 30-second model load into ten minutes, measured on this machine, not a guess.
+Qwen3.8 27B is used by the serving and validation tools. Model files may also be symlinked from an external drive; storage throughput affects load time. See [model storage notes](models/README.md).
 
-Then run one, which does the whole card protocol for you — preflight, lock, server, run, release:
+Before running a workload, read the [operating protocol](#run-and-operate) and confirm that preflight reports `VERDICT: OK`:
 
 ```sh
-sh tools/preflight.sh                                          # read-only; must say VERDICT: OK
+sh tools/preflight.sh
 sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf
 ```
 
-Two things `install.sh` cannot do for you, and says so: **approving the DriverKit extension** (macOS asks you, in
-System Settings → General → Login Items & Extensions), and **the card itself** — an RTX 5090 in a Thunderbolt
-enclosure, which a wedged GSP will occasionally need you to physically replug.
-
-The one Linux-only step is `nvcc`, which compiles ggml's ~190 CUDA translation units for the card. It runs in a CUDA
-container on the Mac — `nvidia/cuda` publishes arm64 images, so it is native, not emulated, and since it only ever
-compiles device code (`--fatbin`, never executed there) the container needs no GPU, no NVIDIA driver and no special
-runtime. If you have a Linux box with CUDA 13, `export TINYCC_HOST=user@box` uses it instead and is faster.
-
 ## What you need
 
-**Hardware.** An Apple Silicon Mac (built and measured on an M4 Max, macOS 27.0) and an RTX 5090 in a Thunderbolt enclosure. The
-card is fragile over Thunderbolt: a wedged GSP or a latched DART fault needs a physical replug, and nothing here can do that for you.
-Read `tools/preflight.sh` and the protocol in §Run before touching it.
+| Component | Tested configuration or requirement |
+|---|---|
+| Mac | Apple Silicon; development and measurements use an M4 Max MacBook Pro on macOS 27.0 |
+| GPU | RTX 5090 in a Thunderbolt enclosure; measurements use an AORUS AI BOX |
+| Host toolchain | Xcode Command Line Tools or Xcode, CMake, Python 3 and Homebrew LLVM at `/opt/homebrew/opt/llvm` |
+| Hardware access | TinyGPU.app and its approved DriverKit extension, `org.tinygrad.tinygpu.driver2` |
+| GPU compiler | Docker with the configured CUDA image, or a Linux machine with CUDA 13 accessible over SSH |
+| Storage | Build artifacts, downloaded dependencies and model files; the installer checks available space |
 
-**On the Mac.**
-- Xcode / Command Line Tools (the build picks a macOS SDK by *linking a one-line program* — `cuda-shim/build/sdk.sh` — because SDK
-  paths moved under the tree more than once), CMake, `python3`.
-- Homebrew LLVM at `/opt/homebrew/opt/llvm` (`brew install llvm`): its clang does the CUDA host-only compile and its `libLLVMDemangle`
-  is linked into the runtime.
-- **TinyGPU.app and its DriverKit dext** (`org.tinygrad.tinygpu.driver2`): tinygrad's signed release,
-  `https://github.com/tinygrad/tinygpu_releases/raw/c0d024f9ff0e1dc8fdf217f255da7101d91e8323/TinyGPU.zip`, unzipped to `/Applications`,
-  then `/Applications/TinyGPU.app/Contents/MacOS/TinyGPU install` (approve the system extension). `tools/tinygpu-server.sh` starts and
-  checks the server that fronts the dext over `$TMPDIR/tinygpu.sock`.
-- Optional, for the driver's offline reference tests and the card-recovery tools: tinygrad checkouts (two branches of the fork the
-  driver was developed against — see `env.sh` for which tool needs which) in `tinygrad/` and `tinygrad-stable/`, with a Python 3.12
-  venv in `venv/` that has tinygrad installed editable.
+**Compiler options.** With `TINYCC_HOST` unset, `tinycc` uses `nvidia/cuda:13.0.3-devel-ubuntu24.04` through Docker. The container compiles device code only and requires no GPU access or NVIDIA container runtime. To use an SSH compiler host, set `TINYCC_HOST=user@linux-box` before installation or the build; use `TINYCC_KEY` if an explicit SSH identity is required. The published benchmark builds used the SSH path.
 
-**`nvcc`, which is Linux-only**, for the device side of every CUDA compile (ggml-cuda's ~190 translation units; the shim's own
-three kernels ship as committed cubins). Either is fine:
-- **Docker on this Mac** (the default): `cuda-shim/build/tinycc` runs `nvcc --fatbin` inside `nvidia/cuda:13.0.3-devel-ubuntu24.04`,
-  which has an arm64 image, so it compiles natively on Apple Silicon. No GPU, no NVIDIA driver and no container GPU runtime are
-  involved — device code is *compiled* there and only ever *executed* on the card, through this project's own driver.
-- **A Linux box with CUDA 13 over ssh**: `export TINYCC_HOST=user@box` (`TINYCC_KEY=~/.ssh/...` if it needs an identity file).
-  Faster if you have one, and the way every published number here was built.
+**Fetched dependencies.** `setup.sh deps` obtains NVIDIA headers at commit `81fe4fb` (release 570.86.16), hash-pinned GSP firmware 570.144 and CUDA Toolkit headers. Toolkit headers come from the configured Linux host, the Docker image or `CUDA_INCLUDE_SRC`. These dependencies are not committed to this repository. The header and firmware versions are intentionally different and have been validated together on the test GPU.
 
-Nothing NVIDIA runs on the Mac; the cubins are your own build output.
+**Optional development dependencies.** Some offline reference tests and recovery tools use the tinygrad checkouts and Python environment described in [env.sh](env.sh). These are separate from the application build prerequisites.
 
-**Fetched by `setup.sh deps`, not in the repository:** NVIDIA's `open-gpu-kernel-modules` headers at commit `81fe4fb` (release
-570.86.16, the one that added the RTX 5090; the build asserts the driver's structure sizes against them), the three signed GSP
-firmware images for 570.144 from linux-firmware (hash-pinned), and the CUDA Toolkit headers (copied from the nvcc box's
-`/usr/local/cuda/include`). The header/firmware skew (570.86.16 / 570.144) is deliberate and proven by booting the card with it.
+## Measured performance
 
-## Build
+### Language models
 
-```sh
-sh setup.sh deps                            # NVIDIA headers + firmware (hash-checked) + CUDA headers
-sh setup.sh llama                           # llama.cpp at ad6c668 + upstream fix 2f53959, CPU-only static build in llama.cpp/build-null
-sh setup.sh sd                              # stable-diffusion.cpp at 59c23bc on llama.cpp's ggml (+ patches/), build-null
-sh setup.sh shim                            # libtinynv.a + libtinycudart.a + libtinycublas.a (no GPU; ~3 s)
-sh setup.sh cuda                            # ggml's CUDA backend: nvcc in a container (or on TINYCC_HOST), clang on the Mac
-sh setup.sh link                            # the *-null binaries in cuda-shim/build/bin
-```
+Measured **19 September 2026, 21:07–21:11**, on driver build `abd0458`, with CUDA graphs enabled, device-to-device copies handled by kernels and ggml-cuda host code compiled at `-O2`.
 
-`export TINYCC_HOST=user@linux-box` before `deps` and `cuda` to use a Linux box for the device compile instead of the container.
+Settings: `llama-bench -ngl 99 -p 256 -n 128 -r 3`. Decode (`tg128`) measures generation of 128 tokens; prefill (`pp256`) measures processing of a 256-token prompt. Values are tokens per second, with macuda results shown as mean ± standard deviation over three repeats.
 
-`setup.sh` is the whole sequence; each step is idempotent. `LLAMA_SRC=` / `SD_SRC=` copy from a local clone instead of GitHub.
+| Model | macuda decode | Windows decode | Decode ratio | macuda prefill | Windows prefill |
+|---|---:|---:|---:|---:|---:|
+| Llama 3.1 8B Instruct Q8_0 | 161.0 ± 1.0 | 164.5 | 98% | 8,927 ± 349 | 11,118 |
+| Nemotron Nano 9B v2 Q6_K | 141.5 ± 0.9 | 140.6 | 101% | 6,894 ± 175 | 4,031 |
+| Gemma 4 12B it Q4_K_M | 133.4 ± 1.0 | 136.4 | 98% | 5,617 ± 207 | 4,169 |
+| Gemma 4 26B-A4B it Q4_K_XL | 225.5 ± 6.5 | 227.8 | 99% | 7,063 ± 207 | 5,478 |
+| Qwen3.8 27B UD-Q4_K_M | 73.4 ± 0.1 | 75.3 | 97% | 2,592 ± 69 | 2,447 |
+| Qwen3.5 35B-A3B Q4_K_M | 223.0 ± 1.9 | 245.0 | 91% | 5,250 ± 209 | 4,726 |
 
-**The ggml-cuda archive.** `cuda-shim/build/libggml-cuda.a` (plus `ggml-backend-reg.cuda.o`) is every ggml-cuda translation unit
-compiled for `sm_120a` with the shim's configuration (`-DGGML_CUDA_FORCE_MMQ -DGGML_CUDA_NO_VMM`, CUDA graphs compiled out) through
-`cuda-shim/build/tinycc`: device compile on the Linux box, host compile on the Mac, one Mach-O object each. It is a build output
-(gitignored) and it belongs to the pinned llama.cpp commit. Rebuild it with `sh setup.sh cuda` (or `JOBS=8 sh
-cuda-shim/build/build-ggml-cuda.sh`): with the container backend the tree is bind-mounted and nothing needs copying; with
-`TINYCC_HOST` set, sync it to the box first (`rsync -a llama.cpp/ggml/ $TINYCC_HOST:ggml/`). About an hour either way.
-`TINYCC_REUSE_FATBIN=1` rebuilds only the host halves, from fatbins a previous run left in `/tmp`. The shim's
-own kernels (`libtinycudart/copy1d.cu`, `copy2d.cu`, `libtinycublas/gemm.cu`) ship as committed cubins with the `nvcc -arch=sm_120`
-line that built them in each source file.
+Ratios are calculated from the displayed means and rounded to the nearest whole percent. The Windows reference was recorded on **14 September 2026** with driver 595.79, using the same GPU and AORUS enclosure over Thunderbolt at PCIe Gen 4 ×4 and byte-identical model files. It used llama.cpp b10970; the macuda tree was b10950 plus one commit. The recorded source comparison found only an AMD-specific change in the intervening ggml-cuda revisions.
 
-**How the binaries are made.** llama.cpp is built once as a plain CPU-only *static* tree (`build-null`; no Metal, no CUDA). `build/link-null.sh`
-replays the exact link line CMake generated for a target and inserts, ahead of `libggml.a`: the backend registry object compiled with
-`GGML_USE_CUDA`, `libggml-cuda.a`, the three shim libraries and LLVM's demangler. The result runs on the driver's **null device**
-(the whole host path, no GPU — `TINYCUDART_TRACE=1` / `TINYCUDART_STATS=1` count launches and time calls there) until
-`TINYNV_SOCKET` points at a TinyGPU server, when it opens the card. The `-null` suffix is that heritage.
+These are comparisons of complete host-and-driver configurations. Host load, thermals and run-to-run variance remain relevant. The Mac's load average was 5.9–8.7 during this batch, and some Windows prefill measurements have large standard deviations. Individual optimisation claims use interleaved A/B tests on the same Mac.
 
-**Build ids.** `libtinynv` bakes `git rev-parse --short HEAD` (plus `-dirty`) into every build, the runtime prints it at init
-(`[tinycudart] libtinynv build <id>`), and `tools/nv_shim_step.sh` checks a binary's id against the branch history before touching the
-card. Outside a git checkout the id reads `nogit`.
+Sources: [Mac benchmark batches](docs/bench/mac-batch-20260919.md) and [Windows reference](docs/bench/windows-reference-20260914.md).
 
-**Offline tests.** `make -C cuda-shim test` runs the driver's suite (page tables, QMD descriptors, cubin/relocation loading, RM
-refusals, the replayed boot against a recorded trace — `traces/5090-boot-smoke.{trace,blob}` and `traces/5090-launch2-launch.json`,
-recorded from this card, gitignored, `TINYNV_ALLOW_NO_TRACE=1` to skip — and a link smoke test through the real CUDA headers),
-then checks that every `cuda*`/`cublas*` symbol `libggml-cuda.a` needs is defined by the shim. Several tests compare against tinygrad's
-own driver: run it as `PYTHON=<venv python with tinygrad> TINYGRAD_SRC=<the egpu-hcq2-remote checkout> make -C cuda-shim test`
-(green from `make clean` on 2026-09-15 with `traces/` and the spike cubins in place). The small test
-cubins in `cuda-shim/spike/` other than `vecadd.*` are gitignored build outputs (`libtinynv/tools/build_spike_cubin.py`, through
-tinygrad's CUDA compile path); without them `test_reloc` stops the suite unless `TINYNV_ALLOW_NO_CUBINS=1`.
+### Image generation
 
-## Run
+The following totals come from the **18:12–18:16 batch on 19 September**, build `05d8b4a`. Total time measures stable-diffusion.cpp's `generate_image` operation. All runs use seed 42 and the reference prompt.
 
-The card is operated through one protocol, and the scripts enforce it: **read-only preflight → lock → one step as its own process →
-release, leaving the card idle warm** (firmware resident, nothing submitted). Two processes on the card at once wedge it.
+| Model | Settings | macuda total | Windows total |
+|---|---|---:|---:|
+| SDXL Turbo | 512 × 512, 4 steps, CFG 1.0 | 2.78 s | 4.11 s |
+| Stable Diffusion 1.5, fp32 | 512 × 512, 20 steps, CFG 7 | 3.71 s | 3.86 s |
+| Z-Image Turbo | 1024 × 1024, 8 steps, CFG 1.0 | 10.06 s | 9.46 s |
 
-**Card-free is not host-free.** On 2026-09-16 the Thunderbolt tunnel dropped and re-enumerated twice with the card idle, both times
-under a full Metal prefill (the Mac's own GPU flat out with a 50 GB model mapped) while the laptop was powered by the enclosure's USB-C
-power delivery over the same cable; on Apple's own charger the same prefills did not drop it. So: power the laptop from its own adapter,
-never from the enclosure, and treat any job that maps or allocates more than ~20 GB of host or Apple-GPU memory as a card-affecting
-action while anyone holds the card - it needs the scheduler's word like a slot. Check a staged script with `sh -n` only; never source
-or run it to see what it prints (that is how one of those prefills was started without a word).
+The Z-Image result is a warm rerun; the initial run took 16.71 s with a cold encoder and VAE. PNG outputs matched earlier macuda validation runs byte for byte. The Windows log records thermal throttling, which affects timing comparisons. Later image measurements are retained separately in the [batch record](docs/bench/mac-batch-20260919.md).
+
+### Serving and speculative decoding
+
+These measurements are from separate serving tests, not the language-model batch above:
+
+| Configuration | Result | Conditions |
+|---|---|---|
+| Qwen3.8 27B + MTP, single stream | 124 tok/s on the first request; 112 tok/s mean | 62-minute soak with byte-identical greedy probes; Windows greedy reference: 124.7 tok/s |
+| Qwen3.8 27B + MTP, eight slots | Approximately 207 tok/s aggregate | Temperature 0.6; 440 requests and zero errors in a 20-minute soak |
+
+Speculative throughput depends on prompt content and draft acceptance. Single-stream throughput and aggregate throughput across concurrent requests measure different workloads.
+
+## Build details
+
+Each stage can be run separately from the repository root:
 
 ```sh
-sh tools/preflight.sh                                   # VERDICT: OK to proceed — reads PCI/dext/server/lock state, touches nothing
-sh tools/nv_shim_step.sh A opverify                     # value-checked test-backend-ops on the card: expect 450/450
-sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf 128          # llama-bench -ngl 99 -p 256 -n 128 -r 3
-sh tools/nv_shim_step.sh A simple models/Qwen3.8-27B-UD-Q4_K_M.gguf 96 'prompt'  # greedy decode, output kept for byte-compares
-sh tools/nv_shim_step.sh A spec models/Qwen3.8-27B-UD-Q4_K_M.gguf models/MTP/mtp-Qwen3.8-27B-Q4_0.gguf 128 4   # speculative decode
-sh tools/nv_shim_step.sh A sd models/sd/<model> 4 'prompt' --cfg-scale 1.0       # stable-diffusion.cpp, image in images/
-sh tools/serve.sh start|status|test|stop                # llama-server + MTP head, OpenAI-compatible at http://127.0.0.1:8090/v1
-sh tools/soak.sh 2 256                                  # hours, max tokens: a soak against the server with a greedy probe every tenth request
+sh setup.sh deps
+sh setup.sh llama
+sh setup.sh sd
+sh setup.sh shim
+DEFS_EXTRA=-DGGML_CUDA_USE_GRAPHS sh setup.sh cuda
+sh setup.sh link
 ```
 
-The runner (`nv_shim_step.sh`) does the preflight, takes the lock with its pid, makes sure the TinyGPU server is up (never replacing a
-live one), runs the step, echoes back the driver's startup line (build id, submission mode, arena, chain depth — *trust that line, not
-what you exported*), marks a step that died by signal or never had the card to itself, and releases. `BIN=<dir>` picks a binary set,
-`DRY=1` runs the step on the null device, `QUIESCE=1` halts the firmware after (cold; the enclosure's fans go to full speed when GSP is
-down — that is not heat). `tinynv-smi` (`cuda-shim/build/shim/nv/tinynv-smi`) reads temperature, power and clocks the driver
-publishes four times a second, without opening the card.
+`setup.sh llama` pins llama.cpp to `ad6c668` and applies upstream fix `2f53959`. `setup.sh sd` pins stable-diffusion.cpp to `59c23bc`, uses llama.cpp's ggml and applies the integration patch in [patches/](patches/). `LLAMA_SRC` and `SD_SRC` can identify local source clones. The scripts manage those dependency checkouts; preserve local edits before rebuilding them.
 
-**Recovery.** `tools/nv_quiesce.sh` (FLR via the dext, halts GSP), `tools/nv_e3_flr.py`, `tools/nv_temp.py` need the tinygrad checkout
-(`env.sh`). A card that drops off the bus, a latched `pci-dart-error-data` flag or "link NOT up" means a physical replug. Never
-`systemextensionsctl reset`.
+**CUDA archive.** `cuda-shim/build/libggml-cuda.a` and the CUDA-enabled backend registry object are build outputs tied to the pinned llama.cpp source. The build uses `GGML_CUDA_FORCE_MMQ` and `GGML_CUDA_NO_VMM`; graph support is added explicitly above. `JOBS` controls compilation parallelism. For SSH builds, synchronise `llama.cpp/ggml/` to the location used by `TINYCC_GGML_LINUX` (default `ggml` on the remote host) before compiling. Docker builds mount the local tree directly.
 
-**Driver knobs** (each run's startup line says which took effect). Defaults are the fast path: asynchronous submission, the command
-arena in VRAM, launch descriptors delivered by the copy engine, chain depth 128, a 64 MB descriptor region, sensors on, small uploads
-ridden inline with the next compute batch. `TINYNV_SYNC=1` (synchronous, every batch waited on), `TINYNV_ARENA_VRAM=0` (host arena),
-`TINYNV_ARENA_DMA=0` (descriptors written across the link), `TINYNV_CHAIN_DEPTH=N`, `TINYNV_DESC_MB=N`, `TINYNV_SENSORS=0`,
-`TINYNV_INLINE_UPLOAD=0`, `TINYNV_FW_DIR=<firmware dir>`, `TINYNV_SOCKET=<tinygpu.sock>` (unset = null device). The runtime's:
-`TINYCUDART_TRACE=1` (timestamped call trace), `TINYCUDART_STATS=1` (per-kernel launch counts and times), `TINYCUBLAS_TC=0`
-(scalar GEMM instead of tensor cores).
+`TINYCC_REUSE_FATBIN=1` reuses device fatbins left in `/tmp` for a host-only rebuild. Use it only when the GPU source and device compilation settings are unchanged. The runtime's copy kernels and cuBLAS-compatible GEMM kernel ship as committed cubins; their source files record the compilation commands.
 
-**Validation recipe** (what "validated" means here — value-checked, not just non-crash): op-verify 450/450 at chain depths 32/64/128
-plus once under `TINYNV_SYNC=1`; the two decode numbers at the defaults; a temp-0 greedy decode run three times and byte-compared;
-for anything speculative, the depth-4 greedy output byte-identical to plain greedy. `tools/wtgate.sh` is that gate as one script
-(it expects a detached worktree `cuda-shim-f/` beside the checkout, so a build never runs against a tree someone is editing);
-`tools/ab_pair.sh OLD NEW` interleaves two builds within the same minutes, which is the only honest way to compare decode numbers on a
-loaded host.
+**Application linking.** llama.cpp first builds as a CPU-only static tree in `build-null`. The link scripts add the CUDA backend, compatibility libraries and LLVM demangler. The resulting `*-null` binaries use the driver's null device until `TINYNV_SOCKET` selects a live TinyGPU server. The suffix does not mean they are restricted to offline execution.
 
-## Disaggregated inference: prefill on the card, decode on the Mac
+**Build provenance.** `libtinynv` embeds its Git commit, with `-dirty` for an uncommitted tree or `nogit` outside a checkout. The runtime prints the ID at startup, and the runner checks it before hardware access. Use that ID to associate a result with its build. Historical results and corrections remain in the [driver design record](docs/driver/libtinynv-design.md) and [19 September handoff](docs/handoff-2026-09-19.md).
 
-A model that fits the Mac's unified memory but not the card's 32 GB can still use the card for what it is best at. The card
-server keeps every expert tensor mmapped on the host (`--n-cpu-moe 48 --no-host --no-repack`) and ggml's scheduler streams
-each layer's experts across the link once per batch, so the card prefills a long prompt at its own speed; the slot's state
-(KV cache plus the linear-attention recurrent state, 24 KB/token for Qwen3-Coder-Next) is saved through `--slot-save-path`,
-restored into a Metal `llama-server` holding the same file, and Metal decodes. `tools/disagg-router.py` makes that one
-endpoint: it reproduces Metal's tokenization, sends cold prompts over a threshold to the card, hands the state over, and
-streams from Metal; `tools/disagg-serve.sh` runs the trio as one tenant under the card protocol.
+## Run and operate
 
-Measured 2026-09-16, Qwen3-Coder-Next 80B-A3B (49.6 GB), a 23,692-token prompt, this M4 Max: card prefill **15.2 s (1558
-tok/s)** against 35.7 s (664 tok/s) on Metal alone; the 662 MB state saved in 0.7 s and restored in 0.1 s; Metal then
-evaluated one token and decoded at 54 tok/s. Three things are load-bearing and documented in `tools/disagg-prefill.sh`:
-the placement flags (without them llama.cpp puts CPU-placed weights in a buffer type that is either not mmappable or not
-offloadable), the 24576 ubatch (ggml-cuda's MoE id helper caps a ubatch at 25,088 tokens on sm_120, so longer prompts stream
-the experts once per ubatch), and saving the state one token early (the recurrent state cannot be rewound). Greedy text
-from the split diverges from Metal-only text on near-ties, since the card's expert matmuls quantize activations and Metal's
-do not; it is numerics, not a wrong cache. The Metal half maps the whole model and is a host-rule job (see §Run).
+Hardware access follows one sequence: **read-only preflight → acquire the lock → run one GPU process → release the lock**, leaving firmware resident and the card idle. Concurrent clients can hang this setup. Use the supplied runners to coordinate access.
 
-## Layout
+Power the laptop from its own adapter. The project observed Thunderbolt re-enumeration during heavy Metal workloads when the enclosure also supplied laptop power; the same workloads did not reproduce it with the separate adapter. Coordinate jobs that allocate more than approximately 20 GB of host or Apple-GPU memory with whoever owns the GPU lock.
 
-```
-install.sh                    one-command setup for a fresh Mac: checks every prerequisite, installs what is missing, builds
-                              (`sh install.sh check` reports and touches nothing)
-setup.sh                      fetch + build sequence (deps | llama | sd | shim | cuda | link)
-env.sh                        paths for the operating tools (tinygrad checkout, venv, nvcc host)
-cuda-shim/                    the driver and the shim — snapshot of the working tree's main at 09e9cdb (2026-09-15)
-  libtinynv/                  the C driver: src/ (gsp.c boot + RM, mmu.c/pt.c/tlsf.c memory, submit.c ring + doorbell, qmd.c launch +
-                              chaining, exec.c the launch path and arena, cubin.c/image.c loading, fw.c/flcn.c firmware, pci_tinygpu.c
-                              the socket backend), test/ (the offline suite, hardware probes test_hw_*), tools/ (fetch scripts, lints,
-                              reference generators), include/tinynv.h (the A–B interface)
-  libtinycudart/              the cudart ABI (cudart.c, cudart_api.c, fatbin.c, hostpool.c, demangle.cpp) + copy1d/copy2d kernels
-  libtinycublas/              cublas.c + gemm.cu / gemm.cubin
-  build/                      tinycc, build-ggml-cuda.sh, link-null.sh, link-llama-bench.sh, sdk.sh, fetch-cuda-headers.sh
-  spike/                      the bring-up spikes and the small cubins the driver tests load
-  test/                       microbenchmarks (socket, bandwidth, H2D/D2H, launch+copy)
-tools/                        preflight, lock, server, runner, serving, soak, load generator, recovery, gates, Windows reference drivers
-patches/                      stable-diffusion.cpp on upstream ggml (its fork-only int8/fp8 paths refuse instead of compiling)
-docs/                         03-cuda-shim-plan.md (architecture and decisions), driver/ (the driver's design documents),
-                              research/launch-overhead-prior-art.md, bench/ (the Windows reference runs)
-models/  logs/                not committed; see models/README.md
+```sh
+# Check hardware state without opening the GPU
+sh tools/preflight.sh
+
+# Operator validation and a decode benchmark
+sh tools/nv_shim_step.sh A opverify
+sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf 128
+
+# Greedy generation and speculative decoding
+sh tools/nv_shim_step.sh A simple models/Qwen3.8-27B-UD-Q4_K_M.gguf 96 'Explain GPU memory bandwidth.'
+sh tools/nv_shim_step.sh A spec models/Qwen3.8-27B-UD-Q4_K_M.gguf models/MTP/mtp-Qwen3.8-27B-Q4_0.gguf 128 4
 ```
 
-## Known limits and hazards
+The runner prints the actual driver settings and build ID, tracks abnormal exits and releases its lock. `BIN` selects an alternate binary directory; `DRY=1` uses the null device for host-path diagnostics, not output validation. `QUIESCE=1` requests a cold stop. The `tinynv-smi` tool in `cuda-shim/build/shim/nv/` reads published temperature, power and clock data without opening the GPU.
 
-- **MoE decode is at ~88% of native and dense at ~98%** (2026-09-19 afternoon). A per-kernel profile from the card's own clock
-  (`TINYNV_KERNEL_PROFILE`, design doc §4i) showed the MoE's kernels at native speed and the loss being the engine idle while the
-  host built the next chain; the host code of ggml-cuda turned out to be compiled at -O0, and rebuilding it at -O2 took the MoE
-  from 140 to 216 tok/s interleaved (§4j). What remains on both models is the token boundary (~1.2-1.4 ms of engine idle a
-  token) and the driver's ~1.7 µs a launch; the options are in `docs/driver/moe-next-steps.md` §9.
-- **The firmware's reservation is derived and checked (closed 2026-09-19).** The driver holds back 256 MB at the top of VRAM, sized
-  from the sizes it hands the firmware (`libtinynv/src/fw_layout.h`, static-asserted against their sum), and at every open reads the
-  chip's WPR2 registers and refuses to start if the manager's top is above the firmware's region. Measured on this card: WPR2 spans
-  202.9 MB starting 224.9 MB below the top, and the manager stops 29 MB below the firmware's unprotected heap. Before this the
-  hold-back was a flat 64 MB and the top 161 MB of what the allocator believed it owned was inside WPR2 - never hit only because
-  no run had filled the card. `totalGlobalMem` now reports what can actually be handed out (32,285 MB of 32,607); free space is
-  still reported as that total. Raising `gspFwHeapSize` without raising the reservation now fails the build.
-- **CUDA graphs are on.** `libtinycudart` implements the subset ggml uses (capture, instantiate, update, launch) and the shipped
-  `libggml-cuda.a` is built with `GGML_CUDA_USE_GRAPHS`: MoE decode +4% interleaved, everything else at parity, with the whole
-  gate clean. A capture has to see every piece of work the caller issues, which cost two bugs to learn - the strided copy was
-  not a recorded node, and libtinycublas launched straight into the driver - so the runtime layer now reports by name anything
-  that happens during a capture without being recorded. `libtinynv` can also keep a replayed token resident as linked chains
-  (`TINYNV_GRAPH_RESIDENT`, off: at parity so far).
-- `test-backend-ops` MUL_MAT with mxfp4/nvfp4 hangs the card; probe it last in a session, if at all.
-- A llama.cpp checkout older than upstream `2f53959` corrupts its own heap in `test-backend-ops` on arm64 (ggml-cpu's rope work buffer)
-  and will look like a driver crash; `setup.sh llama` applies that fix.
-- The card runs warm and idle between steps; halting the firmware or sleeping the Mac with the card attached sends the enclosure's fans
-  to full speed until the next boot of the firmware.
+### Serve an OpenAI-compatible API
+
+The download command above stores the draft head under `models/MTP/`, while `serve.sh` defaults to a top-level model path. Set `MTP` explicitly:
+
+```sh
+MTP=models/MTP/mtp-Qwen3.8-27B-Q4_0.gguf sh tools/serve.sh start
+sh tools/serve.sh status
+sh tools/serve.sh test
+```
+
+The API is available at `http://127.0.0.1:8090/v1`. `PARALLEL` selects the number of concurrent slots; `MTP=` disables speculative decoding. To run a two-hour soak with a 256-token limit, then stop the server:
+
+```sh
+sh tools/soak.sh 2 256
+sh tools/serve.sh stop
+```
+
+### Recovery and diagnostics
+
+Use [tools/preflight.sh](tools/preflight.sh) to determine whether a run can proceed. The recovery tools `nv_quiesce.sh`, `nv_e3_flr.py` and `nv_temp.py` use the tinygrad environment configured by `env.sh`. A disconnected GPU, a latched `pci-dart-error-data` flag or a failed link check may require physically reconnecting the enclosure. Do not use `systemextensionsctl reset` as a recovery shortcut.
+
+The current driver defaults include asynchronous submission, a VRAM command arena, chain depth 128, a 64 MB descriptor region, token-aligned delta delivery, tail-only timeline release, inline small uploads and kernel-based device-to-device copies. Inspect the startup line to confirm the settings for each run.
+
+| Setting | Purpose |
+|---|---|
+| `TINYNV_SYNC=1` | Wait synchronously for each batch |
+| `TINYNV_CHAIN_DEPTH=N`, `TINYNV_DESC_MB=N` | Adjust chain depth or descriptor-region size |
+| `TINYNV_ARENA_VRAM=0`, `TINYNV_ARENA_DMA=0` | Select diagnostic arena and descriptor-delivery paths |
+| `TINYNV_DELTA_DELIVERY=0`, `TINYNV_DELTA_REWIND=0`, `TINYNV_TAIL_RELEASE=0` | Disable the corresponding descriptor optimisations |
+| `TINYNV_INLINE_UPLOAD=0`, `TINYNV_QMD_MEMBAR=sys` | Disable inline uploads or restore system-scope barriers on all descriptors |
+| `TINYNV_DTOD_VIA_COMPUTE=0` | Route device-to-device copies through the copy engine |
+| `TINYNV_GRAPH_RESIDENT=1` | Enable experimental resident graph replay; disabled by default |
+| `TINYNV_SENSORS=0` | Disable sensor publication |
+| `TINYNV_FW_DIR`, `TINYNV_SOCKET` | Select firmware files or the TinyGPU socket |
+| `TINYCUDART_TRACE=1`, `TINYCUDART_STATS=1` | Enable runtime traces or per-kernel statistics |
+| `TINYCUBLAS_TC=0` | Use the diagnostic scalar GEMM path |
+
+Disabling per-launch cache invalidation has produced different greedy outputs even when operator tests passed. Keep `TINYNV_QMD_INVALIDATE` as a diagnostic, not a performance setting.
+
+## Validation
+
+Offline checks run without the GPU:
+
+```sh
+make -C cuda-shim test
+```
+
+The suite covers page tables, descriptors, cubin loading and relocation, resource-management refusals, boot replay and required CUDA/cuBLAS symbols. Some tests need tinygrad reference checkouts, recorded traces or locally built spike cubins. Set `PYTHON` and `TINYGRAD_SRC` as required by those tests. `TINYNV_ALLOW_NO_TRACE=1` and `TINYNV_ALLOW_NO_CUBINS=1` allow explicit skips; a skipped check is not a validation pass.
+
+Hardware validation includes:
+
+- Value-checked `test-backend-ops`: 450/450 at chain depths 32, 64 and 128, plus synchronous mode.
+- Dense and MoE decode benchmarks using driver defaults.
+- Repeated temperature-zero generation, compared byte for byte with a reference; speculative output is checked against plain greedy output.
+- Image-output comparisons and serving soaks for changes affecting those paths.
+- Interleaved old/new build measurements for performance comparisons on the shared host.
+
+[tools/wtgate.sh](tools/wtgate.sh) runs the standard gate from a detached `cuda-shim-f/` worktree beside the checkout. [tools/ab_pair.sh](tools/ab_pair.sh) alternates two builds in the same measurement window. Offline checks do not cover every hardware submission-ordering failure; runtime invariants and concurrent serving tests provide additional coverage.
+
+## Disaggregated inference
+
+Models larger than the GPU's memory can use **CUDA for prefill and Metal for generation**, provided the model fits the Mac's available memory. The CUDA server streams host-resident experts, saves the conversation state and transfers it to a Metal server using the same model file. [tools/disagg-router.py](tools/disagg-router.py) exposes the pair through one endpoint; [tools/disagg-serve.sh](tools/disagg-serve.sh) coordinates them under the GPU protocol.
+
+In the 16 September test, Qwen3-Coder-Next 80B-A3B (49.6 GB) processed a 23,692-token prompt in **15.2 s on the RTX 5090**, compared with **35.7 s on Metal**. Saving 662 MB of state took 0.7 s and restoration took 0.1 s; Metal then generated at 54 tok/s.
+
+The 19 September prefill-only measurements extended the comparison:
+
+| Prompt length | RTX 5090 prefill | Metal prefill | Prefill speedup |
+|---|---:|---:|---:|
+| 23,691 tokens | 15.0 s | 35.2 s | 2.35× |
+| 26,156 tokens | 22.0 s | 64.6 s | 2.94× |
+| 48,667 tokens | 28.9 s | 160.3 s | 5.55× |
+
+These timings exclude state transfer and generation. The configured microbatch size is 24,576 tokens, and expert data is transferred once per microbatch. Longer-context gains in this model do not establish the same behaviour across all models. The screening tool's constant Metal-throughput assumption remains provisional at longer context.
+
+Placement flags and saving state one token early are required by this implementation; see [tools/disagg-prefill.sh](tools/disagg-prefill.sh). Split generation can differ from Metal-only greedy output on near-ties because the backends use different activation numerics. See the [inference state and measurement record](docs/disagg-inference-state.md) for the full configuration and corrected cost model.
+
+## Scope and known limitations
+
+- **Application coverage:** the compatibility libraries implement the interfaces used by the tested applications. GGUF support in upstream llama.cpp alone does not establish compatibility with this stack.
+- **Remaining decode overhead:** profiling identifies host turnaround and roughly 1.7 µs of driver work per launch as optimisation targets. Qwen3.5 35B-A3B reaches 91% of reference decode throughput in the latest listed batch.
+- **Experimental graph replay:** CUDA runtime graph support is implemented. Resident driver-level replay is a separate, opt-in path; it has not established a performance improvement in the recorded tests.
+- **Unsupported operator cases:** `test-backend-ops` MUL_MAT with mxfp4/nvfp4 can hang the card. Treat these as dedicated hardware investigations, not routine validation workloads.
+- **Pinned upstream fix:** older llama.cpp revisions can corrupt the arm64 rope work buffer during operator tests. `setup.sh llama` applies the required `2f53959` fix.
+- **Memory reporting:** the driver reserves and validates the firmware region at startup. The former 64 MB reservation was corrected to a derived 256 MB reservation; reported free memory still reflects the total usable allocation rather than live remaining capacity.
+- **Hardware recovery:** some Thunderbolt and firmware faults require physical reconnection. Halting firmware or sleeping with the card attached can send the enclosure fans to full speed until firmware restarts.
+
+A Linux guest driver forwarding resource-management requests to `libtinynv` over vsock remains a separate research direction. It is not a completed route to general NVIDIA userspace support. See [remaining performance work](docs/driver/moe-next-steps.md) and [resident-chain design](docs/driver/chain-replay-plan.md).
+
+## Repository layout
+
+```text
+install.sh          Prerequisite checks and guided installation
+setup.sh            Dependency fetching and staged builds
+env.sh              Local paths for development and operating tools
+cuda-shim/
+  libtinynv/        Userspace driver, offline tests and hardware probes
+  libtinycudart/    CUDA runtime compatibility and copy kernels
+  libtinycublas/    cuBLAS-compatible entry points and GEMM kernel
+  build/            Compiler wrapper, build scripts and generated binaries
+  spike/            Bring-up experiments and test kernels
+  test/             Transfer and launch microbenchmarks
+tools/              Preflight, locking, runners, serving, recovery and validation
+patches/            stable-diffusion.cpp integration with upstream ggml
+docs/               Architecture, design records, benchmarks and research notes
+models/             Local model files; weights are not committed
+logs/               Local execution records; not committed
+```
 
 ## Third-party components and licensing
 
-- **tinygrad** (MIT, © tiny corp): `libtinynv` is a port of its userspace NVIDIA driver, and the TinyGPU app/dext is its signed
-  release. Keep its copyright notice with the driver.
-- **NVIDIA open-gpu-kernel-modules** headers (MIT/GPL dual-licensed; used under MIT): fetched, not committed.
-- **NVIDIA GSP firmware** 570.144 (NVIDIA's linux-firmware licence, redistributable unmodified): fetched from linux-firmware, hash-checked,
-  not committed.
-- **CUDA Toolkit headers** (NVIDIA CUDA EULA): not committed; copied from your own toolkit install by `fetch-cuda-headers.sh`.
-- **llama.cpp / ggml** (MIT) and **stable-diffusion.cpp** (MIT): cloned at pinned commits by `setup.sh`; `patches/` carries the only change.
-- This repository's own code is under the MIT License (`LICENSE`); `NOTICE` carries the attributions above.
-
-`docs/bench/windows-reference-20260914.md` is the raw record of the native reference runs and contains the Windows box's paths.
+- **tinygrad** (MIT, © tiny corp): the userspace driver reference and signed TinyGPU app/extension. Retain its copyright notice with the driver.
+- **NVIDIA open-gpu-kernel-modules headers** (MIT/GPL dual-licensed; used under MIT): fetched, not committed.
+- **NVIDIA GSP firmware 570.144**: fetched from linux-firmware with hash verification, not committed; subject to its accompanying NVIDIA licence.
+- **CUDA Toolkit headers**: obtained from the configured toolkit or container, not committed; subject to the CUDA Toolkit licence.
+- **llama.cpp / ggml** and **stable-diffusion.cpp** (MIT): fetched at pinned commits, with the integration changes described above.
+- **macuda code**: [MIT License](LICENSE). [NOTICE](NOTICE) contains third-party attributions.
