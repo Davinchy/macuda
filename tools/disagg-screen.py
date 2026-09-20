@@ -58,9 +58,7 @@ def screen(router, path, resident_gib):
     nblocks = len(lay.get("blocks") or [])
     # What must stream: whatever does not fit on the card. Non-expert weight stays resident by preference, so the
     # card holds (resident - non_expert) GiB of experts and the rest crosses the link every ubatch.
-    non_expert = max(total_gib - expert_gib, 0.0)
-    expert_room = max(resident_gib - non_expert, 0.0)
-    streamed = max(expert_gib - expert_room, 0.0)
+    streamed = max(total_gib - resident_gib, 0.0)
     fits = total_gib <= resident_gib
     row = {"path": path, "name": os.path.basename(path), "total_gib": total_gib, "expert_gib": expert_gib,
            "blocks": nblocks, "n_expert": lay.get("n_expert") or 0, "used": lay.get("n_expert_used") or 0,
@@ -68,6 +66,15 @@ def screen(router, path, resident_gib):
     if fits:
         row["verdict"] = "card-only (5.5-7.3x); do not disaggregate"
         row["plateau"] = float("nan")
+        return row
+    # A DENSE model larger than the card is not a candidate at all, and saying "1.0x" would flatter it. What streams
+    # under this path is expert layers (llama.cpp's --n-cpu-moe); a dense model has none, so the overflow cannot be
+    # streamed - it would have to be offloaded to the CPU and computed there, which is a different and much worse
+    # arrangement than the one these numbers describe. Caught 2026-09-19 by asking what the screener would say about a
+    # 70B dense: the first version answered 7.8x, because it measured only expert bytes and a dense model has zero.
+    if row["n_expert"] == 0:
+        row["plateau"] = float("nan")
+        row["verdict"] = "DENSE and bigger than the card: this path does not apply"
         return row
     row["plateau"] = (CARD_UBATCH / METAL_RATE) / (streamed / LINK_RATE + CARD_UBATCH / CARD_RATE)
     # Break-even prompt: below this, Metal alone is faster because the stream is not yet amortised.
@@ -107,7 +114,7 @@ def main():
     print(f"{'model':<44}{'size':>8}{'experts':>9}{'stream':>8}{'plateau':>9}{'break-even':>11}  verdict")
     for r in ok:
         pl = "-" if r["plateau"] != r["plateau"] else f"{r['plateau']:.1f}x"
-        be = "-" if r["fits"] else f"{r['breakeven']:,.0f} tok"
+        be = f"{r['breakeven']:,.0f} tok" if "breakeven" in r else "-"
         print(f"{r['name'][:43]:<44}{r['total_gib']:>7.1f}G{r['expert_gib']:>8.1f}G{r['streamed']:>7.1f}G{pl:>9}{be:>11}  {r['verdict']}")
     print("\nplateau = the speedup a long prompt converges to; break-even = the prompt length below which Metal alone wins.")
     print("A model that fits the card entirely is not a disaggregation candidate - run it card-only instead.")
