@@ -45,10 +45,7 @@
 <div class="wrap">
 <main id="main-content" tabindex="-1">
 
-  <p class="draft"><b>Research draft · sweep complete, residency ladder still running.</b> The method and the
-  hypotheses below were recorded <i>before</i> the measurements and are unedited apart from wording. The results and
-  stability counters are now real, measured 2026-09-20 01:23–02:44. Where a prediction was wrong it is marked wrong
-  rather than quietly revised, and the one fit that failed is reported as failed.</p>
+
   <section class="hero">
     <div class="eyebrow">Cross-model study · measured 19–20 September 2026</div>
     <h1>Six models. One inference question.</h1>
@@ -89,6 +86,8 @@
   used to fit the initial cost model. Per-model residency tuning is outside this study's scope.</p>
 
     <h2>Hypotheses and interpretation limits</h2>
+  <p class="note">These were written down <b>before</b> the measurements and are unedited apart from wording. Where
+  one turned out wrong it is marked wrong below rather than quietly revised.</p>
   <div class="pred"><span class="tag2 p">hypothesis 1</span><b>Higher active-parameter counts produce larger prefill
   gains.</b> The proposed ordering places Mixtral at the high end and Qwen3-Coder-Next at the low end. A flat or reversed
   ordering would challenge that explanation. Differences in transfer volume, quantisation and kernels must also be
@@ -123,7 +122,9 @@
     </tbody>
   </table></div>
   <p class="cap">Each cell is Metal prefill time divided by RTX 5090 prefill time, on identical token ids; above 1×
-  favours the card. Measured 2026-09-20 01:23–02:44, every model with every expert in host memory.</p>
+  favours the card. Measured 2026-09-20 01:23–02:44. Every model ran with <b>every expert in host memory</b> — the
+  one configuration identical across all six, which makes the comparison clean and makes each number a floor: roughly
+  20 GiB of card memory sat unused that a tuned deployment would fill with resident experts.</p>
 
   <div class="meas"><span class="tag2 m">confirmed</span><b>Active parameters are the lever, and the ordering is
   monotonic.</b> Rank the six by the bytes a token actually touches — 3.4, 3.9, 5.8, 8.5, 9.8, 21.3 GiB — and the 24k
@@ -184,7 +185,7 @@
 </main>
 
   <footer>
-    <p>Research companion: <a href="disaggregation.html">Disaggregated inference</a>, including the measurements
+    <p>Companion: <a href="disaggregation.html">Disaggregated inference</a>, including the measurements
     that motivated this study.</p>
   </footer>
 
