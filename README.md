@@ -76,9 +76,31 @@ sh install.sh              # installs the missing pieces (asking first) and buil
 `install.sh check` is safe to run on any Mac: it reads, reports and exits. The full run installs Homebrew packages,
 optionally Docker Desktop and tinygrad's TinyGPU.app, then builds llama.cpp, the shim and ggml's CUDA backend.
 
-Two things it cannot do for you, and says so: **approving the DriverKit extension** (macOS asks you, in System
-Settings → General → Login Items & Extensions), and **the card itself** — an RTX 5090 in a Thunderbolt enclosure,
-which a wedged GSP will occasionally need you to physically replug.
+Then get a model — any GGUF llama.cpp can read. These are the ones every number on this page was measured with, and
+each line was checked against the repository it names (`hf` is `pip install huggingface_hub`; no token needed):
+
+```sh
+# the dense model most numbers here use, with its MTP draft head for speculative decode — 16.5 + 1.4 GB
+hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-Q4_K_M.gguf MTP/mtp-Qwen3.8-27B-Q4_0.gguf --local-dir models/
+hf download unsloth/Qwen3.5-35B-A3B-GGUF Qwen3.5-35B-A3B-Q4_K_M.gguf --local-dir models/          # the MoE row, 22.0 GB
+hf download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF Meta-Llama-3.1-8B-Instruct-Q8_0.gguf --local-dir models/   # 8.5 GB
+```
+
+If you take only one, take the 27B: `tools/serve.sh`, `tools/soak.sh` and the greedy byte-compare all use it, and its
+MTP head is what makes the speculative-decode numbers reproducible. Keeping the files on an external drive is fine —
+symlink them in (`ln -s /Volumes/<drive>/<model>.gguf models/`), every tool resolves symlinks — but a nearly-full
+external SSD reading at 40 MB/s turns a 30-second model load into ten minutes, measured on this machine, not a guess.
+
+Then run one, which does the whole card protocol for you — preflight, lock, server, run, release:
+
+```sh
+sh tools/preflight.sh                                          # read-only; must say VERDICT: OK
+sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf
+```
+
+Two things `install.sh` cannot do for you, and says so: **approving the DriverKit extension** (macOS asks you, in
+System Settings → General → Login Items & Extensions), and **the card itself** — an RTX 5090 in a Thunderbolt
+enclosure, which a wedged GSP will occasionally need you to physically replug.
 
 The one Linux-only step is `nvcc`, which compiles ggml's ~190 CUDA translation units for the card. It runs in a CUDA
 container on the Mac — `nvidia/cuda` publishes arm64 images, so it is native, not emulated, and since it only ever
