@@ -37,13 +37,15 @@ static void hash_vectors(void) {
   printf("sha-256: %zu published vectors, including the one million byte one\n", sizeof(VECTORS) / sizeof(*VECTORS));
 }
 
-// Each of the three images the boot path uses, loaded through the same call the driver makes, then taken apart.
+// Each image the two boot paths and the unload use, loaded through the same call the driver makes, then taken apart.
 static void firmware(void) {
   printf("firmware root: %s\n", *tinynv_fw_root() ? tinynv_fw_root() : "(nowhere configured)");
   struct { const char *dir, *name, *sha, *section; } want[] = {
     {"gb202", "fmc-" TINYNV_FW_VER ".bin", "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd59f5af2ddd7fece", "image"},
     {"gb202", "bootloader-" TINYNV_FW_VER ".bin", "d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071", NULL},
     {"ga102", "gsp-" TINYNV_FW_VER ".bin", "a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f", ".fwimage"},
+    {"ga102", "booter_load-" TINYNV_FW_VER ".bin", "4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b", NULL},
+    {"ga102", "booter_unload-" TINYNV_FW_VER ".bin", "8e63db5b78d7d3e349f20a2d11099c3d7109081393cb09ffc0a28133324ae009", NULL},
   };
   for (size_t i = 0; i < sizeof(want) / sizeof(*want); i++) {
     tinynv_blob_t b;

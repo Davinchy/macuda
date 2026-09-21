@@ -15,6 +15,14 @@
 #include "mmu.h"
 #include "vbios.h"
 
+// A booter image as SEC2 runs it: the signed bytes in video memory, and where its code and data are inside them.
+// booter_load unpacks GSP-RM into the write-protected region at boot; booter_unload tears the region down at unload.
+typedef struct {
+  tinynv_blob_t fw;
+  tinynv_bootmem_t image;
+  uint32_t code_off, code_sz, data_off, data_sz;
+} tinynv_booter_t;
+
 typedef struct {
   tinynv_gpu_t *gpu;
   uint64_t falcon; // the register base of the GSP falcon
@@ -32,9 +40,10 @@ typedef struct {
   // the vbios path: FWSEC out of the card's own rom, then booter_load over SEC2
   tinynv_fwsec_t fwsec;
   uint64_t frts_offset;         // where fwsec is asked to place the write-protected region
-  tinynv_blob_t booter_fw;
-  tinynv_bootmem_t booter_image;
-  uint32_t booter_code_off, booter_code_sz, booter_data_off, booter_data_sz;
+  tinynv_booter_t booter;       // booter_load, held for the life of the process as the oracle holds it
+  tinynv_booter_t unload;       // booter_unload's offsets and firmware; its bytes go into booter_load's slot at unload
+  int unload_staged;            // both unload images have been written into the boot's slots
+  int unloaded;                 // the unload ran and the region is down: the next open finds a cold card
 } tinynv_flcn_t;
 
 // Driving a falcon, which GSP-RM's register sequencer asks the driver to do on its behalf (gsp.c run_cpu_seq).
@@ -46,5 +55,11 @@ int tinynv_flcn_wait_cpu_halted(tinynv_dev_t *d, uint64_t base);
 int tinynv_flcn_init_sw(tinynv_gpu_t *g); // place the boot image and its arguments. no hardware.
 int tinynv_flcn_init_hw(tinynv_gpu_t *g); // send the chain of trust message and wait for the falcon to be released.
 void tinynv_flcn_fini(tinynv_gpu_t *g);
+// Undo init_hw on the vbios path the way NVIDIA's driver does at unload: FWSEC-SB puts the pre-OS applications back and
+// booter_unload tears the write-protected region down, so the next open finds a cold card and boots it the recorded
+// way. _prepare writes both images into the slots the boot used, and runs while GSP-RM is still up; _hw drives the
+// falcons, and runs after GSP-RM has been told and has halted (tinynv_gsp_unload). Both are no-ops on the chain of trust.
+int tinynv_flcn_unload_prepare(tinynv_gpu_t *g);
+int tinynv_flcn_unload_hw(tinynv_gpu_t *g);
 
 #endif

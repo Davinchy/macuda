@@ -42,6 +42,7 @@ typedef struct tinynv_pci tinynv_pci_t;
 struct tinynv_pci {
   void *ctx;
   const char *name; // how the device is addressed: a bdf on linux, "usb4" over tinygpu
+  int live;         // a real device: it can be reset, and a firmware on it can be told to unload. a recording cannot.
 
   uint32_t (*cfg_read)(tinynv_pci_t *p, uint32_t off, uint32_t size);
   void (*cfg_write)(tinynv_pci_t *p, uint32_t off, uint32_t size, uint32_t val);

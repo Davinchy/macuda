@@ -52,6 +52,10 @@ WANTED = [
   ("dev_gc6_island", "ga102", "NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK"),
   # how SEC2 says it has handed off, which the register sequencer's resume step waits for
   ("dev_gc6_island", "ga102", "NV_PGC6_BSI_SECURE_SCRATCH_14"),
+  # the scratch words the VBIOS firmware reports into: FWSEC leaves the FRTS error code in word 0x0e (bits 31:16) and
+  # the SB error code in word 0x15 (bits 15:0). NVIDIA's driver checks both; this one reads them only on paths the
+  # recording never took - a failed FRTS, and the unload - so the recorded boot is reproduced byte for byte.
+  ("dev_bus", "tu102", "NV_PBUS_VBIOS_SCRATCH"),
   # the GSP falcon, and the mailbox pair the libos arguments are handed through before it is started
   ("dev_gsp", "ga102", "NV_PGSP_FALCON_ENGINE"),
   ("dev_gsp", "ga102", "NV_PGSP_FALCON_MAILBOX0"),

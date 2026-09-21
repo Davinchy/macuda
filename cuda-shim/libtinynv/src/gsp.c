@@ -63,11 +63,11 @@ static int seq_fail(uint32_t op, unsigned nops, size_t i, size_t have, const cha
   return tinynv_fail("register sequence aborted at operation %u (op %#x): %s%s%s", nops, op, why, *inner ? " - " : "", inner);
 }
 static int run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
-  // say so, every time. this path was never taken in the recording, so on real hardware a request is the driver leaving
-  // the ground the oracle covers, and that should be visible in the log rather than inferred afterwards.
+  // say so, every time. The recorded 5090 boot never takes this path; the recorded 3060 boot takes it once, and replays
+  // through this code with no divergence, so on an Ampere card one request is the expected shape of a boot and a second
+  // is news.
   g->gsp.cpu_seq_requests++;
-  fprintf(stderr, "tinynv: gsp-rm asked the driver to run a register sequence (%zu bytes, request %u). "
-                  "the recorded boot never did this, so this path is unproven.\n", len, g->gsp.cpu_seq_requests);
+  fprintf(stderr, "tinynv: gsp-rm asked the driver to run a register sequence (%zu bytes, request %u)\n", len, g->gsp.cpu_seq_requests);
   // rpc_run_cpu_sequencer_v17_00 is FORTY bytes, not thirty-two: bufferSizeDWord at 0, cmdIndex at 4, then a register
   // save area of EIGHT words, and only then the commands. This read 32 and took the command count from the last word of
   // that, which is regSaveArea[5], and then started decoding at regSaveArea[6]. Nothing caught it because the recorded
@@ -268,10 +268,20 @@ static int rpc_drain(tinynv_gpu_t *g, uint32_t want, int *seen, uint8_t **reply,
   tinynv_gsp_t *gsp = &g->gsp;
   tinynv_rpcq_t *q = &gsp->stat_q;
   __sync_synchronize();
-  for (;;) {
+  for (uint32_t taken = 0;; taken++) {
     uint32_t rp = nv_rd32(&gsp->queues.view, q->rx_off);
     uint32_t wp = nv_rd32(&gsp->queues.view, q->base + offsetof(tinynv_msgq_tx_header_t, writePtr));
     if (rp == wp) return 0;
+    // A ring that says otherwise is not a ring any more. On 2026-09-21 a boot whose card had lost and regained its
+    // windows mid-way left a zero-length record here, and the drain went round it for ten minutes without a word:
+    // zero bytes is zero slots, and zero slots does not move the read pointer. So: a record is at least one slot, the
+    // write pointer is inside the ring, and one call takes at most a ring's worth before it calls the memory garbage.
+    if (wp >= q->tx.msgCount || rp >= q->tx.msgCount)
+      return tinynv_fail("the status queue's pointers are outside the ring (read %u, write %u, %u slots): the memory "
+                         "gsp-rm writes has been corrupted", rp, wp, q->tx.msgCount);
+    if (taken >= q->tx.msgCount)
+      return tinynv_fail("the status queue never empties (%u records taken, write pointer %u): the memory gsp-rm writes "
+                         "has been corrupted", taken, wp);
 
     // read the position again rather than reuse the one the comparison saw. it costs nothing, it is what the oracle
     // does, and it does not assume that this side is the only writer of a field that lives in shared memory.
@@ -311,6 +321,7 @@ static int rpc_drain(tinynv_gpu_t *g, uint32_t want, int *seen, uint8_t **reply,
 
     // advance past however many slots this message occupied
     uint32_t slots = (mh.length + q->tx.msgSize - 1) / q->tx.msgSize;
+    if (!slots) slots = 1;
     nv_wr32(&gsp->queues.view, q->rx_off, (nv_rd32(&gsp->queues.view, q->rx_off) + slots) % q->tx.msgCount);
     __sync_synchronize();
 
@@ -342,13 +353,79 @@ int tinynv_gsp_poll(tinynv_gpu_t *g) {
   return g->gsp.err_state;
 }
 
+// Where GSP-RM is while the driver waits for its start-up notice, said every few seconds on a live card.
+//
+// Added 2026-09-19 after the fault record of a failed boot showed GSP-RM had NOT died after its register sequence: it
+// delivered ~35 queued status messages the moment a later process turned bus mastering back on, to queue addresses that
+// no longer existed. So during the 60 s wait it was either not allowed to write to host memory, or slower than 60 s.
+// This separates the two: the queue pointers and the log put pointers are host memory it writes (moving = its DMA
+// works), the command register says whether bus mastering is still on, and the falcon registers say whether the core
+// is running. Live only, and only once a wait has lasted five seconds, so the recorded boot - where the notice arrives
+// on the first look - issues exactly the operations it always did.
+static void init_wait_report(tinynv_gpu_t *g, double elapsed) {
+  tinynv_gsp_t *gsp = &g->gsp;
+  tinynv_dev_t *d = &g->dev;
+  tinynv_pci_t *pci = d->pci;
+  uint32_t rp = nv_rd32(&gsp->queues.view, gsp->stat_q.rx_off);
+  uint32_t wp = nv_rd32(&gsp->queues.view, gsp->stat_q.base + offsetof(tinynv_msgq_tx_header_t, writePtr));
+  uint32_t took = nv_rd32(&gsp->queues.view, gsp->cmd_q.rx_off); // how far gsp-rm has read OUR queue
+  uint32_t logput[3] = {0, 0, 0};
+  for (int i = 0; i < 3; i++) logput[i] = nv_rd32(&gsp->logbuf.view, 0x10000u * (unsigned)i); // INIT, INTR, RM
+  uint32_t vd = pci->cfg_read(pci, 0x00, 4), cmd = pci->cfg_read(pci, 0x04, 2);
+  uint32_t mbx0 = tinynv_rd32(d, NV_PGSP_FALCON_MAILBOX0), mbx1 = tinynv_rd32(d, NV_PGSP_FALCON_MAILBOX1);
+  uint32_t rv = tinynv_rd32(d, g->flcn.falcon + NV_PRISCV_RISCV_CPUCTL);
+  uint32_t sec = tinynv_rd32(d, g->flcn.sec2 + NV_PFALCON_FALCON_MAILBOX0);
+  uint32_t wpr = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+  // Every register reading all ones does not mean the same thing as config space reading all ones. The first is a window
+  // that is not decoding; the second is a card that is not there. Saying which is which is the whole value of this line:
+  // on 2026-09-21 it reported "bus master OFF" about a card whose CONFIG space was readable and whose memory window had
+  // simply been switched off underneath a booting firmware, and the two readings look identical if only one is printed.
+  fprintf(stderr, "tinynv: +%3.0fs no start-up notice yet | status rp %u wp %u, gsp read %u of our commands, log put INIT %u "
+                  "INTR %u RM %u | %04x:%04x command %#06x (memory %s, bus master %s) | gsp mailbox %#x %#x, riscv %s%s, "
+                  "sec2 mailbox %#x, wpr2 hi %#x\n",
+          elapsed, rp, wp, took, logput[0], logput[1], logput[2], vd & 0xffff, vd >> 16, cmd,
+          (cmd & 0x2) ? "on" : "OFF", (cmd & 0x4) ? "on" : "OFF", mbx0, mbx1,
+          NV_GET(rv, NV_PRISCV_RISCV_CPUCTL, ACTIVE_STAT) ? "active" : "NOT active",
+          NV_GET(rv, NV_PRISCV_RISCV_CPUCTL, HALTED) ? " halted" : "", sec, wpr);
+
+  // AND PUT IT BACK. A command register that loses its memory window and bus mastering while a firmware is starting is
+  // never a legitimate state: with the window off every register reads all ones, and with bus mastering off nothing
+  // GSP-RM writes reaches this host, so the driver waits for a notice that physically cannot arrive and then reports the
+  // firmware as silent. That is what every failed boot on this card was (2026-09-17 and 2026-09-19); the proof is that a
+  // LATER process setting this register made the firmware deliver the whole backlog at once, into memory that by then
+  // had been freed, which is where the machine's fault records came from. Nothing in this driver clears it, macOS logged
+  // nothing when it happened, and the card never left the bus. So: restore it and say so. TINYNV_REASSERT_BME=0 leaves
+  // it alone, for seeing the untreated failure again.
+  // AND PUT THEM BACK. Restoring the command register alone is not enough and proves it: on 2026-09-21 doing exactly
+  // that brought the start-up notice in immediately - gsp-rm had been running all along with nowhere to write - and the
+  // boot then died in the page tables, because the base address registers were still zero and everything written
+  // through the memory window went nowhere. Both halves or neither.
+  const char *knob = getenv("TINYNV_REASSERT_BME");
+  if (knob && !strcmp(knob, "0")) {
+    if ((cmd & 0x6) != 0x6)
+      fprintf(stderr, "tinynv: the card has lost its windows under a booting gsp-rm and TINYNV_REASSERT_BME=0 leaves it "
+                      "that way, so nothing it writes can reach this host\n");
+    return;
+  }
+  tinynv_dev_restore_decode(d);
+}
+
 static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char *what, uint8_t **reply, uint32_t *reply_len) {
-  double deadline = tinynv_now_s() + timeout_s;
+  double start = tinynv_now_s(), deadline = start + timeout_s, next_report = start + 5.0;
   int seen = 0;
+  int report = want == TINYNV_MSG_EVENT_GSP_INIT_DONE && g->dev.pci->live;
   if (reply) { *reply = NULL; *reply_len = 0; }
   do {
     if (rpc_drain(g, want, &seen, reply, reply_len)) return -1;
-    if (seen) return 0;
+    if (seen) {
+      if (report && tinynv_now_s() - start > 5.0)
+        fprintf(stderr, "tinynv: the start-up notice arrived after %.1f s\n", tinynv_now_s() - start);
+      return 0;
+    }
+    if (report && tinynv_now_s() >= next_report) {
+      init_wait_report(g, tinynv_now_s() - start);
+      next_report += 5.0;
+    }
   } while (tinynv_now_s() < deadline);
   // Whatever arrives now belongs to a request nobody is waiting for any more.
   g->gsp.rpc_desync = 1;
@@ -1537,9 +1614,18 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
     {"RMForcePcieConfigSave", 1},
     {"RMSecBusResetEnable", 1},
   };
-  const size_t n = sizeof(TABLE) / sizeof(*TABLE);
+  // Which of the two to send. The oracle sends both and so does the recorded boot, so the default is both. On hardware
+  // they are suspects: "save the pcie config and put it back" and "you may reset the bus" are the two things a
+  // firmware could be doing when a card's windows vanish under it. TINYNV_REGISTRY=none sends an empty table, =nosave
+  // and =nosbr drop one each.
+  size_t n = sizeof(TABLE) / sizeof(*TABLE), first = 0;
+  const char *pick = getenv("TINYNV_REGISTRY");
+  if (pick && !strcmp(pick, "none")) n = 0;
+  else if (pick && !strcmp(pick, "nosave")) { first = 1; n = 1; }
+  else if (pick && !strcmp(pick, "nosbr")) n = 1;
+  if (pick) fprintf(stderr, "tinynv: registry table: TINYNV_REGISTRY=%s, %zu of 2 entries sent\n", pick, n);
   size_t hdr_size = sizeof(tinynv_registry_table_t), entries_size = sizeof(tinynv_registry_entry_t) * n, names_size = 0;
-  for (size_t i = 0; i < n; i++) names_size += strlen(TABLE[i].name) + 1;
+  for (size_t i = 0; i < n; i++) names_size += strlen(TABLE[first + i].name) + 1;
 
   size_t total = hdr_size + entries_size + names_size;
   uint8_t *buf = calloc(1, total);
@@ -1550,12 +1636,12 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
   tinynv_registry_entry_t *e = (tinynv_registry_entry_t *)(buf + hdr_size);
   size_t at = 0;
   for (size_t i = 0; i < n; i++) {
-    size_t len = strlen(TABLE[i].name) + 1;
+    size_t len = strlen(TABLE[first + i].name) + 1;
     e[i].nameOffset = (uint32_t)(hdr_size + entries_size + at);
     e[i].type = TINYNV_REGISTRY_TYPE_DWORD;
-    e[i].data = TABLE[i].value;
+    e[i].data = TABLE[first + i].value;
     e[i].length = 4;
-    memcpy(buf + hdr_size + entries_size + at, TABLE[i].name, len);
+    memcpy(buf + hdr_size + entries_size + at, TABLE[first + i].name, len);
     at += len;
   }
   int rc = rpc_send(g, TINYNV_MSG_FUNCTION_SET_REGISTRY, buf, total);
@@ -1575,12 +1661,61 @@ int tinynv_gsp_init_hw(tinynv_gpu_t *g) {
   gsp->stat_q.rx_off = gsp->cmd_q_off + cmd_tx.rxHdrOff;
   gsp->cmd_q.rx_off = gsp->stat_q.base + gsp->stat_q.tx.rxHdrOff;
 
-  if (rpc_wait(g, TINYNV_MSG_EVENT_GSP_INIT_DONE, 60.0, "its start-up notice", NULL, NULL)) return -1;
+  // Sixty seconds unless told otherwise: every boot that has worked got its notice in a few, and a longer wait is for
+  // finding out whether a boot that does not is slow or stuck (see init_wait_report).
+  double init_timeout = 60.0;
+  const char *t = getenv("TINYNV_INIT_TIMEOUT");
+  if (t && atof(t) > 0) init_timeout = atof(t);
+  if (g->dev.pci->live) {
+    // where the buffers GSP-RM writes to are, so a fault record's addresses can be read against them
+    const tinynv_bootmem_t *m[] = {&gsp->queues, &gsp->logbuf, &gsp->rm_args, &gsp->libos_args};
+    const char *n[] = {"queues", "logs", "rm args", "libos args"};
+    fprintf(stderr, "tinynv: host buffers gsp-rm writes:");
+    for (int i = 0; i < 4; i++) {
+      size_t split = 0;
+      for (size_t k = 1; k < m[i]->naddrs; k++) split += m[i]->addrs[k] != m[i]->addrs[k - 1] + 0x1000;
+      fprintf(stderr, " %s %#llx+%#zx%s", n[i], m[i]->naddrs ? (unsigned long long)m[i]->addrs[0] : 0ull,
+              m[i]->naddrs * (size_t)0x1000, split ? " (NOT contiguous)" : "");
+    }
+    fprintf(stderr, "\n");
+  }
+  if (rpc_wait(g, TINYNV_MSG_EVENT_GSP_INIT_DONE, init_timeout, "its start-up notice", NULL, NULL)) return -1;
   if (gsp->err_state) return tinynv_fail("gsp-rm started but reported an error on the way up");
 
   // with the firmware up, the two windows onto instance memory are retargeted at it
   tinynv_wr32(&g->dev, NV_PBUS_BAR1_BLOCK, 0);
   if (g->dev.fmc_boot) tinynv_wr32(&g->dev, NV_VIRTUAL_FUNCTION_PRIV_FUNC_BAR1_BLOCK_LOW_ADDR, 0);
+  gsp->up = 1;
+  return 0;
+}
+
+// Tell GSP-RM the driver is going, and wait for it to halt.
+//
+// The oracle sends the same notice (NV_GSP.fini_hw) and stops there, because on Linux the next open resets the card
+// anyway. Here the halt is waited for, as NVIDIA's kgspUnloadRm does: once libos has parked the core the GSP falcon's
+// first mailbox reads 0x80000000 (LIBOS_INTERRUPT_PROCESSOR_SUSPENDED), and only then may that falcon be reset and
+// handed other code, which is what the unload's second half (tinynv_flcn_unload_hw) does.
+int tinynv_gsp_unload(tinynv_gpu_t *g) {
+  tinynv_gsp_t *gsp = &g->gsp;
+  if (!gsp->up) return 0;
+  double t0 = tinynv_now_s();
+  tinynv_unloading_guest_driver_t u = {.bInPMTransition = 0, .bGc6Entering = 0, .newLevel = 1u << 6};
+  if (rpc_call(g, TINYNV_MSG_FUNCTION_UNLOADING_GUEST_DRIVER, &u, sizeof u, NULL, 0, "the unload notice")) return -1;
+  // Poll the mailbox AND keep draining the queue: on its way down GSP-RM may ask for a register sequence (the sequencer's
+  // core-reset and wait-for-halt operations exist for exactly this), and a request left unanswered is a firmware that
+  // waits for us while we wait for it.
+  double deadline = tinynv_now_s() + 10.0;
+  uint32_t mbx;
+  for (;;) {
+    int seen = 0;
+    if (rpc_drain(g, 0xffffffffu, &seen, NULL, NULL)) return -1;
+    mbx = tinynv_rd32(&g->dev, NV_PGSP_FALCON_MAILBOX0);
+    if (mbx == 0x80000000u) break;
+    if (tinynv_now_s() > deadline)
+      return tinynv_fail("gsp-rm acknowledged the unload notice but did not halt in 10 s (gsp mailbox %#x)", mbx);
+  }
+  gsp->up = 0;
+  fprintf(stderr, "tinynv: gsp-rm acknowledged the unload notice and halted, %.2f s\n", tinynv_now_s() - t0);
   return 0;
 }
 

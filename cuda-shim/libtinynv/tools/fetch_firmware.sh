@@ -2,8 +2,9 @@
 # Fetch the signed NVIDIA firmware images a card needs to boot, and refuse anything that hashes wrong.
 #
 # Blackwell (gb202) boots through the FSP chain of trust: fmc + bootloader. Ampere (ga102) boots its falcon from the
-# VBIOS instead - FWSEC/FRTS out of the card's own ROM, then booter_load over SEC2 - so it needs booter_load and its own
-# bootloader. GSP-RM itself (gsp-570.144.bin) ships once, under ga102, and serves both.
+# VBIOS instead - FWSEC/FRTS out of the card's own ROM, then booter_load over SEC2 - so it needs booter_load, its own
+# bootloader, and booter_unload, which tears the write-protected region down again when the driver exits so the next
+# open finds a cold card. GSP-RM itself (gsp-570.144.bin) ships once, under ga102, and serves both.
 #
 # These are code the GPU's secure boot executes, so the version is pinned by content, not by filename: the hashes below
 # are exactly the ones tinygrad's driver asserts, and the boot the replay trace records was taken with these bytes.
@@ -24,6 +25,7 @@ set -- \
   "gb202 bootloader-570.144.bin  d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071" \
   "ga102 gsp-570.144.bin         a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f" \
   "ga102 booter_load-570.144.bin 4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b" \
+  "ga102 booter_unload-570.144.bin 8e63db5b78d7d3e349f20a2d11099c3d7109081393cb09ffc0a28133324ae009" \
   "ga102 bootloader-570.144.bin  82428f532240727e95bb3083fbaaba9b2cc7b937314323f2d546ce7245f27fad"
 
 sha_of() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1 || sha256sum "$1" | cut -d' ' -f1; }

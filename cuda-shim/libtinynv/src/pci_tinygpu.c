@@ -208,7 +208,7 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
 
   tg_t *tg = calloc(1, sizeof(tg_t));
   tg->fd = fd;
-  *out = (tinynv_pci_t){.ctx = tg, .name = "usb4", .cfg_read = tg_cfg_read, .cfg_write = tg_cfg_write, .bar_info = tg_bar_info,
+  *out = (tinynv_pci_t){.ctx = tg, .live = 1, .name = "usb4", .cfg_read = tg_cfg_read, .cfg_write = tg_cfg_write, .bar_info = tg_bar_info,
                         .bar_map = tg_bar_map, .bar_unmap = tg_bar_unmap, .dma_alloc = tg_dma_alloc, .dma_free = tg_dma_free,
                         .reset = tg_reset, .quiesce = tg_quiesce, .close = tg_close};
   return 0;

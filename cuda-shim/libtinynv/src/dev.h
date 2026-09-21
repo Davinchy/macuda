@@ -14,6 +14,11 @@ typedef struct {
   int mmu_ver;          // page table generation, 2 or 3
   uint32_t class_gpfifo, class_compute, class_dma_copy; // the engine classes this architecture answers to
   int wpr2_was_up;      // firmware was already resident when we arrived, so the chip was reset
+  uint32_t wpr2_hi_now; // the region register as last read before the falcon boot: on arrival, or again after the reset
+  // What the card's config space said while it was known good, so the driver can put it back if it is cleared under a
+  // running firmware. Taken on a live card only: reading these is six operations the recorded boot never made.
+  int cfg_saved;
+  uint32_t cfg_cmd, cfg_bars[6];
   int large_bar;        // the whole of video memory is cpu visible
   uint64_t vram_size;
 } tinynv_dev_t;
@@ -24,5 +29,7 @@ void tinynv_dev_quiesce(tinynv_dev_t *d);
 uint32_t tinynv_rd32(tinynv_dev_t *d, uint64_t off);
 void tinynv_wr32(tinynv_dev_t *d, uint64_t off, uint32_t v);
 int tinynv_wait_reg(tinynv_dev_t *d, uint64_t off, uint32_t mask, uint32_t want, int timeout_ms, const char *what);
+// Put the address windows and the command register back if they have been cleared under us. Returns 1 if it had to.
+int tinynv_dev_restore_decode(tinynv_dev_t *d);
 
 #endif

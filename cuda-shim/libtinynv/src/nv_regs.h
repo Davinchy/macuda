@@ -372,6 +372,9 @@ static inline uint64_t nv_get128(const uint64_t w[2], int lo, int hi) {
 #define NV_PGC6_BSI_SECURE_SCRATCH_14_BOOT_STAGE_3_HANDOFF_LO 26
 #define NV_PGC6_BSI_SECURE_SCRATCH_14_BOOT_STAGE_3_HANDOFF_HI 26
 
+// dev_bus/tu102
+#define NV_PBUS_VBIOS_SCRATCH(i) (0x00001400u + (uint64_t)(i) * 0x4u)
+
 // dev_gsp/ga102
 #define NV_PGSP_FALCON_ENGINE 0x001103c0
 #define NV_PGSP_FALCON_ENGINE_RESET_LO 0

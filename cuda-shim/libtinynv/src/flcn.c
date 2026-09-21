@@ -14,11 +14,15 @@
 #include "nv_regs.h"
 #include "nv_structs.h"
 #include "vbios.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 static const char *FMC_SHA = "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd59f5af2ddd7fece";
+// the two booters SEC2 runs on the vbios path, from linux-firmware at the commit tools/fetch_firmware.sh pins
+static const char *BOOTER_LOAD_SHA_GA102 = "4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b";
+static const char *BOOTER_UNLOAD_SHA_GA102 = "8e63db5b78d7d3e349f20a2d11099c3d7109081393cb09ffc0a28133324ae009";
 
 #define FSP_MAX_MSG 0x400
 
@@ -170,24 +174,30 @@ static int flcn_execute_hs(tinynv_gpu_t *g, uint64_t base, uint64_t img_paddr, u
 
 // ---- the vbios path's software init -------------------------------------------------------------------------------
 
-// booter_load carries several signatures and the one to use is patched into the image at a place the image itself
+// A booter image carries several signatures and the one to use is patched into the image at a place the image itself
 // names. Nothing is verified here; the boot ROM does that, and a wrong byte shows up as a core that never starts.
-static int flcn_prep_booter(tinynv_gpu_t *g) {
-  tinynv_flcn_t *f = &g->flcn;
+// booter_load and booter_unload have the same shape (checked: same header layout, same engine id 1 and ucode id 3 in
+// their metadata, only the code and data offsets differ), so one reader serves both.
+// Parse and patch a booter image in host memory. `*image` is malloc'd and the caller places it.
+static int flcn_parse_booter(tinynv_gpu_t *g, const char *which, const char *sha_ga102, tinynv_booter_t *out,
+                             uint8_t **image_out, size_t *len_out) {
+  memset(out, 0, sizeof *out);
+  *image_out = NULL;
   // hash-pinned exactly as the fmc is, and for the same reason: this is code the gpu's secure boot executes
-  static const char *BOOTER_SHA_GA102 = "4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b";
   if (strcmp(g->dev.fw_name, "ga102"))
-    return tinynv_fail("no booter_load hash is pinned for %s, so its image cannot be trusted", g->dev.fw_name);
-  if (tinynv_fw_load(g->dev.fw_name, "booter_load-" TINYNV_FW_VER ".bin", BOOTER_SHA_GA102, &f->booter_fw)) return -1;
+    return tinynv_fail("no %s hash is pinned for %s, so its image cannot be trusted", which, g->dev.fw_name);
+  char name[64];
+  snprintf(name, sizeof name, "%s-" TINYNV_FW_VER ".bin", which);
+  if (tinynv_fw_load(g->dev.fw_name, name, sha_ga102, &out->fw)) return -1;
 
-  const uint8_t *b = f->booter_fw.data;
-  size_t n = f->booter_fw.size;
+  const uint8_t *b = out->fw.data;
+  size_t n = out->fw.size;
   tinynv_nvfw_bin_hdr_t bh;
   tinynv_nvfw_hs_header_v2_t hs;
   tinynv_nvfw_hs_load_header_v2_t lh;
   tinynv_nvfw_hs_load_header_app_t app;
 #define TAKE(dst, off, what) do { \
-    if ((off) > n || sizeof(dst) > n - (off)) return tinynv_fail("booter_load's %s is outside the image", what); \
+    if ((off) > n || sizeof(dst) > n - (off)) return tinynv_fail("%s's %s is outside the image", which, what); \
     memcpy(&(dst), b + (off), sizeof(dst)); } while (0)
   TAKE(bh, 0, "binary header");
   TAKE(hs, bh.header_offset, "heavy-secure header");
@@ -198,31 +208,44 @@ static int flcn_prep_booter(tinynv_gpu_t *g) {
   TAKE(patch_loc, hs.patch_loc, "signature patch location");
   TAKE(patch_sig, hs.patch_sig, "signature selector");
   TAKE(num_sig, hs.num_sig, "signature count");
-  if (!num_sig) return tinynv_fail("booter_load declares no signatures");
+  if (!num_sig) return tinynv_fail("%s declares no signatures", which);
 
   size_t sig_len = hs.sig_prod_size / num_sig;
   size_t sig_off = (size_t)hs.sig_prod_offset + patch_sig;
-  if (sig_off > n || sig_len > n - sig_off) return tinynv_fail("booter_load's production signature is outside the image");
-  if (bh.data_offset > n || bh.data_size > n - bh.data_offset) return tinynv_fail("booter_load's payload is outside the image");
+  if (sig_off > n || sig_len > n - sig_off) return tinynv_fail("%s's production signature is outside the image", which);
+  if (bh.data_offset > n || bh.data_size > n - bh.data_offset) return tinynv_fail("%s's payload is outside the image", which);
   if (patch_loc > bh.data_size || sig_len > bh.data_size - patch_loc)
-    return tinynv_fail("booter_load's signature slot is outside its own payload");
+    return tinynv_fail("%s's signature slot is outside its own payload", which);
 #undef TAKE
 
   uint8_t *image = malloc(bh.data_size);
-  if (!image) return tinynv_fail("no memory for the booter image");
+  if (!image) return tinynv_fail("no memory for the %s image", which);
   memcpy(image, b + bh.data_offset, bh.data_size);
   memcpy(image + patch_loc, b + sig_off, sig_len);
 
-  // video memory: SEC2's dma engine fetches this and is given a physical address
-  int rc = tinynv_alloc_boot_mem(&g->mm, bh.data_size, image, 0, &f->booter_image);
-  free(image);
-  if (rc) return -1;
-
-  f->booter_code_off = app.offset;
-  f->booter_code_sz = app.size;
-  f->booter_data_off = lh.os_data_offset;
-  f->booter_data_sz = lh.os_data_size;
+  out->code_off = app.offset;
+  out->code_sz = app.size;
+  out->data_off = lh.os_data_offset;
+  out->data_sz = lh.os_data_size;
+  *image_out = image;
+  *len_out = bh.data_size;
   return 0;
+}
+
+static int flcn_prep_booter(tinynv_gpu_t *g, const char *which, const char *sha_ga102, tinynv_booter_t *out) {
+  uint8_t *image;
+  size_t len;
+  if (flcn_parse_booter(g, which, sha_ga102, out, &image, &len)) return -1;
+  // video memory: SEC2's dma engine fetches this and is given a physical address
+  int rc = tinynv_alloc_boot_mem(&g->mm, len, image, 0, &out->image);
+  free(image);
+  return rc;
+}
+
+static void flcn_free_booter(tinynv_gpu_t *g, tinynv_booter_t *b) {
+  if (b->image.size) tinynv_free_boot_mem(&g->mm, &b->image);
+  tinynv_fw_free(&b->fw);
+  memset(b, 0, sizeof *b);
 }
 
 static int flcn_vbios_init_sw(tinynv_gpu_t *g) {
@@ -231,7 +254,7 @@ static int flcn_vbios_init_sw(tinynv_gpu_t *g) {
   // to the firmware in 4K units and the firmware fills it; the driver only says where.
   f->frts_offset = g->dev.vram_size - 0x100000 - 0x100000;
   if (tinynv_vbios_fwsec_frts(g, f->frts_offset, &f->fwsec)) return -1;
-  return flcn_prep_booter(g);
+  return flcn_prep_booter(g, "booter_load", BOOTER_LOAD_SHA_GA102, &f->booter);
 }
 
 int tinynv_flcn_init_sw(tinynv_gpu_t *g) {
@@ -331,6 +354,15 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
   if (!gsp->wpr_meta_sysmem || !gsp->libos_args_sysmem)
     return tinynv_fail("the vbios boot needs gsp's addresses: run the software init for both blocks first");
 
+  // NVIDIA's driver fails here: "unexpected WPR2 already up, cannot proceed with booting GSP". A region that is up has a
+  // firmware in it, or had one and nothing tore it down, and running FWSEC to place a new region over it is not a boot.
+  // This costs no register read - early init read the register on arrival, and again after a reset - so the recorded
+  // boot, on which the register reads zero here, is reproduced exactly.
+  if (d->wpr2_hi_now)
+    return tinynv_fail("the write-protected region is already up (hi %#x): gsp-rm cannot be booted over a live one. The "
+                       "previous run should have unloaded it (TINYNV_UNLOAD=1, the default); a replug re-enumerates the card",
+                       d->wpr2_hi_now);
+
   // FWSEC, out of the card's own rom, on the gsp falcon. Its data segment loads at virtual zero, which is why the
   // dmem virtual base is a literal here and the code's is not.
   if (tinynv_flcn_reset(g, f->falcon, 0)) return -1;
@@ -339,9 +371,13 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
                       dsc->DMEMPhysBase, 0, dsc->DMEMLoadSize,
                       dsc->PKCDataOffset, dsc->EngineIdMask, dsc->UcodeId, NULL, NULL)) return -1;
 
-  // FWSEC halts whether or not it did the work, so the region itself is the test
-  if (!tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI))
-    return tinynv_fail("fwsec ran and halted but the write-protected region is still unplaced");
+  // FWSEC halts whether or not it did the work, so the region itself is the test. Only when it failed is the error code
+  // it leaves in the vbios scratch read (NVIDIA checks it first; the oracle never reads it, so on the recorded path the
+  // read would be a divergence) - the region being placed is the whole of what matters, and the code says why it was not.
+  if (!tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI)) {
+    uint32_t sc = tinynv_rd32(d, NV_PBUS_VBIOS_SCRATCH(0x0e));
+    return tinynv_fail("fwsec ran and halted but the write-protected region is still unplaced (frts error code %#x)", sc >> 16);
+  }
 
   // the same falcon again, now selecting its riscv core, and told where gsp-rm's arguments are
   if (tinynv_flcn_reset(g, f->falcon, 1)) return -1;
@@ -353,8 +389,8 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
   if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
   uint32_t mbx[2] = {0, 0};
   uint64_t wpr = gsp->wpr_meta_sysmem;
-  if (flcn_execute_hs(g, f->sec2, f->booter_image.paddr, f->booter_code_off, f->booter_data_off,
-                      0, f->booter_code_off, f->booter_code_sz, 0, 0, f->booter_data_sz,
+  if (flcn_execute_hs(g, f->sec2, f->booter.image.paddr, f->booter.code_off, f->booter.data_off,
+                      0, f->booter.code_off, f->booter.code_sz, 0, 0, f->booter.data_sz,
                       0x10, 1, 3, &wpr, mbx)) return -1;
   if (mbx[0]) return tinynv_fail("booter_load refused to unpack gsp-rm: mailbox %#x %#x", mbx[0], mbx[1]);
 
@@ -406,10 +442,78 @@ int tinynv_flcn_init_hw(tinynv_gpu_t *g) {
 void tinynv_flcn_fini(tinynv_gpu_t *g) {
   tinynv_flcn_t *f = &g->flcn;
   tinynv_vbios_fwsec_free(g, &f->fwsec);
-  if (f->booter_image.size) tinynv_free_boot_mem(&g->mm, &f->booter_image);
-  tinynv_fw_free(&f->booter_fw);
+  flcn_free_booter(g, &f->booter);
+  tinynv_fw_free(&f->unload.fw);
   if (f->boot_args.size) tinynv_free_boot_mem(&g->mm, &f->boot_args);
   if (f->fmc_image.size) tinynv_free_boot_mem(&g->mm, &f->fmc_image);
   tinynv_fw_free(&f->fmc_fw);
   f->hash = f->sig = f->pkey = NULL;
+}
+
+// ---- the vbios path's unload -------------------------------------------------------------------------------------
+//
+// The mirror image of flcn_vbios_init_hw, in the order NVIDIA's kgspTeardown_TU102 does it and nouveau's tu102_gsp_fini
+// copies: the GSP falcon reset onto its falcon core (GSP-RM has halted on the riscv one, see tinynv_gsp_unload), FWSEC
+// run again with the SB command, then booter_unload on SEC2 with 0xff in both mailboxes - the value that means "not a
+// suspend, tear it down" - and finally the region register, which must read zero. The oracle has none of this: on
+// Linux it leaves the firmware resident and resets the card next time. On a 3060 over thunderbolt that reset path
+// produced a firmware that came up and went silent, so the card is left the way NVIDIA leaves it instead.
+//
+// Two halves, because of where the images go. Both are written into the video memory the boot already used and proved -
+// FWSEC-SB over the FRTS image (the same image, patched for the other command, so the same size) and booter_unload over
+// booter_load (smaller) - which are addresses the processor wrote through the memory window and the falcons fetched
+// from in this very boot. A fresh allocation at exit could land past the 256 MB the window shows. And the writes are
+// made first, while GSP-RM is still up and everything about the window is exactly as it was all run.
+
+int tinynv_flcn_unload_prepare(tinynv_gpu_t *g) {
+  tinynv_flcn_t *f = &g->flcn;
+  if (g->dev.fmc_boot) return 0;
+  if (!f->fwsec.image.size || !f->booter.image.size)
+    return tinynv_fail("the boot's fwsec and booter_load slots are gone, so there is nowhere proven to put the unload images");
+  if (!f->fwsec.sb_image) return tinynv_fail("no fwsec-sb image was built at boot: %s", f->fwsec.sb_error);
+
+  uint8_t *image;
+  size_t len;
+  if (flcn_parse_booter(g, "booter_unload", BOOTER_UNLOAD_SHA_GA102, &f->unload, &image, &len)) return -1;
+  if (len > f->booter.image.size) {
+    free(image);
+    return tinynv_fail("booter_unload is %zu bytes and booter_load's slot only %zu", len, (size_t)f->booter.image.size);
+  }
+  nv_wr_block(&f->fwsec.image.view, 0, f->fwsec.sb_image, f->fwsec.image_len);
+  nv_wr_block(&f->booter.image.view, 0, image, len);
+  free(image);
+  f->unload_staged = 1;
+  return 0;
+}
+
+int tinynv_flcn_unload_hw(tinynv_gpu_t *g) {
+  tinynv_flcn_t *f = &g->flcn;
+  tinynv_dev_t *d = &g->dev;
+  if (d->fmc_boot) return 0;
+  if (!f->unload_staged) return tinynv_fail("the unload images were not staged");
+  double t0 = tinynv_now_s();
+
+  if (tinynv_flcn_reset(g, f->falcon, 0)) return -1;
+  const tinynv_falcon_ucode_desc_v3_t *dsc = &f->fwsec.desc;
+  if (flcn_execute_hs(g, f->falcon, f->fwsec.image.paddr, 0, dsc->IMEMLoadSize,
+                      dsc->IMEMPhysBase, dsc->IMEMVirtBase, dsc->IMEMLoadSize,
+                      dsc->DMEMPhysBase, 0, dsc->DMEMLoadSize,
+                      dsc->PKCDataOffset, dsc->EngineIdMask, dsc->UcodeId, NULL, NULL)) return -1;
+  // NVIDIA asserts on this and goes on to booter_unload regardless, because the region coming down is what matters
+  uint32_t sb_err = tinynv_rd32(d, NV_PBUS_VBIOS_SCRATCH(0x15)) & 0xffff;
+  if (sb_err) fprintf(stderr, "tinynv: fwsec-sb reported error %#x putting the pre-os applications back; tearing the region down anyway\n", sb_err);
+
+  uint32_t mbx[2] = {0, 0};
+  uint64_t arg = 0xffull | (0xffull << 32);
+  if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
+  if (flcn_execute_hs(g, f->sec2, f->booter.image.paddr, f->unload.code_off, f->unload.data_off,
+                      0, f->unload.code_off, f->unload.code_sz, 0, 0, f->unload.data_sz, 0x10, 1, 3, &arg, mbx)) return -1;
+  if (mbx[0]) return tinynv_fail("booter_unload refused to tear the region down: mailbox %#x %#x", mbx[0], mbx[1]);
+
+  uint32_t wpr2 = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+  if (wpr2) return tinynv_fail("booter_unload reported success but the write-protected region is still up (hi %#x)", wpr2);
+  f->unloaded = 1;
+  fprintf(stderr, "tinynv: gsp-rm unloaded and its region torn down in %.2f s: the card is cold, and the next open needs no reset\n",
+          tinynv_now_s() - t0);
+  return 0;
 }

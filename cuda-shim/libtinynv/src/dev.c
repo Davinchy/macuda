@@ -74,6 +74,45 @@ static const char *fw_dir(const char *chip_name) {
   return NULL;
 }
 
+// Reset a card that still has a firmware on it, and wait for it to be a card again.
+//
+// This used to be a reset and a 100 ms sleep, and on a 3060 over thunderbolt that was the beginning of every failed
+// afternoon: the recorded boot never resets anything (the oracle opened a fresh card), so nothing on this path had
+// ever been checked against anything. What tools/nv_e3_flr.py established by hand is done here: the config space is
+// polled until the card answers to its own name rather than assumed back after a fixed sleep; the BARs are compared
+// with what they were and put back if the reset cleared them; and the caller then checks that the region actually
+// came down, because a reset that leaves it up is a reset that did nothing, and booting over it is what produced a
+// firmware that came up, ran its register sequence and went silent - three times in one afternoon (2026-09-17).
+static int warm_reset(tinynv_dev_t *d, tinynv_pci_t *pci, uint32_t wpr2_hi) {
+  fprintf(stderr, "tinynv: a firmware is resident (write-protected region hi %#x) - the last run did not unload it. "
+                  "Resetting the card\n", wpr2_hi);
+  uint32_t vd = pci->cfg_read(pci, 0x00, 4), bars[TINYNV_MAX_BARS];
+  for (int i = 0; i < TINYNV_MAX_BARS; i++) bars[i] = pci->cfg_read(pci, 0x10 + 4 * i, 4);
+
+  uint32_t cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
+  cfg_write_flush(d, PCI_COMMAND, cmd & ~PCI_COMMAND_MASTER, 2);
+  double t0 = tinynv_now_s();
+  if (pci->reset(pci)) return -1;
+
+  // back when it answers to its name. All ones is the function still in reset; anything else that is not the name is
+  // a card that came back as something else, which is not a state to continue from
+  uint32_t now = 0xffffffff;
+  double deadline = tinynv_now_s() + 10.0;
+  while ((now = pci->cfg_read(pci, 0x00, 4)) != vd && tinynv_now_s() < deadline) sleep_ms(10);
+  if (now != vd) return tinynv_fail("the card did not come back from its reset in 10 s: vendor/device reads %#x, was %#x", now, vd);
+  double back = tinynv_now_s() - t0;
+
+  int restored = 0;
+  for (int i = 0; i < TINYNV_MAX_BARS; i++) {
+    if (pci->cfg_read(pci, 0x10 + 4 * i, 4) == bars[i]) continue;
+    pci->cfg_write(pci, 0x10 + 4 * i, 4, bars[i]);
+    restored++;
+  }
+  fprintf(stderr, "tinynv: the card answered %.2f s after the reset%s\n", back,
+          restored ? " and its bars had been cleared; put back from the snapshot" : "");
+  return 0;
+}
+
 int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   memset(d, 0, sizeof(*d));
   d->pci = pci;
@@ -88,12 +127,7 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   // what reprograms the command register. Cost most of a day on a 3060 and was blamed on the enclosure's power supply.
   uint32_t wpr2 = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
   d->wpr2_was_up = wpr2 != 0 && wpr2 != 0xffffffff;
-  if (d->wpr2_was_up) {
-    uint32_t cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
-    cfg_write_flush(d, PCI_COMMAND, cmd & ~PCI_COMMAND_MASTER, 2);
-    if (pci->reset(pci)) return -1;
-    sleep_ms(100); // the function is not answering until it has come out of reset
-  }
+  if (d->wpr2_was_up && warm_reset(d, pci, wpr2)) return -1;
 
   // Bus mastering AND the memory window. The window was the backend's business, settled when it opened the device - but
   // the reset above happens after that, and a reset clears the command register outright. So on the one path where this
@@ -104,6 +138,22 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   // because the oracle never opened a card it had just reset.
   uint32_t cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
   cfg_write_flush(d, PCI_COMMAND, cmd | PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY, 2);
+
+  // THE FIRST READING WAS MADE THROUGH A WINDOW THAT MAY HAVE BEEN OFF. If it answered all ones, it said nothing about
+  // whether a firmware is resident - and a card left with its window switched off is exactly the state a previous run
+  // that could not finish leaves behind (see gsp.c's init_wait_report). So ask again now that the window is on. This
+  // cannot diverge from the recording: there, the first read answers zero and this never runs.
+  if (wpr2 == 0xffffffff) {
+    wpr2 = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+    if (wpr2 && wpr2 != 0xffffffff) {
+      fprintf(stderr, "tinynv: with the memory window back on, the write-protected region reads %#x: a firmware IS "
+                      "resident and the first reading could not see it\n", wpr2);
+      d->wpr2_was_up = 1;
+      if (warm_reset(d, pci, wpr2)) return -1;
+      uint32_t cmd2 = pci->cfg_read(pci, PCI_COMMAND, 2);
+      cfg_write_flush(d, PCI_COMMAND, cmd2 | PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY, 2);
+    }
+  }
 
   // Two impossible answers, not one. All ones is a window that is not decoding or a card that has gone; ZERO is a chip
   // that is present and not answering - halted, still in reset, or not yet back from having been put down at the end of
@@ -116,6 +166,19 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   if (d->chip_id == 0)
     return tinynv_fail("the gpu reads zero: it is on the bus but not answering - halted, in reset, or not yet back from "
                        "being put down. A replug re-enumerates it; tools/nv_quiesce.sh does not wake it.");
+
+  // WHAT GOOD LOOKS LIKE, remembered while it is still true. On this machine a card can lose its command register and
+  // all six base address registers WHILE A FIRMWARE IS RUNNING ON IT (2026-09-21, every second boot in an enumeration):
+  // config space stays readable, the card stays on the bus, macOS logs nothing, and the windows are simply gone. With
+  // the windows gone every register reads all ones and every page table entry written through them is lost. macOS will
+  // not reassign them - only re-enumeration does, which means a person and a cable - but the values it assigned are
+  // right here in config space, so the driver can write them back itself. Live cards only: these six reads are
+  // operations the recorded boot never made.
+  if (pci->live) {
+    d->cfg_cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
+    for (int i = 0; i < 6; i++) d->cfg_bars[i] = pci->cfg_read(pci, 0x10 + 4 * i, 4);
+    d->cfg_saved = 1;
+  }
 
   uint32_t boot42 = tinynv_rd32(d, NV_PMC_BOOT_42);
   d->architecture = NV_GET(boot42, NV_PMC_BOOT_42, ARCHITECTURE);
@@ -151,9 +214,49 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   // because that is where the gap is: identifying the chip and setting up its page tables are the same work whatever
   // boots the falcon, so they should run for any chip this driver can name, and a replay should get as far as the thing
   // that is actually missing rather than stopping three reads in.
-  if (d->fmc_boot)
-    return tinynv_wait_reg(d, NV_THERM_I2CS_SCRATCH, 0xffffffff, 0xff, 10000, "waiting for the boot firmware");
-  return wait_gfw_ampere(d, 10000);
+  if (d->fmc_boot ? tinynv_wait_reg(d, NV_THERM_I2CS_SCRATCH, 0xffffffff, 0xff, 10000, "waiting for the boot firmware")
+                  : wait_gfw_ampere(d, 10000)) return -1;
+
+  // What the falcon boot may assume about the region. On the recorded path it is the read made on arrival, so nothing
+  // new is read; after a reset it is read again, because changing it was the whole point of the reset. NVIDIA's driver
+  // refuses to boot GSP-RM over a region that is up ("unexpected WPR2 already up, cannot proceed") and so does this,
+  // here, where the reason is known, rather than sixty seconds later as a start-up notice that never comes.
+  d->wpr2_hi_now = wpr2;
+  if (d->wpr2_was_up) {
+    d->wpr2_hi_now = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+    if (d->wpr2_hi_now == 0xffffffff) return tinynv_fail("the gpu reads all ones after its reset: the memory window did not come back");
+    if (d->wpr2_hi_now)
+      return tinynv_fail("the reset did not tear the write-protected region down (hi still %#x): gsp-rm cannot be booted "
+                         "over a live one, and NVIDIA's own driver refuses to try. A replug re-enumerates the card. To need "
+                         "no reset at all, let a run unload the firmware on its way out (TINYNV_UNLOAD=1, the default)",
+                         d->wpr2_hi_now);
+    fprintf(stderr, "tinynv: the write-protected region is down after the reset; booting the card cold\n");
+  }
+  return 0;
+}
+
+// Have the windows gone, and if so put them back. The card answers config space either way, so this is cheap and safe
+// to ask; the answer is only ever acted on when a base address register has actually been zeroed.
+int tinynv_dev_restore_decode(tinynv_dev_t *d) {
+  tinynv_pci_t *pci = d->pci;
+  if (!d->cfg_saved) return 0;
+  uint32_t vd = pci->cfg_read(pci, 0x00, 4);
+  if (vd == 0xffffffffu || vd == 0) return 0; // not a card that is answering: nothing to put back into
+  uint32_t cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
+  int lost = (cmd & (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER)) != (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+  for (int i = 0; i < 6; i++) lost |= pci->cfg_read(pci, 0x10 + 4 * i, 4) != d->cfg_bars[i];
+  if (!lost) return 0;
+
+  for (int i = 0; i < 6; i++) pci->cfg_write(pci, 0x10 + 4 * i, 4, d->cfg_bars[i]);
+  cfg_write_flush(d, PCI_COMMAND, d->cfg_cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER, 2);
+
+  int back = 1;
+  for (int i = 0; i < 6; i++) back &= pci->cfg_read(pci, 0x10 + 4 * i, 4) == d->cfg_bars[i];
+  uint32_t now = pci->cfg_read(pci, PCI_COMMAND, 2);
+  fprintf(stderr, "tinynv: the card had lost its windows under a running firmware (command %#06x, first base address "
+                  "%#x); written back from what it reported when it was opened - command %#06x, %s\n",
+          cmd, d->cfg_bars[0], now, back ? "all six base address registers read back correctly" : "THEY DID NOT TAKE");
+  return 1;
 }
 
 int tinynv_dev_mmu_init(tinynv_dev_t *d) {

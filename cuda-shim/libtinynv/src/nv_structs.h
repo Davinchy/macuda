@@ -168,6 +168,7 @@ TINYNV_AT(tinynv_libos_region_t, loc, 25);
 #define TINYNV_MSG_FUNCTION_CONTINUATION_RECORD 71
 #define TINYNV_MSG_FUNCTION_GSP_SET_SYSTEM_INFO 72
 #define TINYNV_MSG_FUNCTION_SET_REGISTRY 73
+#define TINYNV_MSG_FUNCTION_UNLOADING_GUEST_DRIVER 47
 #define TINYNV_MSG_EVENT_GSP_INIT_DONE 4097
 #define TINYNV_MSG_EVENT_GSP_RUN_CPU_SEQUENCER 4098
 #define TINYNV_MSG_EVENT_MMU_FAULT_QUEUED 4101
@@ -220,6 +221,12 @@ TINYNV_SIZE(tinynv_registry_entry_t, 16);
 TINYNV_AT(tinynv_registry_entry_t, type, 4);
 TINYNV_AT(tinynv_registry_entry_t, data, 8);
 TINYNV_AT(tinynv_registry_entry_t, length, 12);
+// rpc_unloading_guest_driver_v1F_07 (generated/g_rpc-structures.h): what GSP-RM is told when the driver is going away.
+// Two NvBools and a level; the oracle sends 0, 0 and bit 6 (__GPU_STATE_FLAGS_FAST_UNLOAD), and so does this.
+typedef struct { uint8_t bInPMTransition, bGc6Entering, _pad[2]; uint32_t newLevel; } tinynv_unloading_guest_driver_t;
+TINYNV_SIZE(tinynv_unloading_guest_driver_t, 8);
+TINYNV_AT(tinynv_unloading_guest_driver_t, bGc6Entering, 1);
+TINYNV_AT(tinynv_unloading_guest_driver_t, newLevel, 4);
 
 // --- the resource manager's objects ---------------------------------------------------------------------------------
 // Everything the GPU does is an object in a tree inside GSP-RM: a client at the root, a device under it, a subdevice for

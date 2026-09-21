@@ -15,6 +15,7 @@
 #include "vbios.h"
 #include "gpu.h"
 #include "internal.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,6 +27,7 @@
 #define BIT_HEADER_OFFSET 0x1b0     // where the BIT table is, which is not discoverable: it is this address
 #define BIT_SIGNATURE 0x00544942u   // "BIT\0", checked so a wrong offset is reported rather than walked
 #define FWSEC_FRTS_CMD 0x15         // the command id that means "place the write-protected region"
+#define FWSEC_SB_CMD 0x19           // and the one that means "put the pre-os applications back", run at unload
 #define FWSEC_SIG_BYTES 0x180       // how much of the descriptor's signature block the boot ROM reads
 
 // read a packed structure out of the rom buffer, refusing anything that would run off the end
@@ -100,29 +102,12 @@ static int find_fwsec_desc(const uint8_t *rom, size_t rom_len, size_t exp_off, s
   return tinynv_fail("no production fwsec image in the vbios falcon ucode table");
 }
 
-int tinynv_vbios_fwsec_frts(tinynv_gpu_t *g, uint64_t frts_offset, tinynv_fwsec_t *out) {
-  memset(out, 0, sizeof *out);
-  uint8_t *rom = malloc(VBIOS_SIZE);
-  if (!rom) return tinynv_fail("no memory for the vbios image");
-  nv_rd_block(&g->dev.mmio, VBIOS_MMIO_BASE, rom, VBIOS_SIZE);
-
-  int rc = -1;
-  size_t exp_off = 0, desc_off = 0, desc_size = 0;
-  uint8_t *image = NULL;
-  if (find_expansion_rom(rom, VBIOS_SIZE, &exp_off)) goto done;
-  if (find_fwsec_desc(rom, VBIOS_SIZE, exp_off, &desc_off, &desc_size)) goto done;
-  if (rom_get(rom, VBIOS_SIZE, desc_off, &out->desc, sizeof out->desc, "fwsec descriptor")) goto done;
-
-  // The signature block sits directly after the v3 layout, and the image directly after that. Only the LAST 0x180
-  // bytes of the block are the production signature the boot ROM checks.
-  size_t sig_len = desc_size - TINYNV_FALCON_UCODE_DESC_V3_SIZE_44;
-  size_t sig_off = desc_off + TINYNV_FALCON_UCODE_DESC_V3_SIZE_44;
-  if (sig_len < FWSEC_SIG_BYTES) { tinynv_fail("the fwsec signature block is %#zx bytes, under the %#x the boot rom reads", sig_len, FWSEC_SIG_BYTES); goto done; }
-
-  size_t image_len = (out->desc.StoredSize + 0xff) & ~(size_t)0xff;
-  if (!(image = malloc(image_len))) { tinynv_fail("no memory for the fwsec image"); goto done; }
-  if (rom_get(rom, VBIOS_SIZE, desc_off + desc_size, image, image_len, "fwsec image")) goto done;
-
+// Patch one copy of FWSEC for one command. One image, two commands: FRTS takes the whole command (where the region
+// goes); SB takes only its first part, the vbios descriptor, exactly as NVIDIA's kgspPrepareForFwsec builds the two.
+// Three writes into the image: the command id the mapper is to run, the command itself, and the signature the boot
+// ROM will check. A wrong offset for any of them is a card that refuses the image and says nothing about why.
+static int fwsec_patch(uint8_t *image, size_t image_len, const tinynv_falcon_ucode_desc_v3_t *desc, uint32_t cmd_id,
+                       uint64_t frts_offset, const uint8_t *sig) {
   // The command, and where in the image's data segment it goes. The region is named in 4K units and the firmware
   // decides its own contents; the driver only says where and how big.
   tinynv_fwsec_frts_cmd_t cmd;
@@ -138,9 +123,9 @@ int tinynv_vbios_fwsec_frts(tinynv_gpu_t *g, uint64_t frts_offset, tinynv_fwsec_
 
   // Where the image keeps its interface table, and in it, the entry that says where its command buffer is. Everything
   // is relative to the end of the code segment, because that is where the data segment starts.
-  size_t app_hdr_off = out->desc.IMEMLoadSize + out->desc.InterfaceOffset;
+  size_t app_hdr_off = desc->IMEMLoadSize + desc->InterfaceOffset;
   tinynv_falcon_app_if_hdr_t app;
-  if (app_hdr_off > image_len || sizeof app > image_len - app_hdr_off) { tinynv_fail("the fwsec interface table is outside its own image"); goto done; }
+  if (app_hdr_off > image_len || sizeof app > image_len - app_hdr_off) return tinynv_fail("the fwsec interface table is outside its own image");
   memcpy(&app, image + app_hdr_off, sizeof app);
 
   size_t dmem_offset = 0;
@@ -148,34 +133,78 @@ int tinynv_vbios_fwsec_frts(tinynv_gpu_t *g, uint64_t frts_offset, tinynv_fwsec_
   for (unsigned i = 0; i < app.entryCount; i++) {
     tinynv_falcon_app_if_entry_t e;
     size_t eo = app_hdr_off + sizeof app + (size_t)i * sizeof e;
-    if (eo > image_len || sizeof e > image_len - eo) { tinynv_fail("a fwsec interface entry is outside its own image"); goto done; }
+    if (eo > image_len || sizeof e > image_len - eo) return tinynv_fail("a fwsec interface entry is outside its own image");
     memcpy(&e, image + eo, sizeof e);
     if (e.id == TINYNV_FALCON_APPLICATION_INTERFACE_ENTRY_ID_DMEMMAPPER) { dmem_offset = e.dmemOffset; found_mapper = 1; }
   }
-  if (!found_mapper) { tinynv_fail("the fwsec image declares no dmem mapper, so there is nowhere to put the command"); goto done; }
+  if (!found_mapper) return tinynv_fail("the fwsec image declares no dmem mapper, so there is nowhere to put the command");
 
-  // Three writes into the image: the command id the mapper is to run, the command itself, and the signature the boot
-  // ROM will check. A wrong offset for any of them is a card that refuses the image and says nothing about why.
   tinynv_falcon_dmem_mapper_t mapper;
-  size_t mapper_off = out->desc.IMEMLoadSize + dmem_offset;
-  if (mapper_off > image_len || sizeof mapper > image_len - mapper_off) { tinynv_fail("the fwsec dmem mapper is outside its own image"); goto done; }
+  size_t mapper_off = desc->IMEMLoadSize + dmem_offset;
+  if (mapper_off > image_len || sizeof mapper > image_len - mapper_off) return tinynv_fail("the fwsec dmem mapper is outside its own image");
   memcpy(&mapper, image + mapper_off, sizeof mapper);
-  mapper.init_cmd = FWSEC_FRTS_CMD;
+  mapper.init_cmd = cmd_id;
   memcpy(image + mapper_off, &mapper, sizeof mapper);
 
-  size_t cmd_off = out->desc.IMEMLoadSize + mapper.cmd_in_buffer_offset;
-  if (cmd_off > image_len || sizeof cmd > image_len - cmd_off) { tinynv_fail("the fwsec command buffer is outside its own image"); goto done; }
-  memcpy(image + cmd_off, &cmd, sizeof cmd);
+  size_t cmd_off = desc->IMEMLoadSize + mapper.cmd_in_buffer_offset;
+  size_t cmd_len = cmd_id == FWSEC_FRTS_CMD ? sizeof cmd : sizeof cmd.readVbiosDesc;
+  if (cmd_off > image_len || cmd_len > image_len - cmd_off) return tinynv_fail("the fwsec command buffer is outside its own image");
+  memcpy(image + cmd_off, &cmd, cmd_len);
 
-  size_t pkc_off = out->desc.IMEMLoadSize + out->desc.PKCDataOffset;
-  if (pkc_off > image_len || FWSEC_SIG_BYTES > image_len - pkc_off) { tinynv_fail("the fwsec signature slot is outside its own image"); goto done; }
-  memcpy(image + pkc_off, rom + sig_off + sig_len - FWSEC_SIG_BYTES, FWSEC_SIG_BYTES);
+  size_t pkc_off = desc->IMEMLoadSize + desc->PKCDataOffset;
+  if (pkc_off > image_len || FWSEC_SIG_BYTES > image_len - pkc_off) return tinynv_fail("the fwsec signature slot is outside its own image");
+  memcpy(image + pkc_off, sig, FWSEC_SIG_BYTES);
+  return 0;
+}
+
+int tinynv_vbios_fwsec_frts(tinynv_gpu_t *g, uint64_t frts_offset, tinynv_fwsec_t *out) {
+  memset(out, 0, sizeof *out);
+  uint8_t *rom = malloc(VBIOS_SIZE);
+  if (!rom) return tinynv_fail("no memory for the vbios image");
+  nv_rd_block(&g->dev.mmio, VBIOS_MMIO_BASE, rom, VBIOS_SIZE);
+
+  int rc = -1;
+  size_t exp_off = 0, desc_off = 0, desc_size = 0;
+  uint8_t *image = NULL, *sb = NULL;
+  if (find_expansion_rom(rom, VBIOS_SIZE, &exp_off)) goto done;
+  if (find_fwsec_desc(rom, VBIOS_SIZE, exp_off, &desc_off, &desc_size)) goto done;
+  if (rom_get(rom, VBIOS_SIZE, desc_off, &out->desc, sizeof out->desc, "fwsec descriptor")) goto done;
+
+  // The signature block sits directly after the v3 layout, and the image directly after that. Only the LAST 0x180
+  // bytes of the block are the production signature the boot ROM checks.
+  size_t sig_len = desc_size - TINYNV_FALCON_UCODE_DESC_V3_SIZE_44;
+  size_t sig_off = desc_off + TINYNV_FALCON_UCODE_DESC_V3_SIZE_44;
+  if (sig_len < FWSEC_SIG_BYTES) { tinynv_fail("the fwsec signature block is %#zx bytes, under the %#x the boot rom reads", sig_len, FWSEC_SIG_BYTES); goto done; }
+  const uint8_t *sig = rom + sig_off + sig_len - FWSEC_SIG_BYTES;
+
+  size_t image_len = (out->desc.StoredSize + 0xff) & ~(size_t)0xff;
+  if (!(image = malloc(image_len))) { tinynv_fail("no memory for the fwsec image"); goto done; }
+  if (rom_get(rom, VBIOS_SIZE, desc_off + desc_size, image, image_len, "fwsec image")) goto done;
+
+  // The SB variant is built now, from the same bytes, and kept in host memory until the driver unloads. NVIDIA's driver
+  // and nouveau both prepare it at init rather than read the ROM again at unload, after GSP-RM has had the card; and it
+  // costs the recorded boot nothing, because nothing about it reaches the device until then. A failure here only
+  // means there will be no SB step at unload, so it is recorded rather than allowed to fail the boot.
+  if ((sb = malloc(image_len))) {
+    memcpy(sb, image, image_len);
+    if (fwsec_patch(sb, image_len, &out->desc, FWSEC_SB_CMD, 0, sig)) {
+      snprintf(out->sb_error, sizeof out->sb_error, "%s", tinynv_last_error());
+      free(sb);
+      sb = NULL;
+    }
+  } else snprintf(out->sb_error, sizeof out->sb_error, "no memory for the fwsec-sb image");
+
+  if (fwsec_patch(image, image_len, &out->desc, FWSEC_FRTS_CMD, frts_offset, sig)) goto done;
 
   // Video memory, not host memory: the falcon's own DMA engine fetches this, and it is told a physical address.
   if (tinynv_alloc_boot_mem(&g->mm, image_len, image, 0, &out->image)) goto done;
+  out->image_len = image_len;
+  out->sb_image = sb;
+  sb = NULL;
   rc = 0;
 
 done:
+  free(sb);
   free(image);
   free(rom);
   return rc;
@@ -183,5 +212,6 @@ done:
 
 void tinynv_vbios_fwsec_free(tinynv_gpu_t *g, tinynv_fwsec_t *f) {
   if (f->image.size) tinynv_free_boot_mem(&g->mm, &f->image);
+  free(f->sb_image);
   memset(f, 0, sizeof *f);
 }

@@ -195,6 +195,7 @@ typedef struct {
   uint64_t rm_args_sysmem, cmd_q_off, queue_size;
   tinynv_rpcq_t cmd_q, stat_q;
   int err_state;      // gsp-rm reported an error or a fault; the boot is no longer trustworthy
+  int up;             // gsp-rm sent its start-up notice and has not been told to go: there is something to unload
   // What it actually said, kept so a wait that times out can name it. "gsp-rm reported a fault" with nothing else is
   // the least useful true sentence a driver can print: an MMU fault means a bad address and an error log means the
   // firmware is complaining about something it was asked to do, and those lead opposite ways.
@@ -284,6 +285,8 @@ int tinynv_gsp_init_sw(tinynv_gpu_t *g);
 // Wait for GSP-RM to come up and say so, then point the two memory windows at it. Rings the doorbell, so this is the
 // first thing in the driver that expects the firmware to be alive.
 int tinynv_gsp_init_hw(tinynv_gpu_t *g);
+// Tell GSP-RM the driver is going and wait for it to halt. After this the falcon may be reset and reused (flcn.c).
+int tinynv_gsp_unload(tinynv_gpu_t *g);
 
 // Create the privileged client and the device, chip and address space objects under it. Every later call needs these.
 int tinynv_gsp_init_objects(tinynv_gpu_t *g);

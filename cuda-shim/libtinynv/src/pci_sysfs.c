@@ -182,7 +182,7 @@ int tinynv_pci_open_sysfs(const char *bdf, tinynv_pci_t *out) {
     return tinynv_fail("sysfs: /proc/self/pagemap: %s", strerror(errno));
   }
 
-  *out = (tinynv_pci_t){.ctx = s, .name = s->bdf, .cfg_read = sf_cfg_read, .cfg_write = sf_cfg_write, .bar_info = sf_bar_info,
+  *out = (tinynv_pci_t){.ctx = s, .live = 1, .name = s->bdf, .cfg_read = sf_cfg_read, .cfg_write = sf_cfg_write, .bar_info = sf_bar_info,
                         .bar_map = sf_bar_map, .bar_unmap = sf_bar_unmap, .dma_alloc = sf_dma_alloc, .dma_free = sf_dma_free,
                         .reset = sf_reset, .quiesce = sf_quiesce, .close = sf_close};
   return 0;
