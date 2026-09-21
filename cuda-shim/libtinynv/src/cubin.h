@@ -19,6 +19,11 @@ typedef struct {
   uint32_t param_base;             // where the kernel's parameters start in constant bank 0. 0x160 on sm_8x, 0x380 on sm_12x
   uint32_t param_size;             // how many bytes of them
   uint32_t regs, static_smem, min_stack, max_threads;
+  // Compile-time cluster settings (sm_90+), from the kernel's own records: EIATTR_EXPLICIT_CLUSTER (0x3e, no payload),
+  // EIATTR_CTA_PER_CLUSTER (0x3d, three u32 dimensions), EIATTR_MAX_CLUSTER_RANK (0x3f, u32). Names are cuobjdump's
+  // for these codes, matched by position in a CUDA 13.0 build with __cluster_dims__ / __launch_bounds__(..., ..., 4).
+  // All zero when the kernel sets none, which is CUDA's documented value for "not set at compile time".
+  uint32_t explicit_cluster, cluster_dim[3], max_cluster_rank;
   int nparams;
   struct { uint32_t offset, size; } params[TINYNV_MAX_PARAMS]; // by ordinal, offset relative to param_base
 } tinynv_kernel_desc_t;
@@ -37,6 +42,9 @@ typedef struct {
   int nsections;
   tinynv_section_t *sections;            // owned
   uint32_t sm_arch; // 120 for sm_120, from the ELF flags
+  // Module-wide, what cuFuncGetAttribute reports for every function in it (measured against the real driver, cubin.c):
+  uint64_t const3_size; // CONST_SIZE_BYTES: the size of .nv.constant3, the module's user __constant__ data; 0 if none
+  int ptx_version;      // PTX_VERSION: the virtual architecture, e.g. 80 or 120; -1 when the image does not carry it
   int nkernels;
   tinynv_kernel_desc_t *kernels;
 } tinynv_cubin_t;

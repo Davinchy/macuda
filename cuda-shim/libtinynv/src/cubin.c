@@ -16,6 +16,9 @@
 #define EIATTR_MAX_THREADS 0x05
 #define EIATTR_REGCOUNT 0x2f
 #define EIATTR_MIN_STACK_SIZE 0x12
+#define EIATTR_CTA_PER_CLUSTER 0x3d
+#define EIATTR_EXPLICIT_CLUSTER 0x3e
+#define EIATTR_MAX_CLUSTER_RANK 0x3f
 
 typedef tinynv_section_t sec_t;
 
@@ -64,6 +67,12 @@ static int parse_kernel_info(tinynv_kernel_desc_t *k, const uint8_t *p, const ui
       if (ordinal + 1 > (uint32_t)k->nparams) k->nparams = ordinal + 1;
     } else if (attr == EIATTR_MAX_THREADS && plen >= 12) {
       k->max_threads = rd32(payload) * rd32(payload + 4) * rd32(payload + 8);
+    } else if (attr == EIATTR_CTA_PER_CLUSTER && plen >= 12) {
+      k->cluster_dim[0] = rd32(payload); k->cluster_dim[1] = rd32(payload + 4); k->cluster_dim[2] = rd32(payload + 8);
+    } else if (attr == EIATTR_EXPLICIT_CLUSTER) {
+      k->explicit_cluster = 1;
+    } else if (attr == EIATTR_MAX_CLUSTER_RANK && plen >= 4) {
+      k->max_cluster_rank = rd32(payload);
     }
     p = payload + plen;
   }
@@ -158,6 +167,26 @@ int tinynv_cubin_parse(const void *data, size_t len, tinynv_cubin_t *out) {
       p = payload + plen;
     }
   }
+
+  // MODULE-WIDE ATTRIBUTES, each measured against NVIDIA's own driver (580.126.18, cuFuncGetAttribute on the 3090) for
+  // every kernel of the sm_80 images of two torch builds - 15,238 (cu128, ELF ABI 7) and 14,934 (cu130, ABI 8), all
+  // matching (B's survey and gate, cuda-shim-b 68b6070 vm/rmtrace/kernel-attrs-20260921/):
+  //   CONST_SIZE_BYTES = the size of .nv.constant3, the module's user __constant__ data, the same for every function.
+  //   PTX_VERSION = the virtual architecture: in ABI 8 the u16 at offset 2 of the note descriptor of .note.nv.cuinfo
+  //     (CUDA 13) or .note.nv.cuver (CUDA 12.8); in ABI 7 bits 23:16 of e_flags. A compute_75 -> sm_86 build reads 75
+  //     there and the driver reports 75, while BINARY_VERSION reports 86. The .note.nv.cuver reading (the guest's
+  //     sm_120 images: 120) has NOT been checked against a driver - no sm_120 image loads on the 3090 - and rests on
+  //     the note having the same type and layout as .note.nv.cuinfo.
+  out->ptx_version = -1;
+  for (int i = 0; i < shnum; i++) {
+    if (!strcmp(sec[i].sname, ".nv.constant3")) out->const3_size = sec[i].size;
+    if ((!strcmp(sec[i].sname, ".note.nv.cuinfo") || !strcmp(sec[i].sname, ".note.nv.cuver")) && sec[i].size >= 16) {
+      uint32_t namesz = rd32(img + sec[i].off);
+      uint64_t at = 12 + (((uint64_t)namesz + 3) & ~3ull) + 2;
+      if (at + 2 <= sec[i].size) out->ptx_version = rd16(img + sec[i].off + at);
+    }
+  }
+  if (out->ptx_version < 0 && img[7] == 0x33) out->ptx_version = (int)((rd32(img + 0x30) >> 16) & 0xff);
 
   out->nsections = shnum;
   out->sections = sec;

@@ -52,7 +52,24 @@ tinynv_status_t tinynv_get_kernel(tinynv_module_t, const char* name, tinynv_kern
 // rule (libtinynv/src/cubin.c tinynv_kernel_thread_limit). A driver's CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK comes
 // from here, never from a constant 1024. It is the LAST field on purpose: a reply from a daemon built before it
 // existed leaves it as the caller initialised it, so a caller that zeroes the struct reads 0 = "not reported".
-typedef struct { int num_params; int param_base; struct { int offset, size; } params[64]; int regs, static_smem; int max_threads; } tinynv_kernel_info_t;
+//
+// The fields after max_threads are cuFuncGetAttribute values the IMAGE carries, numbered as CUfunction_attribute
+// (cuda.h). A 0 in them can be a true value, so `attr_reported` says which are answered: bit n set means attribute n is
+// reported below. A daemon built before these fields leaves it as the caller zeroed it, i.e. nothing reported; a bit
+// that is clear is for the caller to REFUSE by name, never to answer with 0.
+//   2  const_size_bytes          size of .nv.constant3 (module-wide)                     driver-checked, sm_80
+//   3  local_size_bytes          EIATTR_MIN_STACK_SIZE                                    driver-checked, sm_80
+//   5  ptx_version               note descriptor u16 at +2, or e_flags[23:16] (ABI 7)     driver-checked, sm_80;
+//                                                                                         .note.nv.cuver (sm_120) NOT yet
+//   7  cache_mode_ca             0                                                        driver reports 0 for every image
+//                                                                                         measured, incl. -dlcm=ca
+//   10 cluster_size_must_be_set  EIATTR_EXPLICIT_CLUSTER present                          decoded, NOT driver-checked
+//   11-13 required_cluster[3]    EIATTR_CTA_PER_CLUSTER, 0 when absent                    decoded, NOT driver-checked
+// 14 and 15 (non-portable cluster size, scheduling policy) are runtime settings with default 0, like 8 and 9: the
+// caller keeps them, the image has no field for them.
+typedef struct { int num_params; int param_base; struct { int offset, size; } params[64]; int regs, static_smem; int max_threads;
+                 unsigned attr_reported; int const_size_bytes, local_size_bytes, ptx_version, cache_mode_ca;
+                 int cluster_size_must_be_set, required_cluster[3]; } tinynv_kernel_info_t;
 tinynv_status_t tinynv_kernel_info(tinynv_kernel_t, tinynv_kernel_info_t* out);
 
 // memory

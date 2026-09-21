@@ -501,6 +501,16 @@ tinynv_status_t tinynv_kernel_info(tinynv_kernel_t k, tinynv_kernel_info_t *i) {
   i->regs = (int)d->regs;
   i->static_smem = (int)d->static_smem;
   i->max_threads = (int)tinynv_kernel_thread_limit(d);
+  // The image-sourced cuFuncGetAttribute values (include/tinynv.h says which are driver-checked). PTX_VERSION is
+  // reported only when the image carries it; otherwise its bit stays clear and the caller refuses it by name.
+  const tinynv_cubin_t *cb = &k->mod->cubin;
+  i->const_size_bytes = (int)cb->const3_size;
+  i->local_size_bytes = (int)d->min_stack;
+  i->cache_mode_ca = 0;
+  i->cluster_size_must_be_set = d->explicit_cluster ? 1 : 0;
+  for (int c = 0; c < 3; c++) i->required_cluster[c] = (int)d->cluster_dim[c];
+  i->attr_reported = (1u << 2) | (1u << 3) | (1u << 7) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13);
+  if (cb->ptx_version >= 0) { i->ptx_version = cb->ptx_version; i->attr_reported |= 1u << 5; }
   // 0 must keep meaning "not reported" (a daemon built before the field): a kernel no block size can hold is refused
   // here by name instead. Only a register count over 256 does that, which no cubin a real toolchain emits carries.
   if (!i->max_threads)
