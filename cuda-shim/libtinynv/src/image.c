@@ -23,6 +23,7 @@
 #define SHT_SYMTAB 2
 #define SHT_RELA 4
 #define SHT_REL 9
+#define SHT_NOBITS 8
 #define CUDA_SECTION_ALIGN 128 // what the oracle loads cubins with, and a section may ask for more
 
 // the CUDA relocation types that appear in a cubin, and what each one writes
@@ -101,6 +102,35 @@ static int place(const tinynv_cubin_t *c, uint64_t *addr, int with_bytes, uint8_
     len += pad;
     if (with_bytes) memcpy(bytes + len, c->img + s->off, s->size);
     addr[i] = len;      // and this is what the relocations and the descriptor will refer to
+    len += s->size;
+  }
+
+  // ZERO-INITIALISED DATA - `.nv.global`, SHT_NOBITS - GOES AFTER EVERYTHING ELSE, AS ZEROES.
+  //
+  // It used to be placed nowhere. A relocation against an object in it then resolved to the section's own sh_addr
+  // (0) plus the symbol's value, i.e. into whatever the loop above had put at the front of the block - measured on the
+  // guest's torch, the non-loadable `.debug_frame` - so 5787 relocations in 414 images handed kernels a pointer into
+  // another section's bytes. Every one happened to be a 1-byte empty tag object (cute::_1, thrust::seq,
+  // cuda::std::ignore) whose address is taken and never dereferenced, which is why nothing failed; the first real
+  // zero-initialised __device__ variable would have written into that other section. Appended here AFTER every
+  // PROGBITS section, so no section above moves: only the block's length grows, by the NOBITS sizes and their
+  // alignment. The bytes are zero because grow() zero-fills everything past the old length, and the whole block is
+  // what goes across, so the device sees zeroes too.
+  for (int i = 0; i < c->nsections; i++) {
+    const tinynv_section_t *s = &c->sections[i];
+    if (s->type != SHT_NOBITS || !s->size) continue;
+    if (addr[i]) {                                   // a declared address: honour it like a PROGBITS one, zero-filled
+      if (addr[i] + s->size > len) {
+        if (with_bytes && grow(&bytes, &len, &cap, (size_t)(addr[i] + s->size))) { free(bytes); return -1; }
+        len = (size_t)(addr[i] + s->size);
+      }
+      continue;
+    }
+    uint64_t align = s->align > CUDA_SECTION_ALIGN ? s->align : CUDA_SECTION_ALIGN;
+    size_t pad = (size_t)((align - len % align) % align);
+    if (with_bytes && grow(&bytes, &len, &cap, len + pad + s->size)) { free(bytes); return -1; }
+    len += pad;
+    addr[i] = len;
     len += s->size;
   }
   *bytes_out = bytes;
@@ -261,9 +291,8 @@ void tinynv_image_free(tinynv_image_t *im) {
 // address every relocation against the same symbol was written with.
 //
 // Refused, each by name: a name no symbol table carries; a symbol that is not an object (a kernel's name, say); and an
-// object in a section this loader does not lay out - `.nv.global` is SHT_NOBITS (zero-initialised __device__ data) and
-// place() lays out only SHT_PROGBITS, so there is no truthful address to give for it.
-#define SHT_NOBITS 8
+// object in a section that is not part of the loadable block. Zero-initialised `.nv.global` (SHT_NOBITS) IS part of it:
+// place() appends it as zeroes after the PROGBITS sections.
 int tinynv_cubin_global(const tinynv_cubin_t *c, const char *name, uint64_t *image_off, uint64_t *size) {
   if (!c->sections || !name) return tinynv_fail("cubin: no section table, or no name to look for");
   for (int i = 0; i < c->nsections; i++) {
@@ -281,10 +310,7 @@ int tinynv_cubin_global(const tinynv_cubin_t *c, const char *name, uint64_t *ima
       if (!shndx || shndx >= (uint16_t)c->nsections)
         return tinynv_fail("cubin: '%s' is not defined in this module (section index %u)", name, shndx);
       const tinynv_section_t *s = &c->sections[shndx];
-      if (s->type == SHT_NOBITS)
-        return tinynv_fail("cubin: '%s' lives in %s, which is zero-initialised (SHT_NOBITS) and not laid out by this loader, "
-                           "so there is no truthful address for it", name, s->sname);
-      if (s->type != SHT_PROGBITS)
+      if (s->type != SHT_PROGBITS && s->type != SHT_NOBITS)
         return tinynv_fail("cubin: '%s' lives in %s, a section of type %u that is not part of the loadable image", name,
                            s->sname, s->type);
       if (value + sz > s->size)

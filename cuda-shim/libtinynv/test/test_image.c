@@ -97,14 +97,32 @@ int main(int argc, char **argv) {
         if (tinynv_cubin_image(&cb, name, 1, &im)) { CHECK(0, "%s: %s", name, tinynv_last_error()); continue; }
         have_image = 1;
       }
-      CHECK(im.len == (size_t)num_after(line, "len="), "the image is %zu bytes, the oracle built %ld", im.len,
-            num_after(line, "len="));
+      // THE ORACLE LAYS OUT SHT_PROGBITS ONLY, AND THIS LOADER NOW DOES NOT, DELIBERATELY. Zero-initialised `.nv.global`
+      // (SHT_NOBITS) used to be placed nowhere - here and in the oracle alike - so relocations against it resolved into
+      // another section's bytes (image.c place()). It is now appended as zeroes after every PROGBITS section. So the
+      // comparison is: the first `len=` bytes are the oracle's image byte for byte (the hash), and what follows is
+      // exactly the NOBITS sections at their alignment - a length worked out here from the section table, not read back
+      // from the loader - and nothing but zeroes.
+      size_t olen = (size_t)num_after(line, "len="), want_len = olen;
+      for (int i = 0; i < cb.nsections; i++) {
+        const tinynv_section_t *z = &cb.sections[i];
+        if (z->type != 8 /* SHT_NOBITS */ || !z->size || z->addr) continue;
+        uint64_t al = z->align > 128 ? z->align : 128;
+        want_len += (size_t)((al - want_len % al) % al) + (size_t)z->size;
+      }
+      CHECK(im.len == want_len, "the image is %zu bytes; the oracle built %zu and the NOBITS tail adds %zu", im.len, olen,
+            want_len - olen);
       uint8_t digest[32];
       char hex[65];
-      tinynv_sha256(im.bytes, im.len, digest);
+      tinynv_sha256(im.bytes, im.len < olen ? im.len : olen, digest);
       tinynv_sha256_hex(digest, hex);
       const char *want = strstr(line, "sha256=");
-      CHECK(want && !strcmp(hex, want + 7), "the image hashes to %s, the oracle's to %s", hex, want ? want + 7 : "?");
+      CHECK(want && !strcmp(hex, want + 7), "the image's first %zu bytes hash to %s, the oracle's image to %s", olen, hex,
+            want ? want + 7 : "?");
+      size_t nonzero = 0;
+      for (size_t b = olen; b < im.len; b++) nonzero += im.bytes[b] != 0;
+      CHECK(nonzero == 0, "%zu of the %zu bytes past the oracle's image are not zero", nonzero, im.len - olen);
+      if (im.len > olen) printf("  the oracle's %zu bytes match; %zu bytes of zeroed .nv.global follow\n", olen, im.len - olen);
       continue;
     }
 
