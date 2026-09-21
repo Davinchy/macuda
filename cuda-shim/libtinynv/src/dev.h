@@ -18,6 +18,8 @@ typedef struct {
   // What the card's config space said while it was known good, so the driver can put it back if it is cleared under a
   // running firmware. Taken on a live card only: reading these is six operations the recorded boot never made.
   int cfg_saved;
+  unsigned windows_restored; // how many times this open found its configuration cleared and put it back
+  double windows_restored_at; // when the last of those was, so a wait can give up sooner than its full timeout
   uint32_t cfg_cmd, cfg_bars[6];
   int large_bar;        // the whole of video memory is cpu visible
   uint64_t vram_size;
@@ -31,5 +33,8 @@ void tinynv_wr32(tinynv_dev_t *d, uint64_t off, uint32_t v);
 int tinynv_wait_reg(tinynv_dev_t *d, uint64_t off, uint32_t mask, uint32_t want, int timeout_ms, const char *what);
 // Put the address windows and the command register back if they have been cleared under us. Returns 1 if it had to.
 int tinynv_dev_restore_decode(tinynv_dev_t *d);
+// Reset the function through the backend and bring it back cold: configuration restored from the snapshot taken at
+// open, boot firmware waited for, write-protected region confirmed down. What a boot that did not finish is undone with.
+int tinynv_dev_reset_cold(tinynv_dev_t *d);
 
 #endif

@@ -253,10 +253,42 @@ int tinynv_dev_restore_decode(tinynv_dev_t *d) {
   int back = 1;
   for (int i = 0; i < 6; i++) back &= pci->cfg_read(pci, 0x10 + 4 * i, 4) == d->cfg_bars[i];
   uint32_t now = pci->cfg_read(pci, PCI_COMMAND, 2);
+  d->windows_restored++;
+  d->windows_restored_at = tinynv_now_s();
   fprintf(stderr, "tinynv: the card had lost its windows under a running firmware (command %#06x, first base address "
                   "%#x); written back from what it reported when it was opened - command %#06x, %s\n",
           cmd, d->cfg_bars[0], now, back ? "all six base address registers read back correctly" : "THEY DID NOT TAKE");
   return 1;
+}
+
+int tinynv_dev_reset_cold(tinynv_dev_t *d) {
+  tinynv_pci_t *pci = d->pci;
+  if (!d->cfg_saved) return tinynv_fail("no configuration snapshot to put back after a reset");
+  uint32_t vd = pci->cfg_read(pci, 0x00, 4);
+  if (vd == 0xffffffffu || vd == 0) return tinynv_fail("the card does not answer in config space (%#x): a reset cannot reach it", vd);
+  uint32_t cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
+  cfg_write_flush(d, PCI_COMMAND, cmd & ~PCI_COMMAND_MASTER, 2);
+  double t0 = tinynv_now_s();
+  if (pci->reset(pci)) return -1;
+  uint32_t now = 0xffffffff;
+  double deadline = tinynv_now_s() + 10.0;
+  while ((now = pci->cfg_read(pci, 0x00, 4)) != vd && tinynv_now_s() < deadline) sleep_ms(10);
+  if (now != vd) return tinynv_fail("the card did not come back from its reset in 10 s: vendor/device reads %#x, was %#x", now, vd);
+  // the snapshot from the open, not from now: a reset clears the base address registers and this is the one copy
+  for (int i = 0; i < 6; i++) pci->cfg_write(pci, 0x10 + 4 * i, 4, d->cfg_bars[i]);
+  cfg_write_flush(d, PCI_COMMAND, d->cfg_cmd | PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY, 2);
+  uint32_t id = tinynv_rd32(d, NV_PMC_BOOT_0);
+  if (id == 0xffffffffu || id == 0) return tinynv_fail("after the reset the chip id reads %#x: the windows did not come back", id);
+  if (d->fmc_boot ? tinynv_wait_reg(d, NV_THERM_I2CS_SCRATCH, 0xffffffff, 0xff, 10000, "waiting for the boot firmware after the reset")
+                  : wait_gfw_ampere(d, 10000)) return -1;
+  uint32_t wpr2 = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+  if (wpr2 && wpr2 != 0xffffffffu)
+    return tinynv_fail("the reset left the write-protected region up (hi %#x): the card is not cold", wpr2);
+  d->wpr2_hi_now = 0;
+  d->wpr2_was_up = 1;
+  fprintf(stderr, "tinynv: the card was reset and is cold again %.2f s later: configuration put back, boot firmware done, region down\n",
+          tinynv_now_s() - t0);
+  return 0;
 }
 
 int tinynv_dev_mmu_init(tinynv_dev_t *d) {

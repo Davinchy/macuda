@@ -439,9 +439,17 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
       init_wait_report(g, tinynv_now_s() - start);
       next_report += 5.0;
     }
+    // A firmware whose windows went and came back either answers within a few seconds of the restore (it had finished
+    // and was only waiting for somewhere to write) or it never will (it was mid-init and read zeroed configuration).
+    // Ten seconds separates those; the rest of a sixty second wait only delays the retry that cures the second case.
+    if (report && g->dev.windows_restored && tinynv_now_s() - g->dev.windows_restored_at > 10.0) {
+      fprintf(stderr, "tinynv: ten seconds after the windows were put back there is still no start-up notice: giving this boot up\n");
+      break;
+    }
   } while (tinynv_now_s() < deadline);
   // Whatever arrives now belongs to a request nobody is waiting for any more.
   g->gsp.rpc_desync = 1;
+  if (want == TINYNV_MSG_EVENT_GSP_INIT_DONE) g->gsp.init_timed_out = 1;
   // A timeout on the start-up notice is the one this driver keeps hitting on a live 3060, so say enough to tell a silent
   // death apart from a message we failed to recognise. If GSP-RM's write pointer sits exactly where our read pointer is,
   // it stopped talking after the register sequence (a hung or browned-out core); if it moved past us, it sent something

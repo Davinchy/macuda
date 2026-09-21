@@ -196,6 +196,7 @@ typedef struct {
   tinynv_rpcq_t cmd_q, stat_q;
   int err_state;      // gsp-rm reported an error or a fault; the boot is no longer trustworthy
   int up;             // gsp-rm sent its start-up notice and has not been told to go: there is something to unload
+  int init_timed_out; // the wait for the start-up notice ran out, which is the one failure a fresh boot may cure
   // What it actually said, kept so a wait that times out can name it. "gsp-rm reported a fault" with nothing else is
   // the least useful true sentence a driver can print: an MMU fault means a bad address and an error log means the
   // firmware is complaining about something it was asked to do, and those lead opposite ways.

@@ -245,7 +245,7 @@ static int device_boot(tinynv_device_t d) {
   catch_the_ways_out();
 #define BOOT_STAGE(call) do { if (call) { d->boot_failed = 1; snprintf(d->boot_error, sizeof d->boot_error, "%s", tinynv_last_error()); \
     return tinynv_fail("%s", d->boot_error); } } while (0)
-  BOOT_STAGE(tinynv_gpu_init_sw(&d->gpu) || tinynv_gpu_init_hw(&d->gpu));
+  BOOT_STAGE(tinynv_gpu_boot_firmware(&d->gpu));
   BOOT_STAGE(tinynv_gsp_init_objects(&d->gpu) || tinynv_gsp_init_channel(&d->gpu) || tinynv_gsp_init_gr_context(&d->gpu) ||
              tinynv_gsp_open_client(&d->gpu) || tinynv_gsp_init_queues(&d->gpu));
   // Does the memory manager stop below what the firmware owns? The firmware has placed its write-protected region by

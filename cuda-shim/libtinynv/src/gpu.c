@@ -29,6 +29,49 @@ int tinynv_gpu_init_hw(tinynv_gpu_t *g) {
   return tinynv_gsp_init_hw(g);
 }
 
+// A boot that did not finish, undone far enough to be made again. GSP-RM is not asked to leave - it is the thing that
+// never answered - so this is the falcon half of the unload alone: the images staged into the boot's own slots, the
+// GSP falcon reset out from under whatever is on it, FWSEC-SB, booter_unload, the region register read back as zero.
+// Then every host-side structure the firmware was handed is freed and rebuilt, because a firmware that half-started
+// may have written into its queues and argument blocks, and a second boot has to begin from what the first began from.
+static int unmake_boot(tinynv_gpu_t *g) {
+  // Not the unload's falcon half: on a card that has just lost and regained its configuration SEC2 would not run
+  // booter_unload (it sat "stopped", 2026-09-21), and a firmware that never answered cannot be asked to leave. The
+  // reset through the backend is what the quiesce does after every failed boot, and every boot after one of those came
+  // up cold today, so it is what a retry is made of.
+  if (tinynv_dev_reset_cold(&g->dev)) return -1;
+  tinynv_gsp_fini(g);
+  tinynv_flcn_fini(g);
+  memset(&g->gsp, 0, sizeof(g->gsp));
+  memset(&g->flcn, 0, sizeof(g->flcn));
+  g->flcn.gpu = g;
+  g->gsp.gpu = g;
+  return 0;
+}
+
+int tinynv_gpu_boot_firmware(tinynv_gpu_t *g) {
+  // Three, because on the 3060 that loses its configuration under a booting firmware (2026-09-21) the loss is a
+  // per-boot event: the boot after a lost one usually comes up. A retry is cheap - five seconds - against the
+  // alternative, which is a process that reports a failed boot and a person who power-cycles the enclosure.
+  const int attempts = g->dev.pci->live && !g->dev.fmc_boot ? 3 : 1;
+  for (int attempt = 1;; attempt++) {
+    if (tinynv_gpu_init_sw(g)) return -1;
+    if (!tinynv_gpu_init_hw(g)) {
+      if (attempt > 1) fprintf(stderr, "tinynv: the firmware came up on boot attempt %d\n", attempt);
+      return 0;
+    }
+    if (attempt >= attempts || !g->gsp.init_timed_out) return -1;
+    char why[512];
+    snprintf(why, sizeof why, "%s", tinynv_last_error());
+    fprintf(stderr, "tinynv: boot attempt %d did not finish (%s)%s; tearing the firmware down and booting again\n",
+            attempt, why, g->dev.windows_restored ? " - the card's configuration had been cleared under it" : "");
+    if (unmake_boot(g)) {
+      fprintf(stderr, "tinynv: could not undo the failed boot (%s), so there will be no second attempt\n", tinynv_last_error());
+      return tinynv_fail("%s", why);
+    }
+  }
+}
+
 // Why the card is unloaded rather than left "idle warm" with the firmware resident, which is what this did until
 // 2026-09-17: a resident firmware makes the next open reset the card first, and on a 3060 over thunderbolt that reset
 // path produced a GSP-RM that came up, ran its register sequence and never sent its start-up notice - every second
