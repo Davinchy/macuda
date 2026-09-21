@@ -412,7 +412,8 @@ static void init_wait_report(tinynv_gpu_t *g, double elapsed) {
 
 static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char *what, uint8_t **reply, uint32_t *reply_len) {
   double start = tinynv_now_s(), deadline = start + timeout_s, next_report = start + 5.0;
-  int seen = 0;
+  int seen = 0, gave_up = 0;
+  const unsigned restored_before = g->dev.windows_restored;   // only a restore made during THIS wait counts below
   int report = want == TINYNV_MSG_EVENT_GSP_INIT_DONE && g->dev.pci->live;
   if (reply) { *reply = NULL; *reply_len = 0; }
   // The configuration is looked at every quarter second, not every five: when it goes, knowing WHEN it went - how long
@@ -442,8 +443,9 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
     // A firmware whose windows went and came back either answers within a few seconds of the restore (it had finished
     // and was only waiting for somewhere to write) or it never will (it was mid-init and read zeroed configuration).
     // Ten seconds separates those; the rest of a sixty second wait only delays the retry that cures the second case.
-    if (report && g->dev.windows_restored && tinynv_now_s() - g->dev.windows_restored_at > 10.0) {
+    if (report && g->dev.windows_restored > restored_before && tinynv_now_s() - g->dev.windows_restored_at > 10.0) {
       fprintf(stderr, "tinynv: ten seconds after the windows were put back there is still no start-up notice: giving this boot up\n");
+      gave_up = 1;
       break;
     }
   } while (tinynv_now_s() < deadline);
@@ -464,6 +466,9 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
                                "message this driver mishandled" : "gsp-rm sent more than this driver consumed",
             gsp->cpu_seq_requests, gsp->err_state ? "HAS" : "has not");
   }
+  if (gave_up)
+    return tinynv_fail("gsp-rm never sent %s (message %u): its configuration was cleared under it %.1f s into the boot and "
+                       "ten seconds after it was put back there was still nothing", what, want, g->dev.windows_restored_at - start);
   return tinynv_fail("gsp-rm never sent %s (message %u) in %.0f s", what, want, timeout_s);
 }
 
