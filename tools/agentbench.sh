@@ -24,15 +24,15 @@ mkdir -p "$(dirname "$out")"
 } > "$out.env.txt"
 # The link the card is on BEFORE the run is not the link the run is made on: the firmware idles the link down to Gen1
 # after every unload and brings it to the driver's cap (Gen3 on this enclosure) a few seconds into the next boot. So
-# the link is sampled from the host every 5 s while llama-bench runs, and the width and speed the run settled on -
-# the last sample - are what the report reads as pcie_link_width / pcie_link_speed, with every distinct sample listed.
+# the link is sampled from the host every 5 s while llama-bench runs, and the width and speed the run was made on -
+# the most common sample; the first can precede the retrain and the last can follow the unload - are what the report reads as pcie_link_width / pcie_link_speed, with every distinct sample listed.
 link_samples="$out.link.txt"; : > "$link_samples"
 ( while :; do sleep 5; system_profiler SPPCIDataType 2>/dev/null | awk '/Vendor ID: 0x10de/{nv=1} nv&&/Link Width/{w=$3} nv&&/Link Speed/{print w, $3, $4; exit}' >> "$link_samples"; done ) & sampler=$!
 # one llama-bench invocation: the tool crosses -p/-n with every -d and adds the -pg rows
 "$bin" -m "$model" -ngl "${NGL:-99}" -fa 1 -p 2048 -n 256 -d "$depths" -pg 16384,512 -r 5 -o json ${BENCH_ARGS:-} > "$out"
 kill $sampler 2>/dev/null; wait $sampler 2>/dev/null || true
 if [ -s "$link_samples" ]; then
-  { echo "pcie_link_width=$(tail -1 "$link_samples" | awk '{print $1}')"; echo "pcie_link_speed=$(tail -1 "$link_samples" | awk '{print $2" "$3}')"
+  { echo "pcie_link_width=$(sort "$link_samples" | uniq -c | sort -rn | head -1 | awk '{print $2}')"; echo "pcie_link_speed=$(sort "$link_samples" | uniq -c | sort -rn | head -1 | awk '{print $3" "$4}')"
     echo "pcie_link_seen=$(sort "$link_samples" | uniq -c | awk '{printf "%s%s at %s %s (%d samples)", (NR>1?"; ":""), $2, $3, $4, $1}')"; } >> "$out.env.txt"
 fi
 rm -f "$link_samples"

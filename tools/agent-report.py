@@ -10,7 +10,7 @@ repetition spread over 5% of the mean, a replay turn that reprocessed its whole 
 slower than 8 GT/s during the run (what a Thunderbolt enclosure holds), a link that changed during the run, and any
 throttle reason the driver's sensors published.
 """
-import argparse, json, os, sys
+import argparse, json, os, re, sys
 
 def label_of(r):
     if r["n_gen"] == 0: return f"pp{r['n_prompt']}"
@@ -44,6 +44,12 @@ def replay_table(rep):
         if t["cache_miss"] and t["turn"] > 1: anomalies.append(f"turn {t['turn']}: cache reuse failed, {t['processed']} of {t['prompt_tokens']} tokens reprocessed")
     out.append(f"| **total** | | | | | | | **{rep['total_s']:.1f}** | |")
     return out, anomalies
+
+def link_moved(seen):
+    """the link changed during the run: some state other than the commonest holds more than a tenth of the samples (one
+    sample before the firmware's retrain, or one after the unload, is the sampler's timing and not the run's)"""
+    counts = [int(m) for m in re.findall(r"\((\d+) samples?\)", seen or "")]
+    return len(counts) > 1 and sum(counts) - max(counts) > sum(counts) / 10
 
 def pct(a, b):  # b relative to a
     return (b - a) / a * 100 if a else float("nan")
@@ -81,7 +87,7 @@ def main():
             try: rg = float(rs.split()[0]) if rs else None
             except ValueError: rg = None
             if rg is not None and rg < 8.0: c["anomalies"].append(f"replay ran on a PCIe link at {rs} - not the 8 GT/s the enclosure holds")
-            if ";" in re_.get("pcie_link_seen", ""): c["anomalies"].append(f"the link changed during the replay: {re_['pcie_link_seen']}")
+            if link_moved(re_.get("pcie_link_seen", "")): c["anomalies"].append(f"the link changed during the replay: {re_['pcie_link_seen']}")
         md += [""]
     # differences, b relative to a, matched by (label, depth)
     A, B = cfgs
@@ -103,9 +109,8 @@ def main():
         except ValueError: gts = None
         if w and w != "x4" or gts is not None and gts < 8.0:
             md.append(f"- {c['label']}: PCIe link {w} at {s} during the run - not the x4 at 8 GT/s the enclosure holds"); any_flag = True
-        seen = c["env"].get("pcie_link_seen", "")
-        if seen and ";" in seen:
-            md.append(f"- {c['label']}: the link changed during the run: {seen}"); any_flag = True
+        if link_moved(c["env"].get("pcie_link_seen", "")):
+            md.append(f"- {c['label']}: the link changed during the run: {c['env']['pcie_link_seen']}"); any_flag = True
     if not any_flag: md.append("- none")
     text = "\n".join(md)
     print(text)

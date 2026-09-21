@@ -26,7 +26,7 @@ python3 "$R/tools/agent-replay.py" --url "http://127.0.0.1:$port" --label "$labe
 kill $sampler 2>/dev/null; wait $sampler 2>/dev/null || true
 { echo "label=$label"; echo "date=$(date -Iseconds)"; echo "model=$model"; echo "binary=$bin"; echo "ctx=$ctx"; echo "server_up_s=$i"
   if [ -s "$link_samples" ]; then
-    echo "pcie_link_width=$(tail -1 "$link_samples" | awk '{print $1}')"; echo "pcie_link_speed=$(tail -1 "$link_samples" | awk '{print $2" "$3}')"
+    echo "pcie_link_width=$(sort "$link_samples" | uniq -c | sort -rn | head -1 | awk '{print $2}')"; echo "pcie_link_speed=$(sort "$link_samples" | uniq -c | sort -rn | head -1 | awk '{print $3" "$4}')"
     echo "pcie_link_seen=$(sort "$link_samples" | uniq -c | awk '{printf "%s%s at %s %s (%d samples)", (NR>1?"; ":""), $2, $3, $4, $1}')"
   fi; } > "$out.env.txt"
 rm -f "$link_samples"

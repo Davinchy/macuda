@@ -110,9 +110,9 @@
 
   <section id="sagent">
     <h2>A coding agent's day: prompt depth and cache reuse</h2>
-    <p class="sub">Qwen2.5-7B Q4_K_M, all weights on both GPUs, flash attention on. llama-bench at the depths an agent actually runs at, five repetitions each, and a ten-turn replay against llama-server: an 8k-token opening turn, then 2k tokens of tool output and 400 tokens back per turn, the whole transcript resent every time. The 3060's link was at Gen1 for these runs, a fifth of its enumerated speed.</p>
+    <p class="sub">Qwen2.5-7B Q4_K_M, all weights on both GPUs, flash attention on. llama-bench at the depths an agent actually runs at, five repetitions each, and a ten-turn replay against llama-server: an 8k-token opening turn, then 2k tokens of tool output and 400 tokens back per turn, the whole transcript resent every time. The 3060's link was x4 at 8 GT/s for these runs, the Gen3 link this Thunderbolt enclosure holds, sampled from the host every five seconds and constant through both.</p>
     <div class="charts" data-group="agent"></div>
-    <p class="sub" style="margin-top:14px">Replay, ten turns to 32k tokens of context: the cache was reused on every turn on both sides (about 2,150 tokens processed per turn against 12k to 32k sent). Total wall time <strong>112.6 s on the 3060, 201.2 s on Metal</strong>. Time to first token on the last turn: 2.5 s on the 3060, 13.2 s on Metal. The full per-turn tables are in <code>docs/bench/agent-benchmark-20260921.md</code>.</p>
+    <p class="sub" style="margin-top:14px">Replay, ten turns to 32k tokens of context: the cache was reused on every turn on both sides (about 2,150 tokens processed per turn against 12k to 32k sent). Total wall time <strong>95.8 s on the 3060, 201.2 s on Metal</strong>. Time to first token on the last turn: 2.3 s on the 3060, 13.2 s on Metal. The same card on a Gen1 link earlier in the day took 112.6 s. The full per-turn tables are in <code>docs/bench/agent-benchmark-20260921.md</code>.</p>
   </section>
 
   <section id="ssd">
@@ -178,18 +178,18 @@
         run: { card: "macuda-main/logs/shim-bench-20260921-144723.log", metal: "logs/metal-bench-gemma-4-12b-it-qat-q4_0-20260921-140249.log" }, foot: "tg128, three repetitions" }
     ],
     "agent": [
-      { key: "pp0", title: "Prompt processing, 2048 tokens at depth 0", unit: "tokens/s", better: "higher", card: 2078.5, metal: 819.9, err: { card: 2.2, metal: 0.9 },
-        run: { card: "logs/agentbench-3060.json", metal: "logs/agentbench-metal.json" }, foot: "five repetitions" },
-      { key: "pp64", title: "Prompt processing, 2048 tokens at depth 65,536", unit: "tokens/s", better: "higher", card: 527.6, metal: 142.5, err: { card: 1.4, metal: 2.8 },
-        run: { card: "logs/agentbench-3060.json", metal: "logs/agentbench-metal.json" }, foot: "the 3060 holds 64k of context and the weights in 12 GB" },
-      { key: "tg0", title: "Generation, 256 tokens at depth 0", unit: "tokens/s", better: "higher", card: 63.0, metal: 69.1, err: { card: 0.1, metal: 1.6 },
-        run: { card: "logs/agentbench-3060.json", metal: "logs/agentbench-metal.json" }, foot: "" },
-      { key: "tg64", title: "Generation, 256 tokens at depth 65,536", unit: "tokens/s", better: "higher", card: 32.6, metal: 21.9, err: { card: 0.9, metal: 0.6 },
-        run: { card: "logs/agentbench-3060.json", metal: "logs/agentbench-metal.json" }, foot: "" },
-      { key: "replay", title: "Ten-turn replay, total wall time", unit: "seconds", better: "lower", card: 112.6, metal: 201.2, err: null,
-        run: { card: "logs/replay-3060-20260921-144424.json", metal: "logs/replay-metal-20260921-142031.json" }, foot: "the headline number: what the agent waits for" },
-      { key: "ttft", title: "Time to first token, turn 10 at 32k", unit: "seconds", better: "lower", card: 2.53, metal: 13.17, err: null,
-        run: { card: "logs/replay-3060-20260921-144424.json", metal: "logs/replay-metal-20260921-142031.json" }, foot: "about 2,165 new tokens on top of 30k cached" }
+      { key: "pp0", title: "Prompt processing, 2048 tokens at depth 0", unit: "tokens/s", better: "higher", card: 2165.3, metal: 819.9, err: { card: 3.0, metal: 0.9 },
+        run: { card: "logs/agentbench-3060-gen3.json", metal: "logs/agentbench-metal.json" }, foot: "five repetitions" },
+      { key: "pp64", title: "Prompt processing, 2048 tokens at depth 65,536", unit: "tokens/s", better: "higher", card: 572.9, metal: 142.5, err: { card: 0.6, metal: 2.8 },
+        run: { card: "logs/agentbench-3060-gen3.json", metal: "logs/agentbench-metal.json" }, foot: "the 3060 holds 64k of context and the weights in 12 GB" },
+      { key: "tg0", title: "Generation, 256 tokens at depth 0", unit: "tokens/s", better: "higher", card: 66.7, metal: 69.1, err: { card: 0.1, metal: 1.6 },
+        run: { card: "logs/agentbench-3060-gen3.json", metal: "logs/agentbench-metal.json" }, foot: "" },
+      { key: "tg64", title: "Generation, 256 tokens at depth 65,536", unit: "tokens/s", better: "higher", card: 38.2, metal: 21.9, err: { card: 0.1, metal: 0.6 },
+        run: { card: "logs/agentbench-3060-gen3.json", metal: "logs/agentbench-metal.json" }, foot: "" },
+      { key: "replay", title: "Ten-turn replay, total wall time", unit: "seconds", better: "lower", card: 95.8, metal: 201.2, err: null,
+        run: { card: "logs/replay-3060-20260921-154251.json", metal: "logs/replay-metal-20260921-142031.json" }, foot: "the headline number: what the agent waits for" },
+      { key: "ttft", title: "Time to first token, turn 10 at 32k", unit: "seconds", better: "lower", card: 2.34, metal: 13.17, err: null,
+        run: { card: "logs/replay-3060-20260921-154251.json", metal: "logs/replay-metal-20260921-142031.json" }, foot: "about 2,165 new tokens on top of 30k cached" }
     ],
     "sd": [
       { key: "img", title: "One image, start to finish", unit: "seconds", better: "lower", card: 5.51, metal: 6.50, err: null,
