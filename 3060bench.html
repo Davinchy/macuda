@@ -71,7 +71,7 @@
   <header>
     <div class="eyebrow">macuda · Apple M3 Max, 48 GB · macOS 27.0 · 2026-09-21</div>
     <h1>An RTX 3060 over Thunderbolt, against the M3 Max's own GPU</h1>
-    <p class="lede">The same four models on the same Mac, twice. Once on a 12 GB RTX 3060 in a Razer Core X V2, driven by macuda's own userspace driver with no NVIDIA software on the machine. Once on the M3 Max through Apple Metal.</p>
+    <p class="lede">Six models and a coding agent's workload on the same Mac, twice. Once on a 12 GB RTX 3060 in a Razer Core X V2, driven by macuda's own userspace driver with no NVIDIA software on the machine. Once on the M3 Max through Apple Metal.</p>
     <div class="legend">
       <span><i class="sw card"></i>RTX 3060, macuda (sm_86, cubins built by nvcc in a container)</span>
       <span><i class="sw metal"></i>M3 Max, Metal (llama.cpp and stable-diffusion.cpp Metal backends)</span>
@@ -94,6 +94,25 @@
     <h2>Qwen3.5-35B-A3B, Q4_K_M</h2>
     <p class="sub">A mixture of experts: 20.5 GiB of weights, 256 experts per layer, 8 used per token, about 3B parameters active. The M3 Max holds all of it. The 3060 holds the attention and the experts of 13 of its 40 layers; the other 27 layers' experts run on the CPU (<code>-ncmoe 27</code>).</p>
     <div class="charts" data-group="moe"></div>
+  </section>
+
+  <section id="slfm">
+    <h2>LFM2.5-8B-A1B, Q8_0</h2>
+    <p class="sub">Liquid's small mixture of experts: 8.4 GiB at 8 bits, 32 experts per layer, 4 used, about 1B parameters active. All of it on both GPUs.</p>
+    <div class="charts" data-group="lfm"></div>
+  </section>
+
+  <section id="sgemma">
+    <h2>Gemma 4 12B, Google's QAT Q4_0</h2>
+    <p class="sub">A dense 12B trained to be quantized: 6.5 GiB at 4 bits with quality close to the full model. All of it on both GPUs, with room to spare on the 3060.</p>
+    <div class="charts" data-group="gemma"></div>
+  </section>
+
+  <section id="sagent">
+    <h2>A coding agent's day: prompt depth and cache reuse</h2>
+    <p class="sub">Qwen2.5-7B Q4_K_M, all weights on both GPUs, flash attention on. llama-bench at the depths an agent actually runs at, five repetitions each, and a ten-turn replay against llama-server: an 8k-token opening turn, then 2k tokens of tool output and 400 tokens back per turn, the whole transcript resent every time. The 3060's link was at Gen1 for these runs, a fifth of its enumerated speed.</p>
+    <div class="charts" data-group="agent"></div>
+    <p class="sub" style="margin-top:14px">Replay, ten turns to 32k tokens of context: the cache was reused on every turn on both sides (about 2,150 tokens processed per turn against 12k to 32k sent). Total wall time <strong>112.6 s on the 3060, 201.2 s on Metal</strong>. Time to first token on the last turn: 2.5 s on the 3060, 13.2 s on Metal. The full per-turn tables are in <code>docs/bench/agent-benchmark-20260921.md</code>.</p>
   </section>
 
   <section id="ssd">
@@ -145,6 +164,32 @@
         run: { card: "macuda-main/logs/shim-bench-20260921-131107.log", metal: "logs/metal-bench-moe-20260921-113726.log" }, foot: "pp256. 3060: experts of 13 of 40 layers on the card, link at 2.5 GT/s that run" },
       { key: "tg", title: "Text generation", unit: "tokens/s", better: "higher", card: 37.06, metal: 66.77, err: { card: 1.75, metal: 0.12 },
         run: { card: "macuda-main/logs/shim-bench-20260921-131107.log", metal: "logs/metal-bench-moe-20260921-113726.log" }, foot: "tg128. The CPU-side experts bound the card's number" }
+    ],
+    "lfm": [
+      { key: "pp", title: "Prompt processing", unit: "tokens/s", better: "higher", card: 3242.28, metal: 2669.70, err: { card: 40.87, metal: 20.35 },
+        run: { card: "macuda-main/logs/shim-bench-20260921-144641.log", metal: "logs/metal-bench-LFM2.5-8B-A1B-Q8_0-20260921-140249.log" }, foot: "pp256, three repetitions" },
+      { key: "tg", title: "Text generation", unit: "tokens/s", better: "higher", card: 126.78, metal: 125.95, err: { card: 0.09, metal: 3.52 },
+        run: { card: "macuda-main/logs/shim-bench-20260921-144641.log", metal: "logs/metal-bench-LFM2.5-8B-A1B-Q8_0-20260921-140249.log" }, foot: "tg128, three repetitions" }
+    ],
+    "gemma": [
+      { key: "pp", title: "Prompt processing", unit: "tokens/s", better: "higher", card: 1225.81, metal: 457.70, err: { card: 2.86, metal: 32.15 },
+        run: { card: "macuda-main/logs/shim-bench-20260921-144723.log", metal: "logs/metal-bench-gemma-4-12b-it-qat-q4_0-20260921-140249.log" }, foot: "pp256, three repetitions" },
+      { key: "tg", title: "Text generation", unit: "tokens/s", better: "higher", card: 38.94, metal: 37.84, err: { card: 0.02, metal: 0.52 },
+        run: { card: "macuda-main/logs/shim-bench-20260921-144723.log", metal: "logs/metal-bench-gemma-4-12b-it-qat-q4_0-20260921-140249.log" }, foot: "tg128, three repetitions" }
+    ],
+    "agent": [
+      { key: "pp0", title: "Prompt processing, 2048 tokens at depth 0", unit: "tokens/s", better: "higher", card: 2078.5, metal: 819.9, err: { card: 2.2, metal: 0.9 },
+        run: { card: "logs/agentbench-3060.json", metal: "logs/agentbench-metal.json" }, foot: "five repetitions" },
+      { key: "pp64", title: "Prompt processing, 2048 tokens at depth 65,536", unit: "tokens/s", better: "higher", card: 527.6, metal: 142.5, err: { card: 1.4, metal: 2.8 },
+        run: { card: "logs/agentbench-3060.json", metal: "logs/agentbench-metal.json" }, foot: "the 3060 holds 64k of context and the weights in 12 GB" },
+      { key: "tg0", title: "Generation, 256 tokens at depth 0", unit: "tokens/s", better: "higher", card: 63.0, metal: 69.1, err: { card: 0.1, metal: 1.6 },
+        run: { card: "logs/agentbench-3060.json", metal: "logs/agentbench-metal.json" }, foot: "" },
+      { key: "tg64", title: "Generation, 256 tokens at depth 65,536", unit: "tokens/s", better: "higher", card: 32.6, metal: 21.9, err: { card: 0.9, metal: 0.6 },
+        run: { card: "logs/agentbench-3060.json", metal: "logs/agentbench-metal.json" }, foot: "" },
+      { key: "replay", title: "Ten-turn replay, total wall time", unit: "seconds", better: "lower", card: 112.6, metal: 201.2, err: null,
+        run: { card: "logs/replay-3060-20260921-144424.json", metal: "logs/replay-metal-20260921-142031.json" }, foot: "the headline number: what the agent waits for" },
+      { key: "ttft", title: "Time to first token, turn 10 at 32k", unit: "seconds", better: "lower", card: 2.53, metal: 13.17, err: null,
+        run: { card: "logs/replay-3060-20260921-144424.json", metal: "logs/replay-metal-20260921-142031.json" }, foot: "about 2,165 new tokens on top of 30k cached" }
     ],
     "sd": [
       { key: "img", title: "One image, start to finish", unit: "seconds", better: "lower", card: 5.51, metal: 6.50, err: null,
@@ -230,7 +275,7 @@
     return box;
   }
 
-  var GROUPS = { "7b": "Qwen2.5-7B Q4_K_M", "27b": "Qwen3.8-27B UD Q4_K_M", "moe": "Qwen3.5-35B-A3B Q4_K_M", "sd": "SDXL-Turbo" };
+  var GROUPS = { "7b": "Qwen2.5-7B Q4_K_M", "27b": "Qwen3.8-27B UD Q4_K_M", "moe": "Qwen3.5-35B-A3B Q4_K_M", "lfm": "LFM2.5-8B-A1B Q8_0", "gemma": "Gemma 4 12B QAT Q4_0", "agent": "Coding agent, Qwen2.5-7B", "sd": "SDXL-Turbo" };
   var tbody = document.querySelector("#results tbody");
   Object.keys(RUNS).forEach(function (group) {
     var host = document.querySelector('.charts[data-group="' + group + '"]');

@@ -16,8 +16,9 @@ mkdir -p "$(dirname "$out")"
 {
   echo "label=$label"; echo "date=$(date -Iseconds)"; echo "model=$model"; echo "binary=$bin"
   echo "macos=$(sw_vers -productVersion) $(uname -m)"; echo "depths=$depths"
-  echo "driver_build_id=$(strings "$bin" | grep -xE '[0-9a-f]{7}(-dirty)?' | grep -v -e 59c23bc -e b906d25 | head -1)"
-  system_profiler SPPCIDataType 2>/dev/null | awk '/Vendor ID: 0x10de/{nv=1} nv&&/Link Width|Link Speed/{print "pcie_"tolower($1)"_"tolower($2)"="$3" "$4} nv&&/Link Status/{exit}'
+  # the driver's build id only means something in a binary that carries the driver; the strings of a Metal build have none
+  if strings "$bin" | grep -q 'libtinynv build'; then echo "driver_build_id=$(strings "$bin" | grep -xE '[0-9a-f]{7}(-dirty)?' | grep -v -e 59c23bc -e b906d25 | head -1)"; else echo "driver_build_id=none (not a driver build)"; fi
+  system_profiler SPPCIDataType 2>/dev/null | awk '/Vendor ID: 0x10de/{nv=1} nv&&/Link Width|Link Speed/{k=tolower($1"_"$2); sub(/:$/, "", k); print "pcie_"k"="$3" "$4} nv&&/Link Status/{exit}'
 } > "$out.env.txt"
 # one llama-bench invocation: the tool crosses -p/-n with every -d and adds the -pg rows
 "$bin" -m "$model" -ngl "${NGL:-99}" -fa 1 -p 2048 -n 256 -d "$depths" -pg 16384,512 -r 5 -o json ${BENCH_ARGS:-} > "$out"
