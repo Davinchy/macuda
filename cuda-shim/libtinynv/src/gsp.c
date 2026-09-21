@@ -1737,12 +1737,10 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
   // card's configuration the link read Gen4, on boots that had opened at Gen1 and on boots that sent LOCK_AT_LOAD
   // alike - the firmware retrains the link to its maximum about 1.5 s into init, before any lock applies, and this
   // enclosure clears the endpoint's configuration on that transition. Boots that open at Gen4 never lose, because
-  // there is nothing to retrain to. So: read the generation the link is on now and forbid every generation above it.
-  // On a Gen1 link that is a clean boot on a slow link; on a Gen4 one, a clean boot on a fast link; a re-enumeration
-  // is what moves the card from the first to the second.
+  // there is nothing to retrain to. So, that evening: read the generation the link is on now and forbid every
+  // generation above it. Superseded the same night by the two findings below; auto is now Gen3, always.
   const char *ls = getenv("TINYNV_PCIE_LINK_SPEED");
   if (!ls && g->dev.pci->live && !g->dev.fmc_boot) ls = "auto";
-  char auto_buf[8];
   if (ls && !strcmp(ls, "auto")) {
     unsigned lgen = 0, lw = 0;
     tinynv_dev_link(&g->dev, &lgen, &lw);
@@ -1751,9 +1749,12 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
     // Gen4 and Gen1 the whole time; capped at Gen3 the same card came up first try, three of three, starting from that
     // same Gen4 link. Gen4 is not a speed this enclosure holds, and a Thunderbolt tunnel carries no more than a Gen3 x4
     // link's worth of PCIe in any case, so nothing is given up.
-    if (lgen > 3) lgen = 3;
-    if (lgen >= 1) { snprintf(auto_buf, sizeof auto_buf, "gen%u", lgen); ls = auto_buf; }
-    else ls = "gen3";
+    // AND ALWAYS GEN3, whatever the link is on now (15:20): the link idles down to Gen1 after every unload, and a boot
+    // that asked for Gen3 from that Gen1 link came up first try with the link at 8 GT/s ten seconds in and there for
+    // the rest of the process (sampled from the host every 3 s) - the retrain up to Gen3 is one this enclosure holds,
+    // and the same gate ran in 21 s instead of 37. Only Gen4 was ever the fault. lgen is read for the log line.
+    (void)lgen; (void)lw;
+    ls = "gen3";
   }
   if (ls && *ls && strcmp(ls, "off") && g->dev.pci->live) {
     uint32_t v = 1u << 31;                       // LOCK_AT_LOAD

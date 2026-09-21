@@ -6,8 +6,9 @@
 
 Each config is label:sweep.json:replay.json (the replay may be omitted). The sweep JSON is llama-bench's -o json; the
 environment file written beside it (<sweep>.env.txt) supplies the build id and the PCIe link. Anomalies flagged: a
-repetition spread over 5% of the mean, a replay turn that reprocessed its whole context, a link narrower or slower
-than the widest seen for that config, and any throttle reason the driver's sensors published.
+repetition spread over 5% of the mean, a replay turn that reprocessed its whole context, a link narrower than x4 or
+slower than 8 GT/s during the run (what a Thunderbolt enclosure holds), a link that changed during the run, and any
+throttle reason the driver's sensors published.
 """
 import argparse, json, os, sys
 
@@ -63,7 +64,8 @@ def main():
         md += [f"## {c['label']}", "",
                f"- model: `{os.path.basename(r0['model_filename'])}` ({r0['model_type']}, {r0['model_size']/2**30:.2f} GiB)",
                f"- llama.cpp build: `{r0['build_commit']}` (#{r0['build_number']}), backend {r0['backends']}, ngl {r0['n_gpu_layers']}, flash attention {r0['flash_attn']}, {r0['n_threads']} threads",
-               f"- driver build id: `{e.get('driver_build_id') if e.get('driver_build_id') not in (None, '', 'fffffff') else '-'}`; PCIe link: {e.get('pcie_link_width', '-')} at {e.get('pcie_link_speed', '-')}; {e.get('macos', '')}",
+               f"- driver build id: `{e.get('driver_build_id') if e.get('driver_build_id') not in (None, '', 'fffffff') else '-'}`; PCIe link during the run: {e.get('pcie_link_width', '-')} at {e.get('pcie_link_speed', '-')}"
+               + (f" (before the run: {e['pcie_link_width_before']} at {e['pcie_link_speed_before']})" if e.get('pcie_link_speed_before') else "") + f"; {e.get('macos', '')}",
                f"- date: {e.get('date', '-')}", "", "### Sweep", ""]
         t, an = sweep_table(c["rows"]); md += t; c["anomalies"] = an
         if c["replay"]:
@@ -83,8 +85,15 @@ def main():
     for c in cfgs:
         for x in c["anomalies"]: md.append(f"- {c['label']}: {x}"); any_flag = True
         w = c["env"].get("pcie_link_width", ""); s = c["env"].get("pcie_link_speed", "")
-        if w and w != "x4" or s and s not in ("16.0 GT/s", "32.0 GT/s") and s != "":
-            md.append(f"- {c['label']}: PCIe link {w} at {s} - not the enumerated x4 at 16 GT/s"); any_flag = True
+        # the link a Thunderbolt enclosure holds is x4 at 8 GT/s (Gen3); the driver caps the firmware there, and anything
+        # narrower or slower during the run (a Gen1 link the firmware never brought up, a lane dropped) is an anomaly
+        try: gts = float(s.split()[0]) if s else None
+        except ValueError: gts = None
+        if w and w != "x4" or gts is not None and gts < 8.0:
+            md.append(f"- {c['label']}: PCIe link {w} at {s} during the run - not the x4 at 8 GT/s the enclosure holds"); any_flag = True
+        seen = c["env"].get("pcie_link_seen", "")
+        if seen and ";" in seen:
+            md.append(f"- {c['label']}: the link changed during the run: {seen}"); any_flag = True
     if not any_flag: md.append("- none")
     text = "\n".join(md)
     print(text)
