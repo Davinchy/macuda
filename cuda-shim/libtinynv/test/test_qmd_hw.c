@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
   // carried between the "launch=" line and the blocks that follow it
   tinynv_qmd_t q;
   char pending[512] = {0};
-  uint32_t cbuf0_dwords = 0;
+  uint32_t cbuf0_dwords = 0, const0_bytes = 0, bytes_fixed = 0;
   static uint8_t want[MAXHEX / 2], mine[MAXHEX / 2];
 
   while (fgets(line, sizeof(line), f)) {
@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
                                    .slm_per_thread = slm, .prog_size = (uint32_t)num_after(line, "prog_size="),
                                    .sass_version = sass};
       prog.constbuf_used[0] = 1;
-      prog.constbuf_size[0] = (uint32_t)num_after(line, "const0_size=");
+      prog.constbuf_size[0] = const0_bytes = (uint32_t)num_after(line, "const0_size=");
       memset(&q, 0, sizeof(q));
       CHECK(!tinynv_qmd_program(&q, &prog), "building the program's descriptor failed: %s", tinynv_last_error());
 
@@ -155,6 +155,20 @@ int main(int argc, char **argv) {
 
     if (!strncmp(line, "qmd=", 4)) {
       CHECK(unhex(line + 4, want, sizeof(want)) == TINYNV_QMD_BYTES, "the recorded descriptor is not %d bytes", TINYNV_QMD_BYTES);
+      { // THE RECORDED BYTES CARRY THE OLD UNIT. This session was recorded when the constant bank's size went into
+        // CONSTANT_BUFFER_SIZE_SHIFTED4_0 in BYTES (the oracle's encoding, 16x the bank); that field now holds 16-byte
+        // units (qmd.c says why). So the recorded block is corrected at that one field - and only after checking it
+        // holds this launch's byte count, so a recording that already used units, or held anything else, fails here.
+        tinynv_qmd_t w;
+        memset(&w, 0, sizeof(w));
+        memcpy(w.b, want, TINYNV_QMD_BYTES);
+        uint64_t v = tinynv_qmd_get(&w, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_0_LO, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_0_HI);
+        CHECK(v == const0_bytes, "the recorded bank 0 size field holds %#llx, not this launch's %#x bytes",
+              (unsigned long long)v, const0_bytes);
+        tinynv_qmd_set(&w, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_0_LO, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_0_HI, (v + 15) >> 4);
+        memcpy(want, w.b, TINYNV_QMD_BYTES);
+        bytes_fixed++;
+      }
       compare_bytes("descriptor", q.b, want, TINYNV_QMD_BYTES, 1);
       continue;
     }
@@ -241,7 +255,10 @@ int main(int argc, char **argv) {
   }
   fclose(f);
 
-  printf("  %d descriptors rebuilt: bytes, claimed bits and constant buffer 0 all as recorded\n", descriptors);
+  CHECK((int)bytes_fixed == descriptors, "the old byte-count bank size was corrected in %u of %d recorded descriptors",
+        bytes_fixed, descriptors);
+  printf("  %d descriptors rebuilt: bytes, claimed bits and constant buffer 0 all as recorded, with the bank 0 size "
+         "field read in 16-byte units where the recording has bytes (%u corrected)\n", descriptors, bytes_fixed);
   printf("  %d command buffers in the recording, %d rebuilt byte for byte\n", buffers, rebuilt);
   CHECK(descriptors >= 1, "%s held no descriptors", path);
   CHECK(rebuilt >= 1, "%s held no command buffer this driver could rebuild", path);

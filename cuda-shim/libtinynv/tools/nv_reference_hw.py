@@ -140,6 +140,9 @@ def main(snap_path: str, out_path: str) -> int:
     # A program size that gives back the prefetch size the card was handed. The snapshot does not carry the size itself -
     # the oracle keeps it in a local - and the field is clamped, so this is the one input reconstructed rather than read.
     # It reaches exactly one field, which is compared like every other.
+    # const0_size is the SHIFTED4 field read back UNSHIFTED, because the oracle wrote BYTES into it (ops_nv.py:294), so in
+    # the recordings this reads it IS the byte count. The field holds 16-byte units (qmd.c); a recording made with that
+    # encoding would put units here, and test_qmd_hw refuses such a reference rather than correcting it twice.
     lines.append(f"launch={i} regs={tmpl['register_count']} shmem={tmpl['shared_memory_size_shifted7'] << 7} "
                  f"slm_per_thread={tmpl['shader_local_memory_high_size_shifted4'] << 4} "
                  f"prog_size={tmpl['program_prefetch_size'] << 8} const0_size={tmpl['constant_buffer_size_shifted4_0']} "

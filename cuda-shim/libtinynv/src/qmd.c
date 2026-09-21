@@ -188,10 +188,22 @@ int tinynv_qmd_program(tinynv_qmd_t *q, const tinynv_qmd_program_t *p) {
 
   for (int i = 0; i < TINYNV_QMD_CONSTBUFS; i++) {
     if (!p->constbuf_used[i]) continue;
-    // The field is named for a shift it is not given: the oracle writes the size in bytes. Reproduced rather than
-    // corrected, because a descriptor that disagrees with the oracle is a descriptor whose only witness disagrees with
-    // it. Worth raising upstream once the first kernel of this driver's own has run.
-    SETF(q, cb_size[i], p->constbuf_size[i]);
+    // CONSTANT_BUFFER_SIZE_SHIFTED4 HOLDS THE SIZE IN 16-BYTE UNITS, rounded up so the bank covers every byte.
+    // Until 2026-09-21 this wrote BYTES, reproducing the oracle (tinygrad ops_nv.py:294 writes the byte count into
+    // the same field). Every descriptor before then - H0, H2, every C1 and llama run - therefore declared each bank
+    // 16x its real size; that fits 13 bits only below 8192 bytes, and H3's first launch (torch index-select, bank 4
+    // of 9024 bytes) was refused by the field check. The unit is NVIDIA's: Kepler's CONSTANT_BUFFER_SIZE is 17 bits of
+    // raw bytes (cla0c0qmd.h:207, open-gpu-kernel-modules 81fe4fb), and from Ampere on the field is SHIFTED4 and 13
+    // bits reaching the same 128 KiB - 13 bits x 16 = 17 bits of bytes (clc6c0qmd.h:222, clcec0qmd.h:267,
+    // tinygrad 084d89582) - so the shift is in the name and the width both. The card control is H0 rerun with this
+    // encoding in the same slot as H3: a hardware that read BYTES would now see every bank 16x too small.
+    uint64_t units = ((uint64_t)p->constbuf_size[i] + 15) >> 4;
+    if (units > field_mask(cb_size[i][0], cb_size[i][1]))
+      return tinynv_fail("constant bank %d is %u bytes, %llu units of 16, and the descriptor's size field holds at "
+                         "most %llu units (%llu bytes)", i, p->constbuf_size[i], (unsigned long long)units,
+                         (unsigned long long)field_mask(cb_size[i][0], cb_size[i][1]),
+                         (unsigned long long)field_mask(cb_size[i][0], cb_size[i][1]) << 4);
+    SETF(q, cb_size[i], units);
     SETF(q, cb_valid[i], 1);
   }
   return 0;

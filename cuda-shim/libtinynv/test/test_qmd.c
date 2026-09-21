@@ -37,6 +37,28 @@ static const char *field_at(uint32_t byte) {
   return buf[0] ? buf : "no field";
 }
 
+// THE ORACLE'S ONE KNOWN DIVERGENCE, CORRECTED IN THE EXPECTATION AND NOWHERE ELSE. tinygrad writes constant bank 0's
+// size in BYTES into CONSTANT_BUFFER_SIZE_SHIFTED4_0 (ops_nv.py:294), a field that holds 16-byte units (qmd.c says why,
+// from NVIDIA's headers). So the expected block is rewritten at exactly that field, and only after checking that what
+// the oracle put there IS the bank's byte count - a reference that had already been fixed, or that wrote some other
+// number, fails here instead of being "corrected" into agreement. Every other bit is still compared to the oracle's.
+static int oracle_bytes_fixed;
+static void oracle_cbuf0_to_units(uint8_t *want, uint64_t bank_bytes) {
+  tinynv_qmd_t w;
+  memset(&w, 0, sizeof(w));
+  memcpy(w.b, want, TINYNV_QMD_BYTES);
+  uint64_t v = tinynv_qmd_get(&w, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_0_LO, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_0_HI);
+  if (v != bank_bytes) {
+    printf("  FAIL: the oracle's bank 0 size field holds %#llx, not the bank's %#llx bytes - the divergence this test "
+           "corrects is not the one in the reference\n", (unsigned long long)v, (unsigned long long)bank_bytes);
+    fails++;
+    return;
+  }
+  tinynv_qmd_set(&w, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_0_LO, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_0_HI, (v + 15) >> 4);
+  memcpy(want, w.b, TINYNV_QMD_BYTES);
+  oracle_bytes_fixed++;
+}
+
 // the reference file: "key rest-of-line", with the blocks written as hex
 #define MAXLINE 8192
 static char *value_of(const char *path, const char *key, char *out, size_t cap) {
@@ -133,8 +155,10 @@ int main(int argc, char **argv) {
   tinynv_qmd_t q;
   memset(&q, 0, sizeof(q));
   CHECK(!tinynv_qmd_program(&q, &prog), "building the program's descriptor failed: %s", tinynv_last_error());
-  if (value_of(ref, "template", hex, sizeof(hex)) && unhex(hex, want, sizeof(want)) == TINYNV_QMD_BYTES)
+  if (value_of(ref, "template", hex, sizeof(hex)) && unhex(hex, want, sizeof(want)) == TINYNV_QMD_BYTES) {
+    oracle_cbuf0_to_units(want, k->const0_size);
     compare("template", &q, want, TINYNV_QMD_BYTES);
+  }
   else { printf("  FAIL: no template in %s\n", ref); fails++; }
 
   tinynv_qmd_launch_t l = {0};
@@ -149,18 +173,24 @@ int main(int argc, char **argv) {
   l.constbuf_addr[0] = field_from(launch, "cbuf0_addr ");
   l.constbuf_set[0] = 1;
   CHECK(!tinynv_qmd_launch(&q, &l), "applying the launch failed: %s", tinynv_last_error());
-  if (value_of(ref, "launched", hex, sizeof(hex)) && unhex(hex, want, sizeof(want)) == TINYNV_QMD_BYTES)
+  if (value_of(ref, "launched", hex, sizeof(hex)) && unhex(hex, want, sizeof(want)) == TINYNV_QMD_BYTES) {
+    oracle_cbuf0_to_units(want, k->const0_size);
     compare("launched", &q, want, TINYNV_QMD_BYTES);
+  }
 
   int slot = tinynv_qmd_release(&q, field_from(release, "addr "), field_from(release, "payload "), 0);
   CHECK(slot == (int)field_from(release, "slot "), "the release took slot %d, the oracle took %llu",
         slot, (unsigned long long)field_from(release, "slot "));
-  if (value_of(ref, "released", hex, sizeof(hex)) && unhex(hex, want, sizeof(want)) == TINYNV_QMD_BYTES)
+  if (value_of(ref, "released", hex, sizeof(hex)) && unhex(hex, want, sizeof(want)) == TINYNV_QMD_BYTES) {
+    oracle_cbuf0_to_units(want, k->const0_size);
     compare("released", &q, want, TINYNV_QMD_BYTES);
+  }
 
   CHECK(!tinynv_qmd_chain(&q, field_from(release, "next_qmd "), 1), "chaining failed: %s", tinynv_last_error());
-  if (value_of(ref, "chained", hex, sizeof(hex)) && unhex(hex, want, sizeof(want)) == TINYNV_QMD_BYTES)
+  if (value_of(ref, "chained", hex, sizeof(hex)) && unhex(hex, want, sizeof(want)) == TINYNV_QMD_BYTES) {
+    oracle_cbuf0_to_units(want, k->const0_size);
     compare("chained", &q, want, TINYNV_QMD_BYTES);
+  }
 
   // Nothing above can catch two fields written over each other: a reference built the same way makes the identical
   // mistake and the bytes still agree. The descriptor counts its own claimed bits, so that is checked here instead.
@@ -295,6 +325,36 @@ int main(int argc, char **argv) {
   free(cb0);
   free(blob);
   tinynv_cubin_free(&cb);
+  CHECK(oracle_bytes_fixed == 4, "the oracle's byte-count bank size was corrected in %d of the 4 blocks - a block "
+        "compared without it would have compared against the oracle's bug", oracle_bytes_fixed);
+
+  // THE UNIT AT ITS BOUNDARIES, on bank 4, the one H3's first launch carried: 9024 bytes is 0x234 units and is
+  // accepted; one byte rounds UP to a unit; 0x1fff0 is the largest the 13-bit field holds; one byte more, and
+  // 0x1fff0 + 16, are refused by name.
+  {
+    static const struct { uint32_t bytes; int ok; uint64_t units; } cases[] = {
+      {0x2340, 1, 0x234}, {1, 1, 1}, {0x17c, 1, 0x18}, {0x1fff0, 1, 0x1fff}, {0x1fff1, 0, 0}, {0x1fff0 + 16, 0, 0},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+      tinynv_qmd_program_t bp = prog;
+      tinynv_qmd_t bq;
+      memset(&bq, 0, sizeof(bq));
+      bp.constbuf_used[4] = 1;
+      bp.constbuf_size[4] = cases[c].bytes;
+      int rc = tinynv_qmd_program(&bq, &bp);
+      if (cases[c].ok) {
+        uint64_t got = tinynv_qmd_get(&bq, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_4_LO, TINYNV_QMD_CONSTANT_BUFFER_SIZE_SHIFTED4_4_HI);
+        CHECK(!rc && got == cases[c].units, "bank 4 of %#x bytes: rc %d, field %#llx, want %#llx units (%s)",
+              cases[c].bytes, rc, (unsigned long long)got, (unsigned long long)cases[c].units, rc ? tinynv_last_error() : "");
+      } else {
+        CHECK(rc && strstr(tinynv_last_error(), "constant bank 4 is"), "bank 4 of %#x bytes was not refused by name "
+              "(rc %d, \"%s\")", cases[c].bytes, rc, tinynv_last_error());
+      }
+    }
+    printf("  constant bank size in 16-byte units: 0x2340 -> 0x234, 1 -> 1, 0x1fff0 -> 0x1fff; 0x1fff1 and 0x20000 "
+           "refused by name (\"%s\")\n", tinynv_last_error());
+  }
+
   printf(fails ? "%d checks failed\n" : "all checks passed\n", fails);
   return fails ? 1 : 0;
 }
