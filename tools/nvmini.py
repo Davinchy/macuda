@@ -35,7 +35,12 @@ class MiniNVDev:
   def cfgw(self, off, val, size=4): self.pd.write_config(off, val, size)
   def command(self): return self.cfg(pci.PCI_COMMAND, 2)
   def snapshot_cfg(self): return {off: self.cfg(off) for off in (0x00, 0x04, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x3c)}
-  def gfw_booted(self):  # NV_FLCN_COT.wait_for_reset condition for GB202 (ip.py:286): THERM I2CS scratch == 0xff
+  def gfw_booted(self):
+    # Where the boot firmware says it has finished differs by architecture: Blackwell in the THERM I2CS scratch (ip.py:286),
+    # Ampere/Ada in the AON secure scratch group 5 (ip.py:96) - and on those the THERM word never reads 0xff, so this
+    # reported "GFW not booted after 30 s" about every healthy 3060 the quiesce ever touched (2026-09-21).
+    if self.NV_PMC_BOOT_42.read_bitfields()['architecture'] < 0x1a:
+      return (self.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05[0].read() & 0xff) == 0xff
     return self.NV_THERM_I2CS_SCRATCH.read() == 0xff
   def gfw_scratch(self): return self.NV_THERM_I2CS_SCRATCH.read()
   def state(self):

@@ -118,6 +118,8 @@ esac
 if [ "${DRY:-0}" != 1 ]; then
   # Default since 2026-09-14 evening: leave the firmware resident ("idle warm"). With GSP halted the AORUS box runs its fans at
   # fail-safe full speed (Antonio), and the driver resets a warm card itself on open (B). QUIESCE=1 restores the cold state.
+  # Since 2026-09-17 an Ampere card is left cold by the driver itself (GSP-RM unloaded, region torn down: TINYNV_UNLOAD=1, the
+  # default), because its reset-on-open path failed every second boot; QUIESCE=1 is then only a belt-and-braces FLR.
   [ "${QUIESCE:-0}" = 1 ] && sh $R/tools/nv_quiesce.sh 2>&1 | sed 's/^/   /'
 fi
 exit $rc
