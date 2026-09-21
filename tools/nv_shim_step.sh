@@ -19,7 +19,8 @@
 #                                                   last slot of a session, Antonio's go for it by name, quiesced after
 #
 # Knobs pass through the environment exactly as the binaries read them (TINYNV_ASYNC, TINYNV_SYNC, TINYNV_ARENA_VRAM,
-# TINYNV_CHAIN_DEPTH); the startup line that records what a run actually used is echoed back, so the report never
+# TINYNV_CHAIN_DEPTH); NGL=<n> (and NGLD=<n> for the draft) offloads fewer layers than all of them, for a model bigger than
+# the card - a 27B Q4 on a 12 GB 3060 is the case (2026-09-21); the startup line that records what a run actually used is echoed back, so the report never
 # depends on what anyone remembers exporting. BIN=<dir> picks the binary set (default build/bin, the validated one);
 # the build id baked into the binary is printed BEFORE the card is touched. QUIESCE=1 quiesces cold after the step (default: idle warm);
 # DRY=1 runs on the null device with no preflight/quiesce, to test this script itself.
@@ -31,14 +32,14 @@ mkdir -p $R/logs; ts=$(date +%Y%m%d-%H%M%S); log=$R/logs/shim-$step-$ts.log
 out=
 case "$step" in
   opverify) bin=$BIN/test-backend-ops-null; set -- -b CUDA0 -o GATED_DELTA_NET -o GATED_LINEAR_ATTN -o SSM_SCAN -o SSM_CONV -o SOLVE_TRI -o RMS_NORM -o ROPE ;;
-  bench)    bin=$BIN/llama-bench-null;      m=${1:?model}; n=${2:-128}; set -- -m "$m" -ngl 99 -p 256 -n "$n" -r 3 ;;
+  bench)    bin=$BIN/llama-bench-null;      m=${1:?model}; n=${2:-128}; set -- -m "$m" -ngl "${NGL:-99}" -p 256 -n "$n" -r 3 ;;
   ops)      bin=$BIN/test-backend-ops-null; ops=${1:?ops}; rx=${2:-}; set -- ${OPS_MODE:-test} -b CUDA0   # OPS_MODE=perf for throughput
             [ "$ops" != all ] && set -- "$@" -o "$ops"        # one comma-separated argument, as the suite wants it
             [ -n "$rx" ] && set -- "$@" -p "$rx"; m="ops-$(echo "$ops" | cut -c1-24 | tr ',' '+')" ;;
-  simple)   bin=$BIN/llama-simple-null;     m=${1:?model}; n=${2:-64}; p=${3:-"The three most important things to know about the Thunderbolt bus are"}; set -- -m "$m" -ngl 99 -n "$n" "$p" ;;
+  simple)   bin=$BIN/llama-simple-null;     m=${1:?model}; n=${2:-64}; p=${3:-"The three most important things to know about the Thunderbolt bus are"}; set -- -m "$m" -ngl "${NGL:-99}" -n "$n" "$p" ;;
   spec)     bin=$BIN/llama-speculative-simple-null; m=${1:?model}; md=${2:?draft model}; n=${3:-128}; dn=${4:-3}
             p=${5:-"The three most important things to know about the Thunderbolt bus are"}
-            set -- -m "$m" -md "$md" -ngl 99 -ngld 99 --spec-type "${SPEC_TYPE:-draft-mtp}" --spec-draft-n-max "$dn" -n "$n" -p "$p" ${SPEC_ARGS:-} ;;
+            set -- -m "$m" -md "$md" -ngl "${NGL:-99}" -ngld "${NGLD:-99}" --spec-type "${SPEC_TYPE:-draft-mtp}" --spec-draft-n-max "$dn" -n "$n" -p "$p" ${SPEC_ARGS:-} ;;
   sd)       bin=$BIN/sd-cli-null; m=${1:?model}; st=${2:-20};
             # the first sampling step uploads the mmapped weights, so a model file that has dropped out of the page cache makes
             # that step run at SSD speed (7-12 s instead of 1-2, seen 2026-09-15 00:26-01:05); read it here first and say how long it took,

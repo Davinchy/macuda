@@ -415,12 +415,25 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
   int seen = 0;
   int report = want == TINYNV_MSG_EVENT_GSP_INIT_DONE && g->dev.pci->live;
   if (reply) { *reply = NULL; *reply_len = 0; }
+  // The configuration is looked at every quarter second, not every five: when it goes, knowing WHEN it went - how long
+  // after the register sequence, what the falcons were doing - is the evidence the open question needs, and putting it
+  // back within a quarter second is less time for anything written through the window to be lost.
+  double next_cfg = start + 0.25;
   do {
     if (rpc_drain(g, want, &seen, reply, reply_len)) return -1;
     if (seen) {
       if (report && tinynv_now_s() - start > 5.0)
         fprintf(stderr, "tinynv: the start-up notice arrived after %.1f s\n", tinynv_now_s() - start);
       return 0;
+    }
+    if (report && tinynv_now_s() >= next_cfg) {
+      next_cfg += 0.25;
+      uint32_t cmd = g->dev.pci->cfg_read(g->dev.pci, 0x04, 2);
+      if (cmd != 0xffff && (cmd & 0x6) != 0x6) {
+        fprintf(stderr, "tinynv: %.2f s after the start-up wait began, the command register reads %#06x\n",
+                tinynv_now_s() - start, cmd);
+        init_wait_report(g, tinynv_now_s() - start);
+      }
     }
     if (report && tinynv_now_s() >= next_report) {
       init_wait_report(g, tinynv_now_s() - start);
@@ -1681,6 +1694,9 @@ int tinynv_gsp_init_hw(tinynv_gpu_t *g) {
   }
   if (rpc_wait(g, TINYNV_MSG_EVENT_GSP_INIT_DONE, init_timeout, "its start-up notice", NULL, NULL)) return -1;
   if (gsp->err_state) return tinynv_fail("gsp-rm started but reported an error on the way up");
+
+  // one more look at the configuration before anything is written through the window again
+  if (g->dev.pci->live) tinynv_dev_restore_decode(&g->dev);
 
   // with the firmware up, the two windows onto instance memory are retargeted at it
   tinynv_wr32(&g->dev, NV_PBUS_BAR1_BLOCK, 0);
