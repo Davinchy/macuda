@@ -32,7 +32,7 @@ mkdir -p $R/logs; ts=$(date +%Y%m%d-%H%M%S); log=$R/logs/shim-$step-$ts.log
 out=
 case "$step" in
   opverify) bin=$BIN/test-backend-ops-null; set -- -b CUDA0 -o GATED_DELTA_NET -o GATED_LINEAR_ATTN -o SSM_SCAN -o SSM_CONV -o SOLVE_TRI -o RMS_NORM -o ROPE ;;
-  bench)    bin=$BIN/llama-bench-null;      m=${1:?model}; n=${2:-128}; set -- -m "$m" -ngl "${NGL:-99}" -p 256 -n "$n" -r 3 ;;
+  bench)    bin=$BIN/llama-bench-null;      m=${1:?model}; n=${2:-128}; set -- -m "$m" -ngl "${NGL:-99}" -p 256 -n "$n" -r 3 ${BENCH_ARGS:-} ;;   # BENCH_ARGS: e.g. -ncmoe 30 for a mixture of experts bigger than the card
   ops)      bin=$BIN/test-backend-ops-null; ops=${1:?ops}; rx=${2:-}; set -- ${OPS_MODE:-test} -b CUDA0   # OPS_MODE=perf for throughput
             [ "$ops" != all ] && set -- "$@" -o "$ops"        # one comma-separated argument, as the suite wants it
             [ -n "$rx" ] && set -- "$@" -p "$rx"; m="ops-$(echo "$ops" | cut -c1-24 | tr ',' '+')" ;;
