@@ -196,6 +196,9 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	        echo "  set TINYNV_ALLOW_NO_CUBINS=1 to skip this test deliberately."; [ -n "$$TINYNV_ALLOW_NO_CUBINS" ]; }; fi
 	@if [ -f ../spike/printf_kernel.sm120.cubin ]; then $(BUILD)/test_reloc ../spike/printf_kernel.sm120.cubin; \
 	 else echo "  (no printf_kernel cubin, test_reloc skipped by TINYNV_ALLOW_NO_CUBINS)"; fi
+	@# ...and the device assert handler, on a real torch sm_120 image that references BOTH allowed names. Tracked
+	@# (test/fixtures/README.md), so this arm never skips.
+	@$(BUILD)/test_reloc test/fixtures/torch-cu128-assertfail-vprintf.sm120.cubin
 	@# the command buffers the card was handed, rebuilt from the oracle's own method numbers and compared word for word
 	@$(PYTHON) tools/nv_reference_submit.py test/reference-submit.txt >/dev/null && $(BUILD)/test_submit test/reference-submit.txt
 	@# and the kernel descriptor, against what tinygrad's own QMD class builds for the same cubin. the C side reads the

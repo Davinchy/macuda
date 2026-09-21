@@ -151,6 +151,7 @@ int tinynv_cubin_image(const tinynv_cubin_t *c, const char *kernel, int with_byt
       const uint8_t *sy = c->img + symtab->off + (uint64_t)sym * 24;
       uint16_t shndx = (uint16_t)(sy[6] | (sy[7] << 8));
       uint64_t target = 0;
+      int undefined = 0;
       if (shndx && shndx < (uint16_t)c->nsections) target = addr[shndx] + rd64(sy + 8);
       else {
         // An undefined symbol: something the cubin references and does not contain. In a cubin there is exactly one
@@ -165,11 +166,28 @@ int tinynv_cubin_image(const tinynv_cubin_t *c, const char *kernel, int with_byt
         // Refusing instead - which is what this did until a real op suite hit it - blocks every quantised model,
         // because one assert path in one header costs the entire decode path. Anything else undefined is still refused,
         // and now by name, because the next one might matter.
+        //
+        // `__assertfail` IS THE SECOND, AND THE EVIDENCE FOR IT IS TORCH'S (D, cuda-shim-d 124f21a, every sm_120 image
+        // of the guest's libtorch_cuda, torch 2.10.0+cu128): 117 of 457 images - 13,964 kernels, the core ops, Indexing
+        // and norm and Pow and the unary and compare and activation and loss kernels - relocate against it and against
+        // nothing else we lack, besides vprintf. It is CUDA's device-side assert handler, called only when an assert
+        // FAILS. The real driver's handler traps the kernel and the context is lost (cudaErrorAssert, sticky); here the
+        // call lands on address 0 and faults, which also fails the launch and also loses the context. A different error
+        // code, the same consequence, and nothing on a path where no assert fails. The one other undefined symbol in
+        // that library, the sm_100 TMA-multicast syscall in a CUTLASS FP8 image, stays refused by name.
+        //
+        // ZERO MEANS ZERO ON THE DEVICE, which it did not until 2026-09-21. The relocation used to be recorded with a
+        // zero target and then written as image_va + target + addend like every other, so the GPU was handed THE
+        // IMAGE'S OWN BASE ADDRESS: a kernel that printed would have jumped to the first byte of its own module - the
+        // "somewhere arbitrary" this comment claims to prevent. test_reloc checked the word BEFORE relocation, where
+        // it is zero, and so could not see it. The relocation is now marked, and tinynv_image_relocate writes an
+        // absolute zero (plus the addend) for it.
         const char *name = strtab_name(c, symtab, sy);
-        if (!name || strcmp(name, "vprintf"))
+        if (!name || (strcmp(name, "vprintf") && strcmp(name, "__assertfail")))
           return tinynv_fail("cubin: relocation against '%s', a symbol this driver cannot resolve",
                              name && *name ? name : "an unnamed undefined symbol");
         out->unresolved++;
+        undefined = 1;
       }
 
       if (out->nrelocs == cap_rel) {
@@ -179,7 +197,7 @@ int tinynv_cubin_image(const tinynv_cubin_t *c, const char *kernel, int with_byt
         out->relocs = p;
       }
       out->relocs[out->nrelocs++] = (tinynv_reloc_t){.at = addr[t] + r_offset, .target = target,
-                                                    .type = type, .addend = addend};
+                                                    .type = type, .addend = addend, .undefined = undefined};
     }
   }
 
@@ -192,7 +210,8 @@ int tinynv_cubin_image(const tinynv_cubin_t *c, const char *kernel, int with_byt
 int tinynv_image_relocate(tinynv_image_t *im, uint64_t image_va) {
   for (int i = 0; i < im->nrelocs; i++) {
     const tinynv_reloc_t *r = &im->relocs[i];
-    uint64_t v = image_va + r->target + (uint64_t)r->addend;
+    // An undefined symbol's value is an absolute zero, not an offset into this image: S + A with S = 0.
+    uint64_t v = (r->undefined ? 0 : image_va + r->target) + (uint64_t)r->addend;
     switch (r->type) {
       case R_CUDA_64:
         if (r->at + 8 > im->len) return tinynv_fail("relocation at %#llx is past the image", (unsigned long long)r->at);

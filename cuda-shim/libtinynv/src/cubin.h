@@ -46,7 +46,9 @@ typedef struct {
 // addresses the GPU is given are offsets into that block.
 #define TINYNV_MAX_CONSTBUFS 8
 
-typedef struct { uint64_t at; uint64_t target; uint32_t type; int64_t addend; } tinynv_reloc_t;
+// `undefined` marks a relocation against a symbol the cubin does not contain: its value is an ABSOLUTE zero, so
+// tinynv_image_relocate must not add the image's address to it (see image.c's allow-list).
+typedef struct { uint64_t at; uint64_t target; uint32_t type; int64_t addend; int undefined; } tinynv_reloc_t;
 
 typedef struct {
   uint8_t *bytes;                        // owned
@@ -56,7 +58,8 @@ typedef struct {
   int nrelocs;
   tinynv_reloc_t *relocs;                // owned
   // Relocations against symbols the cubin does not contain and this driver does not provide - the device runtime's
-  // printf, in practice. They resolve to zero, so a kernel that reaches one faults rather than jumping somewhere
+  // printf and assert handler (image.c names both). They resolve to an ABSOLUTE zero at relocation time, so a kernel
+  // that reaches one calls address 0, which no address space here maps, and faults rather than jumping somewhere
   // arbitrary. Counted so a caller can say so rather than discover it.
   int unresolved;
 } tinynv_image_t;
