@@ -1729,8 +1729,13 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
   // retraining it during its init - which on this enclosure is the moment the configuration is cleared. Live cards
   // only, and only when asked: the recorded boot sends exactly two entries.
   struct { const char *name; uint32_t value; } extra = {NULL, 0};
+  // ON BY DEFAULT on a live vbios-path card since 2026-09-21: the first boot of the day on a 16 GT/s link that did not
+  // lose its configuration was the one with the link locked, and the loss had always come 1.5 s into init - where the
+  // firmware, left to itself, drops the link to Gen1 for power. TINYNV_PCIE_LINK_SPEED=off sends the two entries the
+  // recording sends and nothing else.
   const char *ls = getenv("TINYNV_PCIE_LINK_SPEED");
-  if (ls && *ls && g->dev.pci->live) {
+  if (!ls && g->dev.pci->live && !g->dev.fmc_boot) ls = "lock";
+  if (ls && *ls && strcmp(ls, "off") && g->dev.pci->live) {
     uint32_t v = 1u << 31;                       // LOCK_AT_LOAD
     int gen = !strncmp(ls, "gen", 3) ? atoi(ls + 3) : 0;
     if (gen >= 1 && gen < 2) v |= 2u << 0;       // ALLOW_GEN2_DISABLE
