@@ -53,7 +53,12 @@ int tinynv_gpu_boot_firmware(tinynv_gpu_t *g) {
   // Three, because on the 3060 that loses its configuration under a booting firmware (2026-09-21) the loss is a
   // per-boot event: the boot after a lost one usually comes up. A retry is cheap - five seconds - against the
   // alternative, which is a process that reports a failed boot and a person who power-cycles the enclosure.
-  const int attempts = g->dev.pci->live && !g->dev.fmc_boot ? 3 : 1;
+  // Six, not three: the window loss is roughly even odds per boot on this enclosure's supply, so three attempts
+  // fail together about one run in eight (the 35B-A3B bench on 2026-09-21 lost all three, on a card at 38.8 C - not
+  // thermal). Six brings all-failing to about one in fifty, at ~12 s per lost attempt. TINYNV_BOOT_ATTEMPTS
+  // overrides. A workaround for a marginal supply, not a fix: a supply that held would not clear the configuration.
+  int attempts = g->dev.pci->live && !g->dev.fmc_boot ? 6 : 1;
+  { const char *e = getenv("TINYNV_BOOT_ATTEMPTS"); if (e && *e && atoi(e) > 0) attempts = atoi(e); }
   for (int attempt = 1;; attempt++) {
     if (tinynv_gpu_init_sw(g)) return -1;
     if (!tinynv_gpu_init_hw(g)) {
