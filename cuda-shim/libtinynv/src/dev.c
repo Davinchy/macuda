@@ -6,6 +6,7 @@
 // MMU version too. Everything here is register access plus config space, so it works over any of the PCI backends.
 #include "dev.h"
 #include "internal.h"
+#include <stdlib.h>
 #include "nv_regs.h"
 #include "nv_structs.h"
 #include <stdio.h>
@@ -178,6 +179,27 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
     d->cfg_cmd = pci->cfg_read(pci, PCI_COMMAND, 2);
     for (int i = 0; i < 6; i++) d->cfg_bars[i] = pci->cfg_read(pci, 0x10 + 4 * i, 4);
     d->cfg_saved = 1;
+    // The PCI Express capability, for the link registers. Walked the standard way: the pointer at 0x34, then each
+    // capability's id and next pointer, stopping at id 0x10 or at the end of the list.
+    uint32_t cap = pci->cfg_read(pci, 0x34, 1) & 0xfc;
+    for (int guard = 0; cap && cap != 0xfc && guard < 48; guard++) {
+      uint32_t id = pci->cfg_read(pci, cap, 1);
+      if (id == 0x10) { d->pcie_cap = cap; break; }
+      cap = pci->cfg_read(pci, cap + 1, 1) & 0xfc;
+    }
+    unsigned gen = 0, width = 0;
+    tinynv_dev_link(d, &gen, &width);
+    // TINYNV_LINK_TARGET=<gen> writes the endpoint's target link speed (Link Control 2, bits 3:0), which bounds the
+    // speed the next retrain settles at - the retrain itself is the upstream port's, or the firmware's, to start.
+    const char *t = getenv("TINYNV_LINK_TARGET");
+    if (t && *t && d->pcie_cap) {
+      uint32_t lc2 = pci->cfg_read(pci, d->pcie_cap + 0x30, 2), want = (uint32_t)atoi(t) & 0xf;
+      pci->cfg_write(pci, d->pcie_cap + 0x30, 2, (lc2 & ~0xfu) | want);
+      fprintf(stderr, "tinynv: link control 2 target speed set to gen%u (was gen%u)\n", want, lc2 & 0xf);
+    }
+    fprintf(stderr, "tinynv: pcie link x%u at gen%u (%s), target gen%u\n", width, gen,
+            gen == 1 ? "2.5 GT/s" : gen == 2 ? "5 GT/s" : gen == 3 ? "8 GT/s" : gen == 4 ? "16 GT/s" : gen == 5 ? "32 GT/s" : "?",
+            d->pcie_cap ? pci->cfg_read(pci, d->pcie_cap + 0x30, 2) & 0xf : 0);
   }
 
   uint32_t boot42 = tinynv_rd32(d, NV_PMC_BOOT_42);
@@ -255,10 +277,20 @@ int tinynv_dev_restore_decode(tinynv_dev_t *d) {
   uint32_t now = pci->cfg_read(pci, PCI_COMMAND, 2);
   d->windows_restored++;
   d->windows_restored_at = tinynv_now_s();
+  unsigned lgen = 0, lw = 0;
+  tinynv_dev_link(d, &lgen, &lw);
   fprintf(stderr, "tinynv: the card had lost its windows under a running firmware (command %#06x, first base address "
-                  "%#x); written back from what it reported when it was opened - command %#06x, %s\n",
-          cmd, d->cfg_bars[0], now, back ? "all six base address registers read back correctly" : "THEY DID NOT TAKE");
+                  "%#x, link now x%u gen%u); written back from what it reported when it was opened - command %#06x, %s\n",
+          cmd, d->cfg_bars[0], lw, lgen, now, back ? "all six base address registers read back correctly" : "THEY DID NOT TAKE");
   return 1;
+}
+
+void tinynv_dev_link(tinynv_dev_t *d, unsigned *gen, unsigned *width) {
+  *gen = 0; *width = 0;
+  if (!d->pcie_cap) return;
+  uint32_t ls = d->pci->cfg_read(d->pci, d->pcie_cap + 0x12, 2);   // Link Status: speed 3:0, width 9:4
+  if (ls == 0xffff) return;
+  *gen = ls & 0xf; *width = (ls >> 4) & 0x3f;
 }
 
 int tinynv_dev_reset_cold(tinynv_dev_t *d) {

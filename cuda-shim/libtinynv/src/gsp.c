@@ -376,17 +376,19 @@ static void init_wait_report(tinynv_gpu_t *g, double elapsed) {
   uint32_t rv = tinynv_rd32(d, g->flcn.falcon + NV_PRISCV_RISCV_CPUCTL);
   uint32_t sec = tinynv_rd32(d, g->flcn.sec2 + NV_PFALCON_FALCON_MAILBOX0);
   uint32_t wpr = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+  unsigned lgen = 0, lw = 0;
+  tinynv_dev_link(d, &lgen, &lw);
   // Every register reading all ones does not mean the same thing as config space reading all ones. The first is a window
   // that is not decoding; the second is a card that is not there. Saying which is which is the whole value of this line:
   // on 2026-09-21 it reported "bus master OFF" about a card whose CONFIG space was readable and whose memory window had
   // simply been switched off underneath a booting firmware, and the two readings look identical if only one is printed.
   fprintf(stderr, "tinynv: +%3.0fs no start-up notice yet | status rp %u wp %u, gsp read %u of our commands, log put INIT %u "
                   "INTR %u RM %u | %04x:%04x command %#06x (memory %s, bus master %s) | gsp mailbox %#x %#x, riscv %s%s, "
-                  "sec2 mailbox %#x, wpr2 hi %#x\n",
+                  "sec2 mailbox %#x, wpr2 hi %#x, link x%u gen%u\n",
           elapsed, rp, wp, took, logput[0], logput[1], logput[2], vd & 0xffff, vd >> 16, cmd,
           (cmd & 0x2) ? "on" : "OFF", (cmd & 0x4) ? "on" : "OFF", mbx0, mbx1,
           NV_GET(rv, NV_PRISCV_RISCV_CPUCTL, ACTIVE_STAT) ? "active" : "NOT active",
-          NV_GET(rv, NV_PRISCV_RISCV_CPUCTL, HALTED) ? " halted" : "", sec, wpr);
+          NV_GET(rv, NV_PRISCV_RISCV_CPUCTL, HALTED) ? " halted" : "", sec, wpr, lw, lgen);
 
   // AND PUT IT BACK. A command register that loses its memory window and bus mastering while a firmware is starting is
   // never a legitimate state: with the window off every register reads all ones, and with bus mastering off nothing
@@ -1722,15 +1724,33 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
   else if (pick && !strcmp(pick, "nosave")) { first = 1; n = 1; }
   else if (pick && !strcmp(pick, "nosbr")) n = 1;
   if (pick) fprintf(stderr, "tinynv: registry table: TINYNV_REGISTRY=%s, %zu of 2 entries sent\n", pick, n);
-  size_t hdr_size = sizeof(tinynv_registry_table_t), entries_size = sizeof(tinynv_registry_entry_t) * n, names_size = 0;
+  // TINYNV_PCIE_LINK_SPEED=lock|gen1|gen2|gen3|gen4 adds RMPcieLinkSpeed (nvrm_registry.h): generations above the
+  // named one disabled, and bit 31, LOCK_AT_LOAD, so the firmware keeps the link where it found it instead of
+  // retraining it during its init - which on this enclosure is the moment the configuration is cleared. Live cards
+  // only, and only when asked: the recorded boot sends exactly two entries.
+  struct { const char *name; uint32_t value; } extra = {NULL, 0};
+  const char *ls = getenv("TINYNV_PCIE_LINK_SPEED");
+  if (ls && *ls && g->dev.pci->live) {
+    uint32_t v = 1u << 31;                       // LOCK_AT_LOAD
+    int gen = !strncmp(ls, "gen", 3) ? atoi(ls + 3) : 0;
+    if (gen >= 1 && gen < 2) v |= 2u << 0;       // ALLOW_GEN2_DISABLE
+    if (gen >= 1 && gen < 3) v |= 2u << 2;       // ALLOW_GEN3_DISABLE
+    if (gen >= 1 && gen < 4) v |= 2u << 4;       // ALLOW_GEN4_DISABLE
+    if (gen >= 1 && gen < 5) v |= 2u << 6;       // ALLOW_GEN5_DISABLE
+    extra.name = "RMPcieLinkSpeed"; extra.value = v;
+    fprintf(stderr, "tinynv: registry table: RMPcieLinkSpeed=%#x (%s, locked at load)\n", v, ls);
+  }
+  size_t n_extra = extra.name ? 1 : 0;
+  size_t hdr_size = sizeof(tinynv_registry_table_t), entries_size = sizeof(tinynv_registry_entry_t) * (n + n_extra), names_size = 0;
   for (size_t i = 0; i < n; i++) names_size += strlen(TABLE[first + i].name) + 1;
+  if (n_extra) names_size += strlen(extra.name) + 1;
 
   size_t total = hdr_size + entries_size + names_size;
   uint8_t *buf = calloc(1, total);
   if (!buf) return tinynv_fail("out of memory for the registry table");
   tinynv_registry_table_t *h = (tinynv_registry_table_t *)buf;
   h->size = (uint32_t)total;
-  h->numEntries = (uint32_t)n;
+  h->numEntries = (uint32_t)(n + n_extra);
   tinynv_registry_entry_t *e = (tinynv_registry_entry_t *)(buf + hdr_size);
   size_t at = 0;
   for (size_t i = 0; i < n; i++) {
@@ -1740,6 +1760,15 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
     e[i].data = TABLE[first + i].value;
     e[i].length = 4;
     memcpy(buf + hdr_size + entries_size + at, TABLE[first + i].name, len);
+    at += len;
+  }
+  if (n_extra) {
+    size_t len = strlen(extra.name) + 1;
+    e[n].nameOffset = (uint32_t)(hdr_size + entries_size + at);
+    e[n].type = TINYNV_REGISTRY_TYPE_DWORD;
+    e[n].data = extra.value;
+    e[n].length = 4;
+    memcpy(buf + hdr_size + entries_size + at, extra.name, len);
     at += len;
   }
   int rc = rpc_send(g, TINYNV_MSG_FUNCTION_SET_REGISTRY, buf, total);

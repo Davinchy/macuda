@@ -18,6 +18,7 @@ typedef struct {
   // What the card's config space said while it was known good, so the driver can put it back if it is cleared under a
   // running firmware. Taken on a live card only: reading these is six operations the recorded boot never made.
   int cfg_saved;
+  uint32_t pcie_cap;         // offset of the PCI Express capability in config space, 0 if not found (live cards only)
   unsigned windows_restored; // how many times this open found its configuration cleared and put it back
   double windows_restored_at; // when the last of those was, so a wait can give up sooner than its full timeout
   uint32_t cfg_cmd, cfg_bars[6];
@@ -36,5 +37,8 @@ int tinynv_dev_restore_decode(tinynv_dev_t *d);
 // Reset the function through the backend and bring it back cold: configuration restored from the snapshot taken at
 // open, boot firmware waited for, write-protected region confirmed down. What a boot that did not finish is undone with.
 int tinynv_dev_reset_cold(tinynv_dev_t *d);
+// The link as config space reports it: generation (1..5, 0 when unknown) and lane count. Cheap, and the one number
+// that says whether the card is on the link it was enumerated on or on the one it fell back to.
+void tinynv_dev_link(tinynv_dev_t *d, unsigned *gen, unsigned *width);
 
 #endif
