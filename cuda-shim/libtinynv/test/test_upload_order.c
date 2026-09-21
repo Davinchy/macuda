@@ -41,14 +41,20 @@ static int take(tinynv_cmdbuf_t *c, uint32_t dwords) {
 }
 
 // ---- recording stand-ins, with the real dword counts (submit.c) so a batch sized too small is refused ----
+// Each count is the encoder's own: a method is one header word plus its data words (tinynv_cmd_method). G's review
+// (20260921-131013, finding 7) found two wrong here: a release is 8, not 6 (the semaphore's 6 plus a 2-word non-stall
+// interrupt, tinynv_cmd_release_ts), and a copy is 9 per 2 GiB step, not 20 (5 + 2 + 2, tinynv_cmd_copy).
 int tinynv_cmd_wait(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value) { rec(EV_WAIT, (addr - sem_base) / 128, value); return take(c, 6); }
 int tinynv_cmd_inline_upload(tinynv_cmdbuf_t *c, uint64_t dst, const void *src, uint32_t n) { (void)src; rec(EV_INLINE, dst, n); return take(c, TINYNV_INLINE_DWORDS(n)); }
 int tinynv_cmd_launch(tinynv_cmdbuf_t *c, uint64_t qmd_addr) { rec(EV_LAUNCH, qmd_addr, 0); return take(c, 4); }
 int tinynv_cmd_memory_barrier(tinynv_cmdbuf_t *c) { rec(EV_BARRIER, 0, 0); return take(c, 2); }
-int tinynv_cmd_release(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value) { rec(EV_RELEASE, (addr - sem_base) / 128, value); return take(c, 6); }
+int tinynv_cmd_release(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value) { rec(EV_RELEASE, (addr - sem_base) / 128, value); return take(c, 8); }
 int tinynv_cmd_release_clocked(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value) { return tinynv_cmd_release(c, addr, value); }
 int tinynv_cmd_copy_release(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value) { rec(EV_RELEASE, (addr - sem_base) / 128, value); return take(c, 6); }
-int tinynv_cmd_copy(tinynv_cmdbuf_t *c, uint64_t dst, uint64_t src, uint64_t bytes) { (void)src; rec(EV_COPY, dst, bytes); return take(c, 20); }
+int tinynv_cmd_copy(tinynv_cmdbuf_t *c, uint64_t dst, uint64_t src, uint64_t bytes) {
+  (void)src; rec(EV_COPY, dst, bytes);
+  return take(c, 9u * (uint32_t)((bytes + (1ull << 31) - 1) >> 31));
+}
 int tinynv_cmd_timestamp(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value) { (void)addr; (void)value; return take(c, 6); }
 int tinynv_cmd_copy_timestamp(tinynv_cmdbuf_t *c, uint64_t addr, uint64_t value) { (void)addr; (void)value; return take(c, 6); }
 static tinynv_exec_t *cur;
