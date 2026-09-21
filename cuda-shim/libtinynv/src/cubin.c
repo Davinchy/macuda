@@ -88,7 +88,14 @@ int tinynv_cubin_parse(const void *data, size_t len, tinynv_cubin_t *out) {
 
   out->img = img;
   out->len = len;
-  out->sm_arch = (rd32(img + 0x30) >> 8) & 0xff; // e_flags holds the sm number in its second byte: 0x...5604 -> 86, 0x...7802 -> 120
+  // TWO CUDA ELF ABIs, AND THEY KEEP THE ARCHITECTURE IN DIFFERENT BYTES OF e_flags. OSABI 0x41 / ABI version 8 has it
+  // in the SECOND byte (0x06005004 -> 80, 0x06007802 -> 120); OSABI 0x33 / ABI version 7 - what ptxas 12.x emits for
+  // sm_80 and sm_90, and so cu128 torch's sm_80/sm_90 images - has it in the LOW byte (0x00500550 -> 80), where the
+  // second byte is 5 for every architecture. Measured on one PTX compiled by ptxas 12.8 and 13.0
+  // (test/fixtures/abi-*, README-abi.md) and on every image of two torch fatbins (libtinycudart/fatbin.c, elf_sm).
+  // This read the second byte unconditionally until 2026-09-21, so a v7 sm_80 image came out as "sm_5".
+  uint32_t eflags = rd32(img + 0x30);
+  out->sm_arch = img[7] == 0x33 ? (eflags & 0xff) : ((eflags >> 8) & 0xff);
 
   uint64_t shoff = rd64(img + 0x28);
   uint16_t shent = rd16(img + 0x3a), shnum = rd16(img + 0x3c), shstrndx = rd16(img + 0x3e);
