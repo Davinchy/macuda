@@ -1746,8 +1746,14 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
   if (ls && !strcmp(ls, "auto")) {
     unsigned lgen = 0, lw = 0;
     tinynv_dev_link(&g->dev, &lgen, &lw);
-    if (lgen >= 1 && lgen <= 5) { snprintf(auto_buf, sizeof auto_buf, "gen%u", lgen); ls = auto_buf; }
-    else ls = "lock";
+    // AND NEVER ABOVE GEN3. On a fresh 16 GT/s enumeration with only Gen5 forbidden, every boot lost its configuration
+    // on every attempt (23 losses in 18 tries, 2026-09-21 15:00) and the loss lines showed the link flapping between
+    // Gen4 and Gen1 the whole time; capped at Gen3 the same card came up first try, three of three, starting from that
+    // same Gen4 link. Gen4 is not a speed this enclosure holds, and a Thunderbolt tunnel carries no more than a Gen3 x4
+    // link's worth of PCIe in any case, so nothing is given up.
+    if (lgen > 3) lgen = 3;
+    if (lgen >= 1) { snprintf(auto_buf, sizeof auto_buf, "gen%u", lgen); ls = auto_buf; }
+    else ls = "gen3";
   }
   if (ls && *ls && strcmp(ls, "off") && g->dev.pci->live) {
     uint32_t v = 1u << 31;                       // LOCK_AT_LOAD
