@@ -73,6 +73,9 @@ typedef struct {
 int tinynv_cubin_image(const tinynv_cubin_t *c, const char *kernel, int with_bytes, tinynv_image_t *out);
 // Writes the addresses into the image, once the block has a device address. Relocation types are CUDA's, not the host's.
 int tinynv_image_relocate(tinynv_image_t *im, uint64_t image_va);
+// A data object's offset in the loadable image and its size, from the symbol table and the image's own layout.
+// Refuses by name: no such symbol, not an object, or a section the image does not lay out (image.c).
+int tinynv_cubin_global(const tinynv_cubin_t *c, const char *name, uint64_t *image_off, uint64_t *size);
 void tinynv_image_free(tinynv_image_t *im);
 
 int tinynv_cubin_parse(const void *data, size_t len, tinynv_cubin_t *out);

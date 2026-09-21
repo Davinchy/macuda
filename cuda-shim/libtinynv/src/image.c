@@ -72,22 +72,21 @@ static int grow(uint8_t **buf, size_t *len, size_t *cap, size_t want) {
   return 0;
 }
 
-int tinynv_cubin_image(const tinynv_cubin_t *c, const char *kernel, int with_bytes, tinynv_image_t *out) {
-  memset(out, 0, sizeof(*out));
-  if (!c->sections) return tinynv_fail("cubin: no section table; parse it first");
-
-  // A private copy of the addresses: laying out assigns one to every section that had none, and the cubin itself stays
-  // as it was read so a second kernel from the same cubin lays out from the same starting point.
-  uint64_t *addr = calloc((size_t)c->nsections, sizeof(uint64_t));
-  if (!addr) return tinynv_fail("out of memory for %d section addresses", c->nsections);
+// Where every section goes in the loadable block: its declared address if it has one, else appended in file order at
+// CUDA's 128-byte alignment (or the section's own, if larger). Only SHT_PROGBITS sections are placed. Shared by
+// tinynv_cubin_image and tinynv_cubin_global, so a global's address is computed from THE layout the image is built with
+// and not from a second copy of it that could drift. On failure nothing is allocated and *bytes is NULL.
+static int place(const tinynv_cubin_t *c, uint64_t *addr, int with_bytes, uint8_t **bytes_out, size_t *len_out,
+                 size_t *cap_out) {
   for (int i = 0; i < c->nsections; i++) addr[i] = c->sections[i].addr;
 
   // Sections that declare an address fix the block's size before anything is appended.
   size_t len = 0, cap = 0;
   uint8_t *bytes = NULL;
+  *bytes_out = NULL;
   for (int i = 0; i < c->nsections; i++)
     if (c->sections[i].type == SHT_PROGBITS && addr[i] && addr[i] + c->sections[i].size > len) len = addr[i] + c->sections[i].size;
-  if (with_bytes && grow(&bytes, &len, &cap, len)) { free(addr); return -1; }
+  if (with_bytes && grow(&bytes, &len, &cap, len)) return -1;
 
   for (int i = 0; i < c->nsections; i++) {
     const tinynv_section_t *s = &c->sections[i];
@@ -98,12 +97,29 @@ int tinynv_cubin_image(const tinynv_cubin_t *c, const char *kernel, int with_byt
     }
     uint64_t align = s->align > CUDA_SECTION_ALIGN ? s->align : CUDA_SECTION_ALIGN;
     size_t pad = (size_t)((align - len % align) % align);
-    if (with_bytes && grow(&bytes, &len, &cap, len + pad + s->size)) { free(addr); free(bytes); return -1; }
+    if (with_bytes && grow(&bytes, &len, &cap, len + pad + s->size)) { free(bytes); return -1; }
     len += pad;
     if (with_bytes) memcpy(bytes + len, c->img + s->off, s->size);
     addr[i] = len;      // and this is what the relocations and the descriptor will refer to
     len += s->size;
   }
+  *bytes_out = bytes;
+  *len_out = len;
+  *cap_out = cap;
+  return 0;
+}
+
+int tinynv_cubin_image(const tinynv_cubin_t *c, const char *kernel, int with_bytes, tinynv_image_t *out) {
+  memset(out, 0, sizeof(*out));
+  if (!c->sections) return tinynv_fail("cubin: no section table; parse it first");
+
+  // A private copy of the addresses: laying out assigns one to every section that had none, and the cubin itself stays
+  // as it was read so a second kernel from the same cubin lays out from the same starting point.
+  uint64_t *addr = calloc((size_t)c->nsections, sizeof(uint64_t));
+  if (!addr) return tinynv_fail("out of memory for %d section addresses", c->nsections);
+  size_t len = 0, cap = 0;
+  uint8_t *bytes = NULL;
+  if (place(c, addr, with_bytes, &bytes, &len, &cap)) { free(addr); return -1; }
 
   // Where this kernel's code and constant banks ended up. Bank 0 belongs to the kernel and is named after it; the higher
   // banks belong to the module. The oracle takes whichever ".nv.constant0.*" it meets last, which is right for a cubin
@@ -233,4 +249,57 @@ void tinynv_image_free(tinynv_image_t *im) {
   free(im->bytes);
   free(im->relocs);
   memset(im, 0, sizeof(*im));
+}
+
+// A DATA SYMBOL'S PLACE IN THE LOADABLE IMAGE - what cuModuleGetGlobal / cuLibraryGetGlobal answer, before the
+// module's device address is added. cuBLAS asks for exactly one today: `cublas::internal::deviceConstants`, and without
+// it cublasCreate returns ALLOC_FAILED (C's H2 enumeration). In libcublasLt's 13,616-byte sm_120 image it is an OBJECT
+// symbol, LOCAL binding, 112 bytes at offset 0 of `.nv.global.init` - so locals are found (the real driver answers
+// this one), and the size is the SYMBOL's own st_size, never a guess or the section's size.
+//
+// The offset comes from place(), the one layout tinynv_cubin_image builds with, so the address a caller gets is the
+// address every relocation against the same symbol was written with.
+//
+// Refused, each by name: a name no symbol table carries; a symbol that is not an object (a kernel's name, say); and an
+// object in a section this loader does not lay out - `.nv.global` is SHT_NOBITS (zero-initialised __device__ data) and
+// place() lays out only SHT_PROGBITS, so there is no truthful address to give for it.
+#define SHT_NOBITS 8
+int tinynv_cubin_global(const tinynv_cubin_t *c, const char *name, uint64_t *image_off, uint64_t *size) {
+  if (!c->sections || !name) return tinynv_fail("cubin: no section table, or no name to look for");
+  for (int i = 0; i < c->nsections; i++) {
+    const tinynv_section_t *symtab = &c->sections[i];
+    if (symtab->type != SHT_SYMTAB) continue;
+    for (uint64_t off = 0; off + 24 <= symtab->size; off += 24) {
+      const uint8_t *sy = c->img + symtab->off + off;
+      const char *n = strtab_name(c, symtab, sy);
+      if (!n || strcmp(n, name)) continue;
+      unsigned type = sy[4] & 0xf;
+      uint16_t shndx = (uint16_t)(sy[6] | (sy[7] << 8));
+      uint64_t value = rd64(sy + 8), sz = rd64(sy + 16);
+      if (type != 1 /* STT_OBJECT */)
+        return tinynv_fail("cubin: '%s' is a symbol of type %u, not a data object, so it has no global to hand out", name, type);
+      if (!shndx || shndx >= (uint16_t)c->nsections)
+        return tinynv_fail("cubin: '%s' is not defined in this module (section index %u)", name, shndx);
+      const tinynv_section_t *s = &c->sections[shndx];
+      if (s->type == SHT_NOBITS)
+        return tinynv_fail("cubin: '%s' lives in %s, which is zero-initialised (SHT_NOBITS) and not laid out by this loader, "
+                           "so there is no truthful address for it", name, s->sname);
+      if (s->type != SHT_PROGBITS)
+        return tinynv_fail("cubin: '%s' lives in %s, a section of type %u that is not part of the loadable image", name,
+                           s->sname, s->type);
+      if (value + sz > s->size)
+        return tinynv_fail("cubin: '%s' claims %llu bytes at %llu of %s, which holds %llu", name, (unsigned long long)sz,
+                           (unsigned long long)value, s->sname, (unsigned long long)s->size);
+      uint64_t *addr = calloc((size_t)c->nsections, sizeof(uint64_t));
+      if (!addr) return tinynv_fail("out of memory for %d section addresses", c->nsections);
+      uint8_t *bytes = NULL;
+      size_t len = 0, cap = 0;
+      if (place(c, addr, 0, &bytes, &len, &cap)) { free(addr); return -1; }
+      *image_off = addr[shndx] + value;
+      *size = sz;
+      free(addr);
+      return 0;
+    }
+  }
+  return tinynv_fail("cubin: no global named '%s' in this module", name);
 }

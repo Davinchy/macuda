@@ -63,6 +63,11 @@ struct tinynv_module {
   // cubin, not of a kernel, so every kernel in it shares these bytes and differs only in where its own code sits.
   tinynv_exec_module_t loaded;
   int is_loaded;
+  // THE NULL DEVICE'S "DEVICE MEMORY" FOR THIS MODULE: its laid-out image in host memory, built on the first global
+  // lookup. The null device's malloc hands out host memory too, so a global's address here is a host pointer a
+  // caller's copies can read and write - consistent with every other pointer the null device gives out.
+  uint8_t *host_image;
+  size_t host_len;
 };
 
 struct tinynv_kernel {
@@ -428,7 +433,51 @@ tinynv_status_t tinynv_module_unload(tinynv_module_t m) {
   }
   tinynv_cubin_free(&m->cubin);
   free(m->image);
+  free(m->host_image);
   free(m);
+  return TINYNV_OK;
+}
+
+// A module's data object by name: its device address and its size, both from the module itself - the size is the
+// symbol's own, never guessed. On a card the module's image goes across first if no launch has taken it yet, exactly
+// as the first launch would (one upload per module), so the address is where the bytes really are.
+tinynv_status_t tinynv_get_global(tinynv_module_t m, const char *name, tinynv_devptr_t *addr, size_t *size) {
+  if (!m || !name || !addr || !size) return TINYNV_ERR_INVALID;
+  uint64_t off = 0, sz = 0;
+  if (tinynv_cubin_global(&m->cubin, name, &off, &sz)) return TINYNV_ERR_INVALID;
+  if (!m->cubin.nkernels) return tinynv_fail("module has no kernels to lay its image out by"), TINYNV_ERR_INVALID;
+  tinynv_device_t d = m->dev;
+  if (d->has_pci) {
+    if (booted(d)) return TINYNV_ERR_DRIVER;
+    pthread_mutex_lock(&g_lock);
+    if (!m->is_loaded) {
+      if (tinynv_exec_load(&d->exec, &m->cubin, m->cubin.kernels[0].name, &m->loaded)) {
+        pthread_mutex_unlock(&g_lock);
+        return TINYNV_ERR_DRIVER;
+      }
+      m->is_loaded = 1;
+    }
+    uint64_t base = m->loaded.mem.va, len = m->loaded.layout.len;
+    pthread_mutex_unlock(&g_lock);
+    if (off + sz > len)
+      return tinynv_fail("global '%s' at %llu+%llu falls outside the %llu byte image", name, (unsigned long long)off,
+                         (unsigned long long)sz, (unsigned long long)len), TINYNV_ERR_DRIVER;
+    *addr = base + off;
+    *size = (size_t)sz;
+    return TINYNV_OK;
+  }
+  if (!m->host_image) {
+    tinynv_image_t im;
+    if (tinynv_cubin_image(&m->cubin, m->cubin.kernels[0].name, 1, &im)) return TINYNV_ERR_INVALID;
+    m->host_image = im.bytes; m->host_len = im.len;
+    im.bytes = NULL;
+    tinynv_image_free(&im);
+  }
+  if (off + sz > m->host_len)
+    return tinynv_fail("global '%s' at %llu+%llu falls outside the %zu byte image", name, (unsigned long long)off,
+                       (unsigned long long)sz, m->host_len), TINYNV_ERR_DRIVER;
+  *addr = (tinynv_devptr_t)(uintptr_t)(m->host_image + off);
+  *size = (size_t)sz;
   return TINYNV_OK;
 }
 
