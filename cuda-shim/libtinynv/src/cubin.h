@@ -78,5 +78,8 @@ void tinynv_image_free(tinynv_image_t *im);
 int tinynv_cubin_parse(const void *data, size_t len, tinynv_cubin_t *out);
 void tinynv_cubin_free(tinynv_cubin_t *c);
 const tinynv_kernel_desc_t *tinynv_cubin_kernel(const tinynv_cubin_t *c, const char *name);
+// The most threads one block of this kernel can have: its __launch_bounds__ if it declares one, capped by what its
+// registers allow (NVIDIA's own rule, cubin.c). 0 means no block size fits at all.
+uint32_t tinynv_kernel_thread_limit(const tinynv_kernel_desc_t *d);
 
 #endif

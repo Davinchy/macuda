@@ -126,7 +126,7 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # already wins over the environment, so this changes nothing about how they run - it removes the possibility that a
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
-test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_rm_free $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_rm_free $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@# FIRST, before any test runs: do the tests in this directory still report what they find? On 2026-09-15
 	@# test_rm_free.c exited 0 with FAIL printed - it consulted its failure count at line 117 of a 318-line main, the
 	@# file grew past that guard, and the whole C4b decision plus the rows proving the read-only fix landed below it.
@@ -199,6 +199,9 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@# ...and the device assert handler, on a real torch sm_120 image that references BOTH allowed names. Tracked
 	@# (test/fixtures/README.md), so this arm never skips.
 	@$(BUILD)/test_reloc test/fixtures/torch-cu128-assertfail-vprintf.sm120.cubin
+	@# the most threads a block can have: __launch_bounds__ capped by registers (NVIDIA's rule), on a torch image whose
+	@# kernels declare no bound - reported by kernel_info, and one warp over it refused before any card is involved
+	@$(BUILD)/test_thread_limit test/fixtures/torch-cu128-unbounded-regs.sm120.cubin
 	@# the command buffers the card was handed, rebuilt from the oracle's own method numbers and compared word for word
 	@$(PYTHON) tools/nv_reference_submit.py test/reference-submit.txt >/dev/null && $(BUILD)/test_submit test/reference-submit.txt
 	@# and the kernel descriptor, against what tinygrad's own QMD class builds for the same cubin. the C side reads the

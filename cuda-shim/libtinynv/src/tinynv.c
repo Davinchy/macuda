@@ -451,6 +451,12 @@ tinynv_status_t tinynv_kernel_info(tinynv_kernel_t k, tinynv_kernel_info_t *i) {
   i->param_base = (int)d->param_base;
   i->regs = (int)d->regs;
   i->static_smem = (int)d->static_smem;
+  i->max_threads = (int)tinynv_kernel_thread_limit(d);
+  // 0 must keep meaning "not reported" (a daemon built before the field): a kernel no block size can hold is refused
+  // here by name instead. Only a register count over 256 does that, which no cubin a real toolchain emits carries.
+  if (!i->max_threads)
+    return tinynv_fail("kernel %s declares %u registers per thread, more than any block can hold", d->name, d->regs),
+           TINYNV_ERR_INVALID;
   int n = d->nparams;
   if (n > (int)(sizeof(i->params) / sizeof(i->params[0]))) return tinynv_fail("kernel %s has %d parameters, the interface carries %zu",
                                                                               d->name, n, sizeof(i->params) / sizeof(i->params[0])),
@@ -1052,10 +1058,23 @@ tinynv_status_t tinynv_launch(tinynv_stream_t s, tinynv_kernel_t k, unsigned gx,
   const tinynv_kernel_desc_t *d = k->desc;
   if (params_len > d->param_size)
     return tinynv_fail("launch %s: %zu bytes of parameters, the cubin declares %u", d->name, params_len, d->param_size), TINYNV_ERR_INVALID;
-  // the cubin's own __launch_bounds__ when it declares one, else the hardware ceiling: a 256-bound kernel run at 512 faults
-  unsigned threads = bx * by * bz, bound = d->max_threads ? d->max_threads : 1024;
-  if (threads > bound)
-    return tinynv_fail("launch %s: %u threads per block, the kernel allows %u", d->name, threads, bound), TINYNV_ERR_LAUNCH;
+  // the cubin's own __launch_bounds__ when it declares one, else the hardware ceiling: a 256-bound kernel run at 512
+  // faults - AND capped by the kernel's registers, which the hardware does not refuse but never schedules
+  // (tinynv_kernel_thread_limit, NVIDIA's occupancy rule). The refusal says which of the two set the limit.
+  unsigned threads = bx * by * bz, bound = tinynv_kernel_thread_limit(d);
+  if (threads > bound) {
+    unsigned declared = d->max_threads ? d->max_threads : 1024;
+    // THE REASON COMES BEFORE THE NAME. A CUTLASS kernel's mangled name runs past 1800 characters and the error
+    // buffer does not, so a message that led with the name lost everything after it - including why.
+    if (bound < declared)
+      return tinynv_fail("launch refused: %u threads per block, but %u registers per thread allow at most %u (NVIDIA's "
+                         "occupancy rule; %s %u) - kernel %s", threads, d->regs, bound,
+                         d->max_threads ? "its __launch_bounds__ says" : "it declares no bound, the ceiling is", declared,
+                         d->name),
+             TINYNV_ERR_LAUNCH;
+    return tinynv_fail("launch refused: %u threads per block, the kernel allows %u - kernel %s", threads, bound, d->name),
+           TINYNV_ERR_LAUNCH;
+  }
   s->submitted++;
   if (s->dev->has_pci) {
     if (!s->dev->booted) NEED_GPU(s);   // the boot check takes the lock; once booted, a flag says so

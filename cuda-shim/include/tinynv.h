@@ -48,7 +48,11 @@ tinynv_status_t tinynv_module_load(tinynv_device_t, const void* cubin, size_t le
 tinynv_status_t tinynv_module_unload(tinynv_module_t);
 tinynv_status_t tinynv_get_kernel(tinynv_module_t, const char* name, tinynv_kernel_t* out);
 // param layout the shim needs to marshal args correctly (from the cubin's EIATTR_KPARAM_INFO 0x17 / PARAM_CBANK 0x0a)
-typedef struct { int num_params; int param_base; struct { int offset, size; } params[64]; int regs, static_smem; } tinynv_kernel_info_t;
+// max_threads: the most threads one block can have - __launch_bounds__ capped by what the registers allow, NVIDIA's
+// rule (libtinynv/src/cubin.c tinynv_kernel_thread_limit). A driver's CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK comes
+// from here, never from a constant 1024. It is the LAST field on purpose: a reply from a daemon built before it
+// existed leaves it as the caller initialised it, so a caller that zeroes the struct reads 0 = "not reported".
+typedef struct { int num_params; int param_base; struct { int offset, size; } params[64]; int regs, static_smem; int max_threads; } tinynv_kernel_info_t;
 tinynv_status_t tinynv_kernel_info(tinynv_kernel_t, tinynv_kernel_info_t* out);
 
 // memory

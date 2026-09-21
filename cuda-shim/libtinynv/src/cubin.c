@@ -178,3 +178,42 @@ const tinynv_kernel_desc_t *tinynv_cubin_kernel(const tinynv_cubin_t *c, const c
   tinynv_fail("cubin: no kernel named %s", name);
   return NULL;
 }
+
+/* THE MOST THREADS ONE BLOCK OF THIS KERNEL CAN HAVE, which is 1024 only when its registers allow it.
+ *
+ * A kernel with no __launch_bounds__ was treated as good for 1024 threads. Its registers say otherwise: the register
+ * file is shared by every warp of a block, and a block whose warps need more than the file holds is not refused by
+ * the hardware in any way this driver can see - the shared-memory case, measured on this card, arrives as a launch
+ * that is accepted and never scheduled. Torch's guest library has 1387 kernels with no bound whose registers do not
+ * allow 1024 threads, down to 256 (B's sweep, D's rerun on the guest file: cuda-shim-d cc2b1c3).
+ *
+ * NVIDIA'S OWN RULE, NOT A REMEMBERED ONE - cuda-13/include/cuda_occupancy.h, the CUDA 13.0 occupancy calculator:
+ *   cudaOccRegAllocationGranularity  (:680)   256 registers, compute capability 3 through 12
+ *   cudaOccRegAllocationMaxPerThread (:650)   256 per thread, compute capability 7 through 12
+ *   cudaOccSubPartitionsPerMultiprocessor (:708)  4, compute capability 7 through 12
+ *   the per-block check (:1523-1545): regsAllocatedPerWarp = roundUp(numRegs * warpSize, granularity); a block of W
+ *   warps fits only if regsPerBlock >= regsAllocatedPerWarp * roundUp(W, subPartitions)  ("the hardware check")
+ *                  and regsPerBlock >= regsAllocatedPerWarp * W                          ("the software check")
+ * regsPerBlock is 65536: the shim's CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK, which it tags ARCH (a programming-
+ * model constant, not read from this card - shim.c:345). The same calculator also needs the SM to hold the block's
+ * warps; with regsPerMultiprocessor equal to regsPerBlock that follows from the check above.
+ *
+ * Every constant above is the same for every architecture this driver loads (sm_80 to sm_120), so none is keyed on
+ * sm_arch; a compute capability outside 7..12 would need the table re-read, not these numbers reused. */
+#define TNV_REGS_PER_BLOCK      65536u
+#define TNV_REG_GRANULARITY     256u
+#define TNV_REG_MAX_PER_THREAD  256u
+#define TNV_SUBPARTITIONS       4u
+uint32_t tinynv_kernel_thread_limit(const tinynv_kernel_desc_t *d) {
+  uint32_t bound = d->max_threads && d->max_threads < 1024 ? d->max_threads : 1024;
+  if (d->regs > TNV_REG_MAX_PER_THREAD) return 0;
+  uint32_t per_warp = (d->regs * 32u + TNV_REG_GRANULARITY - 1) / TNV_REG_GRANULARITY * TNV_REG_GRANULARITY;
+  if (!per_warp) return bound;
+  uint32_t fit = 0;
+  for (uint32_t w = 1; w <= 32; w++) {
+    uint32_t rounded = (w + TNV_SUBPARTITIONS - 1) / TNV_SUBPARTITIONS * TNV_SUBPARTITIONS;
+    if (per_warp * rounded > TNV_REGS_PER_BLOCK || per_warp * w > TNV_REGS_PER_BLOCK) break;
+    fit = w * 32;
+  }
+  return fit < bound ? fit : bound;
+}

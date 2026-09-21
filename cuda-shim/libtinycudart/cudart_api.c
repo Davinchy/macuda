@@ -247,7 +247,11 @@ cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *a, const void *fn) 
   tinynv_kernel_t k = tinycudart_kernel_for(fn); tinynv_kernel_info_t ki; memset(a, 0, sizeof *a);
   if (!k || tinynv_kernel_info(k, &ki) != TINYNV_OK) { fprintf(stderr, "[tinycudart] cudaFuncGetAttributes: %s (%p) has no device code\n", tinycudart_kernel_name(fn), fn); return E(cudaErrorInvalidDeviceFunction); }
   tinynv_device_props_t p = props();
-  a->numRegs = ki.regs; a->sharedSizeBytes = (size_t)ki.static_smem; a->maxThreadsPerBlock = p.max_threads_per_block ? p.max_threads_per_block : 1024;
+  /* maxThreadsPerBlock is the FUNCTION's, not the device's: its __launch_bounds__ capped by its registers (libtinynv
+   * tinynv_kernel_thread_limit, NVIDIA's occupancy rule). The device's 1024 here told a caller that a 254-register
+   * kernel could take 1024 threads, and a block that size is accepted and never scheduled. */
+  a->numRegs = ki.regs; a->sharedSizeBytes = (size_t)ki.static_smem;
+  a->maxThreadsPerBlock = ki.max_threads > 0 ? ki.max_threads : (p.max_threads_per_block ? p.max_threads_per_block : 1024);
   a->constSizeBytes = (size_t)(ki.param_base + (ki.num_params ? ki.params[ki.num_params - 1].offset + ki.params[ki.num_params - 1].size : 0));
   a->maxDynamicSharedSizeBytes = dyn_smem_limit(fn); a->binaryVersion = a->ptxVersion = p.cc_major * 10 + p.cc_minor;
   return E(cudaSuccess);
