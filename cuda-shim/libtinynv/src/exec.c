@@ -872,9 +872,11 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
   uint32_t inl = 0;
   if (q != &ex->g->gsp.copy_q)
     for (unsigned i = 0; i < ex->inline_pend_n; i++) inl += TINYNV_INLINE_DWORDS(ex->inline_pend[i].len);
-  uint32_t *w = cmd_space(ex, dwords + inl + (head_ts ? 12u : 0u), va);
+  // Six dwords for the same-queue acquire below (one semaphore method), which every asynchronous compute batch takes.
+  uint32_t sq = q != &ex->g->gsp.copy_q && !ex->sync && ex->q_last[0] ? 6u : 0u;
+  uint32_t *w = cmd_space(ex, dwords + inl + sq + (head_ts ? 12u : 0u), va);
   if (!w) return -1;
-  *c = (tinynv_cmdbuf_t){.words = w, .n = 0, .cap = dwords + inl + (head_ts ? 12u : 0u)};
+  *c = (tinynv_cmdbuf_t){.words = w, .n = 0, .cap = dwords + inl + sq + (head_ts ? 12u : 0u)};
   // Synchronously there is nothing to order against: the previous batch was waited on before this one was built, so
   // the acquire would always be already satisfied. Leaving it out is what makes TINYNV_SYNC=1 the pre-d29cb32 path
   // rather than the new path with a wait bolted on, which matters when the question is whether the acquire is the bug.
@@ -907,9 +909,19 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
       ex->pending_acquire_other = ex->q_last[other];
     }
   }
-  // Emitted here: after the acquire that orders this batch, before anything the caller appends, and before the memory
+  // THE SAME-QUEUE ACQUIRE, BEFORE ANY HELD BYTES (H4's address-0 fault, 2026-09-21). Every asynchronous compute batch
+  // waits here for the compute work before it. This used to be emitted by tinynv_exec_flush AFTER this function returned
+  // - so the held uploads below, which this batch's command stream writes the moment it runs, landed while the previous
+  // chain's kernels could still be executing: bytes the guest issued AFTER those launches, underneath them. The standalone
+  // batches that carry held bytes on their own (a copy's, a full list's) had no same-queue acquire at all. Now all of
+  // them take it, and the chain flush no longer emits a second one.
+  if (sq) {
+    if (tinynv_cmd_wait(c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) return -1;
+    ex->pending_acquire = ex->q_last[0];
+  }
+  // Emitted here: after both acquires that order this batch, before anything the caller appends, and before the memory
   // barrier a launch batch emits next - so the bytes are written and flushed before any kernel in this batch can read
-  // them, and ordered against the previous chain by the same acquire that orders everything else.
+  // them, and only after every launch the guest issued before them has finished.
   if (q != &ex->g->gsp.copy_q && ex->inline_pend_n) {
     for (unsigned i = 0; i < ex->inline_pend_n; i++)
       if (tinynv_cmd_inline_upload(c, ex->inline_pend[i].dst, ex->inline_pend_buf + ex->inline_pend[i].off,
@@ -1492,10 +1504,8 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   //
   // One acquire per chain, not per launch: thirty-two kernels still pipeline inside it, and only the seam between
   // chains is serialised. That is the cost of correctness here and it is a thirty-second of what the old release cost.
-  if (!ex->sync && ex->q_last[0]) {
-    if (tinynv_cmd_wait(&c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) return -1;
-    ex->pending_acquire = ex->q_last[0];
-  }
+  // (That acquire is emitted by batch_begin now, at the head of the batch and before any held bytes it carries - see
+  // there. Emitting it here, after them, is what let held uploads land underneath the previous chain.)
   // the caches have to forget what the last kernel left in them, or this one reads its predecessor's constants
   if (tinynv_cmd_memory_barrier(&c)) return -1;
   if (ex->no_chain_deps) {
@@ -1798,6 +1808,15 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
   // Small, whole dwords, aligned: everything else goes to the engine built for moving bytes. The 20480-byte copy of
   // the seven stays there too - past a few KB the pushbuffer itself has to reach the card, so inlining stops paying.
   if (ex->inline_upload && n && n <= ex->inline_max && !(n & 3u) && !(dst_va & 3u)) {
+    // AN UPLOAD NEVER LANDS BEFORE A LAUNCH THAT PRECEDES IT (H4's address-0 fault, 2026-09-21). Held bytes ride at the
+    // HEAD of the next compute batch, and a chain's launches are accumulated before that batch is begun - so an upload
+    // issued between launch k and k+1 of a pending chain landed before launch 1. A kernel earlier in the chain that
+    // wrote the destination (a zero-fill, say) then ran AFTER the new bytes and overwrote them, and a later kernel read
+    // what it left: a pointer table still zero, a read of address 0. TINYNV_SYNC=1 hid it, because every batch was
+    // waited on. The pending chain is handed over first, so the bytes ride behind these launches, at the head of the
+    // next batch, after its same-queue acquire on them. It costs a chain boundary per upload issued mid-chain, and
+    // nothing when uploads come before a step's launches, which is where llama.cpp and every H-run until H4 put them.
+    if (ex->nchain && tinynv_exec_flush(ex)) return -1;
     // BUFFERED, not submitted, and that is the whole of the fix. This took a batch, a doorbell and an idle of its own
     // - and worse, batch_begin FLUSHES the pending chain, so every tiny copy forced whatever launches were queued out
     // early. Six a token. Session A measured the round trip at ~50 us a copy and then showed, by removing the wait
