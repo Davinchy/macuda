@@ -1037,6 +1037,40 @@ tinynv_status_t tinynv_event_sync(tinynv_event_t e) {
   if (!e || !e->dev->has_pci || !e->dev->booted) return TINYNV_OK;
   return WITH_LOCK(tinynv_exec_wait(&e->dev->exec, e->value, 30.0)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
 }
+// Whether tinynv_event_sync would return at once, without waiting. The answer is tinynv_exec_reached - the predicate the
+// wait itself exits on - so "complete" cannot be said of work the engine has not retired. A caching allocator polls
+// this to decide when a block freed on one stream may be reused, and a wrong 1 hands out memory a kernel still writes.
+tinynv_status_t tinynv_event_query(tinynv_event_t e, int *complete) {
+  if (!e || !complete) return TINYNV_ERR_INVALID;
+  if (!e->dev->has_pci || !e->dev->booted || !e->value) { *complete = 1; return TINYNV_OK; }
+  int r = WITH_LOCK(tinynv_exec_reached(&e->dev->exec, e->value));
+  if (r < 0) return TINYNV_ERR_DRIVER;
+  *complete = r;
+  return TINYNV_OK;
+}
+tinynv_status_t tinynv_event_destroy(tinynv_event_t e) {
+  if (!e) return TINYNV_ERR_INVALID;
+  free(e);                 // an event is a remembered timeline value: there is nothing on the device to release
+  return TINYNV_OK;
+}
+tinynv_status_t tinynv_event_elapsed(float *ms, tinynv_event_t start, tinynv_event_t end) {
+  if (!ms || !start || !end) return TINYNV_ERR_INVALID;
+  return tinynv_fail("event elapsed time is not recorded by this driver: an event is a timeline value, and no timestamp "
+                     "is taken at the point it names, so there is nothing true to subtract"),
+         TINYNV_ERR_INVALID;
+}
+tinynv_status_t tinynv_mem_info(tinynv_device_t d, uint64_t *free_bytes, uint64_t *total_bytes) {
+  if (!d || !free_bytes || !total_bytes) return TINYNV_ERR_INVALID;
+  if (!d->has_pci)
+    return tinynv_fail("the null device has no memory allocator to report free memory from"), TINYNV_ERR_NODEV;
+  if (booted(d)) return TINYNV_ERR_DRIVER;
+  pthread_mutex_lock(&g_lock);
+  uint64_t total = tinynv_tlsf_size(d->gpu.mm.pa.alloc), used = tinynv_tlsf_used(d->gpu.mm.pa.alloc);
+  pthread_mutex_unlock(&g_lock);
+  *total_bytes = total;
+  *free_bytes = used < total ? total - used : 0;
+  return TINYNV_OK;
+}
 // Wait until the work an event was recorded after has finished.
 //
 // ggml's scheduler calls this on every llama.cpp run, not only across several GPUs: token embeddings live on the CPU

@@ -534,6 +534,10 @@ int tinynv_exec_arena_dma(const char *e, int arena_vram, const char **why);
 // Wait until the engine has released `value`, or give up. Returns -1 on timeout, which is a fault rather than slowness:
 // the engine either ran the batch or faulted, and a batch that never completes means the second.
 int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds);
+// Has the work up to `value` finished? 1 yes, 0 not yet, -1 the question could not be asked. The SAME predicate
+// tinynv_exec_wait decides "done" with, asked once instead of in a loop - so a query answers 1 exactly when a wait
+// would return at once, and can never say "complete" for work the engine has not retired.
+int tinynv_exec_reached(tinynv_exec_t *ex, uint64_t value);
 
 // Wait for everything submitted so far. The caller needs this before it reads a result, before it takes away memory the
 // engine might still be reading, and nowhere else - which is the whole point of submitting without waiting.

@@ -304,6 +304,13 @@ static uint64_t qmd_sum(const uint8_t *b) {
   return h;
 }
 
+int tinynv_exec_reached(tinynv_exec_t *ex, uint64_t value) {
+  // Staged and not announced is work the engine has not been told about: announce it first, exactly as the wait does,
+  // or a query of an event recorded behind it would read "not yet" forever.
+  if (tinynv_submit_ring(ex->g)) return -1;
+  return sem_reached(ex, value);
+}
+
 int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
   // A pending keep-alive is let go before a wait that needs the compute queue past it (the driver's own later work,
   // which never happens on a decode); a wait that needs no more than what came before it leaves the spin alone.

@@ -132,6 +132,19 @@ void tinynv_graph_free(tinynv_stream_t, tinynv_graph_t);
 tinynv_status_t tinynv_event_create(tinynv_device_t, tinynv_event_t* out);
 tinynv_status_t tinynv_event_record(tinynv_event_t, tinynv_stream_t);
 tinynv_status_t tinynv_event_sync(tinynv_event_t);
+// Has the work before the event's record point finished, WITHOUT waiting: *complete = 1 or 0. Never 1 before the
+// engine has retired that work - it is the predicate tinynv_event_sync waits on, asked once. An event never recorded
+// is complete (CUDA's rule). On the null device nothing executes and every event is complete.
+tinynv_status_t tinynv_event_query(tinynv_event_t, int *complete);
+tinynv_status_t tinynv_event_destroy(tinynv_event_t);
+// Milliseconds between two recorded events - REFUSED BY NAME, always, for now: an event here is a timeline value and
+// no timestamp is taken at the point it names, so there is nothing true to subtract (CUDA refuses the same way for
+// events created without timing). A number made up here would be believed.
+tinynv_status_t tinynv_event_elapsed(float *ms, tinynv_event_t start, tinynv_event_t end);
+// Free and total bytes of device memory AS THE ALLOCATOR SEES IT: total is what it manages (never the physical size),
+// free is total minus what it has handed out and not had back, so a malloc that lands moves it. Refused by name on
+// the null device, which has no allocator to ask.
+tinynv_status_t tinynv_mem_info(tinynv_device_t, uint64_t *free_bytes, uint64_t *total_bytes);
 tinynv_status_t tinynv_stream_wait_event(tinynv_stream_t, tinynv_event_t);
 // the hot path. params is one contiguous blob laid out per tinynv_kernel_info (param_base..). dyn_smem in bytes.
 tinynv_status_t tinynv_launch(tinynv_stream_t, tinynv_kernel_t,

@@ -44,6 +44,7 @@ typedef struct blk {
 
 struct tinynv_tlsf {
   uint64_t base, size;
+  uint64_t used;   // bytes in live blocks: + a block's final size when it is handed out, - the same when it comes back
   blk_t *head;
   blk_t **buckets; // [lv1][lv2], flattened
   int lv1_max;
@@ -144,6 +145,7 @@ uint64_t tinynv_tlsf_alloc(tinynv_tlsf_t *a, uint64_t req_size, uint64_t align) 
       }
       if (b->size > req_size && !split(a, b, req_size)) return TINYNV_TLSF_FAIL;
       bucket_remove(a, b);
+      a->used += b->size;
       return b->start + a->base;
     }
   }
@@ -155,6 +157,7 @@ void tinynv_tlsf_release(tinynv_tlsf_t *a, uint64_t addr) {
   blk_t *b = a->head;
   while (b && b->start != at) b = b->next;
   if (!b || b->free) return;
+  a->used -= b->size;              // before the merge below changes what b->size means
   bucket_append(a, b);
   // merge with free neighbours so the space can be used by a larger request later
   while (b->prev && b->prev->free) {
@@ -179,3 +182,6 @@ void tinynv_tlsf_release(tinynv_tlsf_t *a, uint64_t addr) {
     bucket_append(a, b);
   }
 }
+
+uint64_t tinynv_tlsf_used(const tinynv_tlsf_t *a) { return a ? a->used : 0; }
+uint64_t tinynv_tlsf_size(const tinynv_tlsf_t *a) { return a ? a->size : 0; }
