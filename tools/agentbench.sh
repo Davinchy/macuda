@@ -20,7 +20,7 @@ mkdir -p "$(dirname "$out")"
   # the driver's build id only means something in a binary that carries the driver; the strings of a Metal build have none
   # the id is the string build_id.c carries, and the archive the binary was linked from carries the same one alone
   if strings "$bin" | grep -q 'libtinynv build'; then echo "driver_build_id=$(strings "$R/cuda-shim/build/shim/nv/libtinynv.a" 2>/dev/null | grep -oE '^[0-9a-f]{7}(-dirty)?$|^nogit(-dirty)?$' | head -1)"; else echo "driver_build_id=none (not a driver build)"; fi
-  system_profiler SPPCIDataType 2>/dev/null | awk '/Vendor ID: 0x10de/{nv=1} nv&&/Link Width|Link Speed/{k=tolower($1"_"$2); sub(/:$/, "", k); print "pcie_"k"_before="$3" "$4} nv&&/Link Status/{exit}'
+  system_profiler SPPCIDataType 2>/dev/null | awk '/Vendor ID: 0x10de/{nv=1} nv&&/Link Width|Link Speed/{k=tolower($1"_"$2); sub(/:$/, "", k); v=$3; if ($4 != "") v=v" "$4; print "pcie_"k"_before="v} nv&&/Link Status/{exit}'
 } > "$out.env.txt"
 # The link the card is on BEFORE the run is not the link the run is made on: the firmware idles the link down to Gen1
 # after every unload and brings it to the driver's cap (Gen3 on this enclosure) a few seconds into the next boot. So
