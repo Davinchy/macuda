@@ -25,6 +25,9 @@ void tinynv_dump_host_writes(int sig);
 // runs use, so the first time the card sees this driver it sees a sequence it has already accepted. (Session A's
 // suggestion, 2026-09-14.)
 int tinynv_is_faithful(void);
+
+// The drain tinynv_module_unload refuses on (tinynv.c): tests only - see the comment there.
+extern int (*tinynv_module_unload_drain)(tinynv_module_t);
 void tinynv_set_faithful(int on);
 
 // What the last fault was, for a caller holding only a device handle. Declared here rather than in the public header

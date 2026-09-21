@@ -425,12 +425,32 @@ tinynv_status_t tinynv_module_load(tinynv_device_t d, const void *cubin, size_t 
   return TINYNV_OK;
 }
 
+// WHETHER A MODULE'S CODE MAY BE FREED NOW: 0 when nothing can still be executing it - never uploaded, the device torn
+// down, or the device DRAINED - and nonzero when the drain FAILED, so a kernel from it may still be queued or running.
+// A pointer only so a card-free test can stand in a drain that fails or succeeds (test/test_module_unload.c, tinynvd's
+// selftest): the null device never uploads a module, so the real drain is not reachable without a card. Nothing else
+// assigns it.
+static int module_drained(tinynv_module_t m) {
+  if (!m->is_loaded || m->dev->torn_down || !m->dev->booted) return 0;
+  return tinynv_exec_idle(&m->dev->exec);
+}
+int (*tinynv_module_unload_drain)(tinynv_module_t) = module_drained;
+
+// REFUSED, AND KEPT, WHEN THE DEVICE DID NOT DRAIN (G's review, finding 1; A). This used to ignore tinynv_exec_idle's
+// result, free the module's code and return OK: an unload racing a hung or slow kernel freed memory the GPU could still
+// be executing, and the daemon then dropped every handle under it. Now the module, its code and its kernels stay exactly
+// as they were, the refusal says why, and a later unload - once the device has drained - frees it.
 tinynv_status_t tinynv_module_unload(tinynv_module_t m) {
   if (!m) return TINYNV_ERR_INVALID;
-  if (m->is_loaded && !m->dev->torn_down) {
-    if (m->dev->booted) tinynv_exec_idle(&m->dev->exec);   // a kernel from this module may still be queued
-    tinynv_exec_unload(&m->dev->gpu.mm, &m->loaded);
+  if (tinynv_module_unload_drain(m)) {
+    char why[256];
+    const char *said = tinynv_last_error();
+    snprintf(why, sizeof why, "%s", strcmp(said, "no error") ? said : "the drain recorded no reason");
+    tinynv_fail("module unload REFUSED: the device did not drain (%s), so a kernel from this module may still be "
+                "running; the module, its code and its kernels stay loaded - unload it again once the device is idle", why);
+    return TINYNV_ERR_DRIVER;
   }
+  if (m->is_loaded && !m->dev->torn_down) tinynv_exec_unload(&m->dev->gpu.mm, &m->loaded);
   tinynv_cubin_free(&m->cubin);
   free(m->image);
   free(m->host_image);
