@@ -57,7 +57,11 @@ def main():
         parts = spec.split(":"); label, sweep = parts[0], parts[1]; replay = parts[2] if len(parts) > 2 and parts[2] else None
         rows, env = load_sweep(sweep)
         rep = json.load(open(replay)) if replay and os.path.exists(replay) else None
-        cfgs.append({"label": label, "rows": rows, "env": env, "replay": rep, "sweep_path": sweep})
+        renv = {}
+        if replay and os.path.exists(replay + ".env.txt"):
+            for line in open(replay + ".env.txt"):
+                if "=" in line: k, v = line.rstrip("\n").split("=", 1); renv[k] = v
+        cfgs.append({"label": label, "rows": rows, "env": env, "replay": rep, "replay_env": renv, "sweep_path": sweep})
     md = ["# Coding-agent benchmark: " + " vs ".join(c["label"] for c in cfgs), ""]
     for c in cfgs:
         e = c["env"]; r0 = c["rows"][0]
@@ -69,7 +73,15 @@ def main():
                f"- date: {e.get('date', '-')}", "", "### Sweep", ""]
         t, an = sweep_table(c["rows"]); md += t; c["anomalies"] = an
         if c["replay"]:
-            md += ["", "### Replay, ten turns", ""]; t, an2 = replay_table(c["replay"]); md += t; c["anomalies"] += an2
+            re_ = c["replay_env"]
+            md += ["", "### Replay, ten turns", ""]
+            if re_.get("pcie_link_speed"): md += [f"- PCIe link during the replay: {re_.get('pcie_link_width', '-')} at {re_['pcie_link_speed']}; context {re_.get('ctx', '-')}; server up in {re_.get('server_up_s', '-')} s", ""]
+            t, an2 = replay_table(c["replay"]); md += t; c["anomalies"] += an2
+            rs = re_.get("pcie_link_speed", "")
+            try: rg = float(rs.split()[0]) if rs else None
+            except ValueError: rg = None
+            if rg is not None and rg < 8.0: c["anomalies"].append(f"replay ran on a PCIe link at {rs} - not the 8 GT/s the enclosure holds")
+            if ";" in re_.get("pcie_link_seen", ""): c["anomalies"].append(f"the link changed during the replay: {re_['pcie_link_seen']}")
         md += [""]
     # differences, b relative to a, matched by (label, depth)
     A, B = cfgs
