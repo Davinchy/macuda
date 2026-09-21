@@ -97,7 +97,8 @@ int main(int argc, char **argv) {
   // carried between the "launch=" line and the blocks that follow it
   tinynv_qmd_t q;
   char pending[512] = {0};
-  uint32_t cbuf0_dwords = 0;
+  uint32_t cbuf0_dwords = 0, sm_version = 0;
+  int qmd_v3 = 0;
   static uint8_t want[MAXHEX / 2], mine[MAXHEX / 2];
 
   while (fgets(line, sizeof(line), f)) {
@@ -107,13 +108,19 @@ int main(int argc, char **argv) {
     if (!strncmp(line, "device ", 7)) {
       slm = (uint32_t)num_after(line, "slm_per_thread=");
       sass = (uint32_t)num_after(line, "sass_version=");
+      qmd_v3 = num_after(line, "qmd_version=") == 3;
+      sm_version = (uint32_t)num_after(line, "sm_version=");
       shared_window = strtoull(strstr(line, "shared_window=") + 14, NULL, 0);
       local_window = strtoull(strstr(line, "local_window=") + 13, NULL, 0);
       die.num_gpcs = (uint32_t)num_after(line, "num_gpcs=");
       die.num_tpc_per_gpc = (uint32_t)num_after(line, "num_tpc_per_gpc=");
       die.num_sm_per_tpc = (uint32_t)num_after(line, "num_sm_per_tpc=");
       die.max_warps_per_sm = (uint32_t)num_after(line, "max_warps_per_sm=");
-      CHECK(sass == tinynv_sass_version(0xa04), "sass version %u, the card reported %u", tinynv_sass_version(0xa04), sass);
+      // against the sm_version THIS reference recorded, not against one card's: the same derivation has to hold for
+      // whichever card produced the capture, and hardcoding 0xa04 made this a check about the 5090 rather than about
+      // the derivation.
+      CHECK(sass == tinynv_sass_version(sm_version), "sass version %u derived from sm_version %#x, the card reported %u",
+            tinynv_sass_version(sm_version), sm_version, sass);
       tinynv_local_memory_size(&die, slm, &bytes_per_tpc);
       continue;
     }
@@ -129,6 +136,7 @@ int main(int argc, char **argv) {
       prog.constbuf_used[0] = 1;
       prog.constbuf_size[0] = (uint32_t)num_after(line, "const0_size=");
       memset(&q, 0, sizeof(q));
+      q.v3 = (uint8_t)qmd_v3;   // the layout these recorded bytes are in
       CHECK(!tinynv_qmd_program(&q, &prog), "building the program's descriptor failed: %s", tinynv_last_error());
 
       tinynv_qmd_launch_t l = {0};
@@ -154,19 +162,22 @@ int main(int argc, char **argv) {
     }
 
     if (!strncmp(line, "qmd=", 4)) {
-      CHECK(unhex(line + 4, want, sizeof(want)) == TINYNV_QMD_BYTES, "the recorded descriptor is not %d bytes", TINYNV_QMD_BYTES);
-      compare_bytes("descriptor", q.b, want, TINYNV_QMD_BYTES, 1);
+      // the size of the block THIS reference is in: 384 bytes of v5, or 256 of v3
+      uint32_t qbytes = qmd_v3 ? TINYNV_QMD_V3_BYTES : TINYNV_QMD_BYTES;
+      CHECK(unhex(line + 4, want, sizeof(want)) == (int)qbytes, "the recorded descriptor is not %u bytes", qbytes);
+      compare_bytes("descriptor", q.b, want, qbytes, 1);
       continue;
     }
     if (!strncmp(line, "claimed=", 8)) {
-      CHECK(unhex(line + 8, want, sizeof(want)) == TINYNV_QMD_BYTES, "the recorded claim mask is not %d bytes", TINYNV_QMD_BYTES);
-      compare_bytes("claimed bits", q.claimed, want, TINYNV_QMD_BYTES, 1);
+      uint32_t cbytes = qmd_v3 ? TINYNV_QMD_V3_BYTES : TINYNV_QMD_BYTES;
+      CHECK(unhex(line + 8, want, sizeof(want)) == (int)cbytes, "the recorded claim mask is not %u bytes", cbytes);
+      compare_bytes("claimed bits", q.claimed, want, cbytes, 1);
       continue;
     }
     if (!strncmp(line, "cbuf0=", 6)) {
       int n = unhex(line + 6, want, sizeof(want));
       uint32_t *cb0 = calloc(cbuf0_dwords, 4);
-      CHECK(tinynv_qmd_cbuf0(cb0, cbuf0_dwords, shared_window, local_window, NULL, NULL) == cbuf0_dwords,
+      CHECK(tinynv_qmd_cbuf0(cb0, cbuf0_dwords, qmd_v3, shared_window, local_window, NULL, NULL) == cbuf0_dwords,
             "constant buffer 0 came back the wrong length");
       CHECK(n == (int)cbuf0_dwords * 4, "the card's constant buffer 0 is %d bytes, this one is %u", n, cbuf0_dwords * 4);
       if (n == (int)cbuf0_dwords * 4) compare_bytes("constant buffer 0", (const uint8_t *)cb0, want, (uint32_t)n, 0);

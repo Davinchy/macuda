@@ -28,19 +28,45 @@ from tinygrad.helpers import round_up                      # noqa: E402
 from tinygrad.runtime.autogen import nv_570 as g           # noqa: E402
 from tinygrad.runtime import ops_nv                        # noqa: E402
 
-# The card's own numbers, from the 5090. Fixed here rather than queried so this runs with no GPU; the combined recording
-# session is what checks them against the card.
-SLM_PER_THREAD, SM_VERSION = 0x40, 0xa04
+# The card's own numbers. Fixed here rather than queried so this runs with no GPU; the combined recording session is
+# what checks them against the card.
+#
+# TWO ARCHITECTURES, because tinygrad's QMD picks its version - and therefore its field table, its grid field names and
+# whether a release carries payload64b - from the device's compute class alone. Handing the stub an Ampere class is
+# enough to make the oracle emit a v3 descriptor, which is how a reference for a 256 byte descriptor can be generated
+# with no Ampere card present.
+#
+# The Ampere sm_version is a PLACEHOLDER, and marked as one. A real card reports it from the RM control our own boot
+# issues in tinynv_gsp_open_client, which is a stage no recording here reaches yet, so there is no measured value to
+# use. It feeds exactly one descriptor field (SASS_VERSION) and the reference header states it, so the C side is told
+# the same number and the comparison stays a comparison of ENCODING. Replace it when a client-stage capture exists.
+SLM_PER_THREAD = 0x40
+ARCHS = {
+  "blackwell": (lambda: g.BLACKWELL_COMPUTE_B, 0xa04),  # measured on the 5090
+  "ampere":    (lambda: g.AMPERE_COMPUTE_B,    0x806),  # sm_version is a placeholder, see above
+}
+ARCH = os.environ.get("REFQMD_ARCH", "blackwell")
+if ARCH not in ARCHS: raise SystemExit(f"REFQMD_ARCH={ARCH}: expected one of {', '.join(ARCHS)}")
+COMPUTE_CLASS, SM_VERSION = ARCHS[ARCH][0](), ARCHS[ARCH][1]
 SHARED_WINDOW, LOCAL_WINDOW = 0x729400000000, 0x729300000000
 # placeholders with distinct halves, so a swapped high and low word shows up as a mismatch rather than a coincidence
 # Every one is in range for the field that holds it, which is checked below rather than assumed: a descriptor holds an
 # address in two halves, and the upper half of several of them is narrower than 32 bits.
 PROGRAM_ADDR, CBUF0_ADDR = 0x7f1122330000, 0x7f4455660000
-SEM_ADDR, SEM_PAYLOAD = 0x7f8899aabbcc, 0x99aabbccddeeff00
+SEM_PAYLOAD = 0x99aabbccddeeff00
+# THE RELEASE SEMAPHORE ADDRESS IS NARROWER ON AMPERE, and by a lot: v3 splits it 8 bits upper + 32 lower, so a
+# descriptor can only release a semaphore in the low 1 TB, where v5 splits it 25 + 32 and reaches 57 bits. The
+# placeholder below is 47 bits and fits Blackwell comfortably; on Ampere it does not fit at all, and the check further
+# down caught it rather than letting this file compare the C writer against a silently truncated address.
+#
+# This is not just a detail of the reference. A driver that places a release semaphore above 2^40 on an Ampere card
+# gets no error: the address is truncated into the field and the release lands somewhere else, which is a hang with no
+# message. tinygrad's own VA allocator is based at 64 GB with a 16 TB span, so that is reachable.
+SEM_ADDR = {"blackwell": 0x7f8899aabbcc, "ampere": 0x99aabbccdd}[ARCH]
 NEXT_QMD = 0x8899aabb00   # the chain pointer is 32 bits holding the address shifted by eight, so it reaches 1 TB and no further
 GRID, BLOCK = (17, 3, 2), (256, 2, 1)
 
-class StubIface: compute_class = g.BLACKWELL_COMPUTE_B
+class StubIface: compute_class = COMPUTE_CLASS
 class StubDev:
   """Everything NVProgramData reads off a device while building a descriptor, and nothing else."""
   iface = StubIface()
@@ -107,10 +133,22 @@ def main(cubin_path: str, out_path: str) -> int:
   # what the oracle derived, recovered from the fields it set. shared memory is rounded to 128 and local memory to 32,
   # so shifting them back is lossless; the check is that the C side derives the same numbers from the same cubin.
   fields = {k: v for w in writes for k, v in w.items()}
-  shmem = fields["shared_memory_size_shifted7"] << 7
-  regs = fields["register_count"]
-  if fields["shader_local_memory_high_size_shifted4"] << 4 != SLM_PER_THREAD:
-    return err(f"local memory per thread came back as {fields['shader_local_memory_high_size_shifted4'] << 4:#x}")
+
+  # Several fields are named for a shift on one architecture and not on the other - shared_memory_size_shifted7 against
+  # shared_memory_size - so the value is read by stem and the shift taken from whichever name the oracle used, rather
+  # than by a name that is only right for one of them.
+  def by_stem(stem: str):
+    for k, v in fields.items():
+      if k == stem: return v, 0
+      if k.startswith(stem + "_shifted"): return v, int(k[len(stem) + len("_shifted"):])
+    raise KeyError(f"the oracle set no field with stem {stem!r}")
+
+  shmem_raw, shmem_sh = by_stem("shared_memory_size")
+  shmem = shmem_raw << shmem_sh
+  regs = fields["register_count"] if "register_count" in fields else fields["register_count_v"]
+  slm_raw, slm_sh = by_stem("shader_local_memory_high_size")
+  if slm_raw << slm_sh != SLM_PER_THREAD:
+    return err(f"local memory per thread came back as {slm_raw << slm_sh:#x}")
   if fields["program_prefetch_size"] != min(prog_size >> 8, 0x1ff):
     return err(f"prefetch size {fields['program_prefetch_size']:#x} does not match a {prog_size:#x} byte program")
 
@@ -141,7 +179,7 @@ def main(cubin_path: str, out_path: str) -> int:
   lines = [
     f"# generated by tools/nv_reference_qmd.py from tinygrad's own NVProgramData and QMD",
     f"# cubin {cubin_path} kernel {name}",
-    f"device slm_per_thread {SLM_PER_THREAD:#x} sm_version {SM_VERSION:#x} shared_window {SHARED_WINDOW:#x} "
+    f"device arch {ARCH} slm_per_thread {SLM_PER_THREAD:#x} sm_version {SM_VERSION:#x} shared_window {SHARED_WINDOW:#x} "
     f"local_window {LOCAL_WINDOW:#x}",
     f"derived regs {regs} shmem {shmem:#x} prog_size {prog_size:#x} const0_size {data.constbufs[0][1]:#x} "
     f"kernargs_size {data.kernargs_size:#x} qmd_slot {qmd_sz:#x} cbuf0_dwords {len(data.cbuf_0)}",
@@ -165,5 +203,5 @@ def err(msg: str) -> int:
   return 1
 
 if __name__ == "__main__":
-  if len(sys.argv) < 3: raise SystemExit("usage: nv_reference_qmd.py <cubin> <out>")
+  if len(sys.argv) < 3: raise SystemExit("usage: [REFQMD_ARCH=blackwell|ampere] nv_reference_qmd.py <cubin> <out>")
   raise SystemExit(main(sys.argv[1], sys.argv[2]))

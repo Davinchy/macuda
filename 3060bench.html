@@ -1,0 +1,240 @@
+<title>3060 Bench</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  :root {
+    --surface: #fcfcfb; --panel: #f3f4f1; --ink: #1c1f1d; --ink-2: #4d534f; --muted: #7a817c; --hair: #e1e4df;
+    --card: #2f7d4f; --metal: #3b5fa8; --card-wash: rgba(47,125,79,.10); --metal-wash: rgba(59,95,168,.10);
+    --good: #2f7d4f; --note: #9a6b12;
+    --display: "Bricolage Grotesque", "Avenir Next Condensed", "Helvetica Neue", Arial, sans-serif;
+    --body: "Source Sans 3", "Helvetica Neue", Arial, sans-serif;
+    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --surface: #1a1a19; --panel: #232422; --ink: #ecefea; --ink-2: #c3c8c1; --muted: #9aa39c; --hair: #2e312e;
+      --card: #3fa062; --metal: #6a8ee0; --card-wash: rgba(63,160,98,.14); --metal-wash: rgba(106,142,224,.14);
+      --good: #3fa062; --note: #d9a94a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --surface: #1a1a19; --panel: #232422; --ink: #ecefea; --ink-2: #c3c8c1; --muted: #9aa39c; --hair: #2e312e;
+    --card: #3fa062; --metal: #6a8ee0; --card-wash: rgba(63,160,98,.14); --metal-wash: rgba(106,142,224,.14);
+    --good: #3fa062; --note: #d9a94a;
+  }
+  body { background: var(--surface); color: var(--ink); font-family: var(--body); font-size: 16px; line-height: 1.5; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding-block: 28px 56px; padding-inline: 20px; }
+  header { display: grid; gap: 10px; padding-bottom: 22px; border-bottom: 1px solid var(--hair); }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-family: var(--display); font-weight: 700; font-size: clamp(30px, 5vw, 46px); line-height: 1.05; margin: 0; text-wrap: balance; letter-spacing: -.01em; }
+  .lede { color: var(--ink-2); max-width: 62ch; margin: 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; font-size: 14px; color: var(--ink-2); margin-top: 4px; }
+  .legend span { display: inline-flex; align-items: center; gap: 8px; }
+  .sw { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+  .sw.card { background: var(--card); } .sw.metal { background: var(--metal); }
+  section { padding-block: 26px; border-bottom: 1px solid var(--hair); }
+  section:last-of-type { border-bottom: 0; }
+  h2 { font-family: var(--display); font-weight: 700; font-size: 24px; margin: 0 0 4px; letter-spacing: -.005em; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 16px; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 18px; }
+  .chart { background: var(--panel); border-radius: 8px; padding: 14px 16px 10px; min-width: 0; }
+  .chart h3 { font-family: var(--body); font-weight: 600; font-size: 15px; margin: 0; }
+  .chart .unit { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
+  .chart svg { width: 100%; height: auto; display: block; margin-top: 8px; overflow: visible; }
+  .chart .foot { font-size: 13px; color: var(--muted); margin: 6px 0 0; }
+  .bar-label { font-family: var(--body); font-size: 15px; fill: var(--ink-2); }
+  .bar-value { font-family: var(--mono); font-size: 14px; font-weight: 600; fill: var(--ink); }
+  .bar-pending { font-family: var(--mono); font-size: 12px; fill: var(--muted); }
+  .grid { stroke: var(--hair); stroke-width: 1; }
+  .axis { font-family: var(--mono); font-size: 12px; fill: var(--muted); }
+  .bar { transition: opacity .12s; }
+  .hit:hover .bar, .hit:focus .bar { opacity: .82; }
+  .hit { outline: none; cursor: default; }
+  .hit:focus-visible rect.focus { stroke: var(--ink); stroke-width: 1.5; }
+  .tip { position: fixed; pointer-events: none; background: var(--ink); color: var(--surface); font-family: var(--mono); font-size: 12px; padding: 6px 9px; border-radius: 6px; z-index: 5; max-width: 260px; white-space: normal; }
+  .tip[hidden] { display: none; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  .tablewrap { overflow-x: auto; }
+  th, td { text-align: left; padding: 9px 12px 9px 0; border-bottom: 1px solid var(--hair); vertical-align: top; }
+  th { font-weight: 600; color: var(--ink-2); font-size: 13px; letter-spacing: .02em; }
+  td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; padding-right: 18px; }
+  td.who { white-space: nowrap; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; vertical-align: 0; }
+  .dot.card { background: var(--card); } .dot.metal { background: var(--metal); }
+  .notes { display: grid; gap: 10px; max-width: 70ch; color: var(--ink-2); font-size: 15px; }
+  .notes p { margin: 0; }
+  .notes strong { color: var(--ink); }
+  code { font-family: var(--mono); font-size: .92em; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+  @media (prefers-reduced-motion: reduce) { .bar { transition: none; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">macuda · Apple M3 Max, 48 GB · macOS 27.0 · 2026-09-21</div>
+    <h1>An RTX 3060 over Thunderbolt, against the M3 Max's own GPU</h1>
+    <p class="lede">The same three models on the same Mac, twice. Once on a 12 GB RTX 3060 in a Razer Core X V2, driven by macuda's own userspace driver with no NVIDIA software on the machine. Once on the M3 Max through Apple Metal.</p>
+    <div class="legend">
+      <span><i class="sw card"></i>RTX 3060, macuda (sm_86, cubins built by nvcc in a container)</span>
+      <span><i class="sw metal"></i>M3 Max, Metal (llama.cpp and stable-diffusion.cpp Metal backends)</span>
+    </div>
+  </header>
+
+  <section id="s7b">
+    <h2>Qwen2.5-7B-Instruct, Q4_K_M</h2>
+    <p class="sub">4.36 GiB of weights, all of them on the GPU on both sides. llama-bench, 256-token prompt, 128 generated, three repetitions.</p>
+    <div class="charts" data-group="7b"></div>
+  </section>
+
+  <section id="s27b">
+    <h2>Qwen3.8-27B, unsloth UD Q4_K_M</h2>
+    <p class="sub">15.32 GiB of weights and 65 layers. The M3 Max holds all of it. The 3060 holds 44 layers in its 12 GB and leaves 21 to the CPU, or 38 layers when its MTP draft head (1.27 GiB) shares the card. Speculative decoding paid on neither side here: the 3060 is bound by its CPU layers, and the Metal draft path ran far slower than plain decoding.</p>
+    <div class="charts" data-group="27b"></div>
+  </section>
+
+  <section id="ssd">
+    <h2>SDXL-Turbo, fp16</h2>
+    <p class="sub">stable-diffusion.cpp, 4 steps, 512×512, cfg 1.0, seed 42. Wall time for one image, weights already in the page cache.</p>
+    <div class="charts" data-group="sd"></div>
+  </section>
+
+  <section id="table">
+    <h2>All the numbers</h2>
+    <p class="sub">Every measurement on this page, with the run it came from.</p>
+    <div class="tablewrap"><table id="results"><thead><tr><th>Workload</th><th>Where</th><th class="num">Value</th><th>Unit</th><th>Run</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section id="how">
+    <h2>How it was measured</h2>
+    <div class="notes">
+      <p><strong>The card.</strong> ASUS RTX 3060 12 GB (GA106, device 0x2504) in a Razer Core X V2 on a Thunderbolt link at x4, 16 GT/s. The driver is libtinynv from this repository: VBIOS falcon boot, GSP-RM 570.144, QMD v3 descriptors, MMU v2 page tables. Every card step was run through <code>tools/nv_shim_step.sh</code> with <code>QUIESCE=1</code>, after a read-only preflight, and the card was booted cold each time: the driver unloads GSP-RM and tears its region down on the way out.</p>
+      <p><strong>The Mac.</strong> Apple M3 Max with 48 GB of unified memory, powered from Apple's 140 W adapter, not from the enclosure. Metal builds of llama.cpp (at the same commit the card binaries link against) and stable-diffusion.cpp, with the Metal library embedded.</p>
+      <p><strong>What is comparable.</strong> Prefill and decode are llama-bench's own tokens per second. The 7B is a like-for-like comparison: all weights on both GPUs. The 27B is not: the 3060 runs a third of it on the CPU, so its numbers describe a 12 GB card with a 15 GiB model, not the card's compute. The image times are from the same binary's stage timings; the 3060's include copying the weights over Thunderbolt, and the first Metal run, at 13.57 s, spent 6 s reading the file cold and is not the number shown.</p>
+      <p><strong>Correctness.</strong> The 3060 passes the value-checked test-backend-ops suite 450/450, its SDXL-Turbo image is byte-identical to the first image the card ever produced (2026-09-17), and its 96-token greedy decode is kept as a reference text. The Metal greedy text diverges from the card's at character 156, which is the expected result of different kernels accumulating in a different order.</p>
+    </div>
+  </section>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+(function () {
+  // Every number on the page lives here. Values are as printed by the tools; null means not measured.
+  var RUNS = {
+    "7b": [
+      { key: "pp", title: "Prompt processing", unit: "tokens/s", better: "higher", card: 2112.79, metal: 812.90, err: { card: 11.68, metal: 0.70 },
+        run: { card: "logs/shim-bench-20260921-100509.log", metal: "logs/metal-bench-7b-20260921-104328.log" }, foot: "pp256, three repetitions" },
+      { key: "tg", title: "Text generation", unit: "tokens/s", better: "higher", card: 65.39, metal: 73.36, err: { card: 0.14, metal: 0.26 },
+        run: { card: "logs/shim-bench-20260921-100509.log", metal: "logs/metal-bench-7b-20260921-104328.log" }, foot: "tg128, three repetitions" },
+      { key: "greedy", title: "96-token greedy decode", unit: "tokens/s", better: "higher", card: 63.74, metal: 65.04, err: null,
+        run: { card: "logs/shim-simple-20260921-100628.log", metal: "logs/metal-simple-7b-20260921-104328.log" }, foot: "llama-simple, one run each, text kept" }
+    ],
+    "27b": [
+      { key: "pp", title: "Prompt processing", unit: "tokens/s", better: "higher", card: 124.07, metal: 205.87, err: { card: 0.02, metal: 0.18 },
+        run: { card: "logs/shim-bench-20260921-104648.log", metal: "logs/metal-bench-27b-20260921-104831.log" }, foot: "pp256. 3060: 44 of 65 layers on the card" },
+      { key: "tg", title: "Text generation", unit: "tokens/s", better: "higher", card: 11.82, metal: 18.98, err: { card: 0.10, metal: 0.56 },
+        run: { card: "logs/shim-bench-20260921-104648.log", metal: "logs/metal-bench-27b-20260921-104831.log" }, foot: "tg128. 3060: 44 of 65 layers on the card" },
+      { key: "mtp", title: "Speculative decode with the MTP head", unit: "tokens/s", better: "higher", card: 11.48, metal: 3.37, err: null,
+        run: { card: "logs/shim-spec-20260921-104756.log", metal: "logs/metal-spec-27b-20260921-104831.log" }, foot: "llama-speculative-simple, draft-mtp, 4 drafted. Accepted 39% on the 3060 (38 layers on the card), 32% on Metal" }
+    ],
+    "sd": [
+      { key: "img", title: "One image, start to finish", unit: "seconds", better: "lower", card: 5.51, metal: 6.50, err: null,
+        run: { card: "logs/shim-sd-20260921-100541.log", metal: "logs/metal-sd-20260921-104449.log" }, foot: "generate_image completed" },
+      { key: "sample", title: "Sampling, 4 steps", unit: "seconds", better: "lower", card: 3.02, metal: 3.08, err: null,
+        run: { card: "logs/shim-sd-20260921-100541.log", metal: "logs/metal-sd-20260921-104449.log" }, foot: "the UNet" },
+      { key: "vae", title: "VAE decode", unit: "seconds", better: "lower", card: 0.82, metal: 2.44, err: null,
+        run: { card: "logs/shim-sd-20260921-100541.log", metal: "logs/metal-sd-20260921-104449.log" }, foot: "latent to pixels" }
+    ]
+  };
+  var WHO = { card: "RTX 3060, macuda", metal: "M3 Max, Metal" };
+  var SVGNS = "http://www.w3.org/2000/svg";
+
+  function fmt(v, unit) {
+    if (v === null || v === undefined) return "pending";
+    if (unit === "seconds") return v.toFixed(2) + " s";
+    return (v >= 100 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1)) + " tok/s";
+  }
+  function nice(max) {
+    if (!max) return 1;
+    var p = Math.pow(10, Math.floor(Math.log10(max)));
+    var m = max / p;
+    var step = m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10;
+    return step * p;
+  }
+  function el(name, attrs, parent) {
+    var n = document.createElementNS(SVGNS, name);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+  var tip = document.getElementById("tip");
+  function showTip(text, x, y) { tip.textContent = text; tip.hidden = false; moveTip(x, y); }
+  function moveTip(x, y) { tip.style.left = Math.min(x + 14, window.innerWidth - 270) + "px"; tip.style.top = (y + 14) + "px"; }
+  function hideTip() { tip.hidden = true; }
+
+  function chart(m, group) {
+    var box = document.createElement("div"); box.className = "chart";
+    var h = document.createElement("h3"); h.textContent = m.title;
+    var u = document.createElement("span"); u.className = "unit"; u.textContent = m.unit + (m.better === "higher" ? ", more is better" : ", less is better");
+    h.appendChild(u); box.appendChild(h);
+
+    var W = 420, labelW = 128, rowH = 34, top = 6, H = top + rowH * 2 + 22;
+    var svg = el("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": m.title + " on the RTX 3060 and the M3 Max" });
+    var x0 = labelW, plotW = W - labelW - 66;
+    var vals = [m.card, m.metal].filter(function (v) { return v !== null; });
+    var scale = nice(Math.max.apply(null, vals.length ? vals : [1]));
+    // hairline grid at quarter steps of the nice scale
+    for (var i = 1; i <= 4; i++) {
+      var gx = x0 + plotW * i / 4;
+      el("line", { x1: gx, y1: top, x2: gx, y2: top + rowH * 2, class: "grid" }, svg);
+      var t = el("text", { x: gx, y: H - 4, class: "axis", "text-anchor": "middle" }, svg);
+      var tv = scale * i / 4;
+      t.textContent = m.unit === "seconds" ? tv.toFixed(tv < 10 ? 1 : 0) : Math.round(tv).toLocaleString("en-US");
+    }
+    el("line", { x1: x0, y1: top, x2: x0, y2: top + rowH * 2, class: "grid" }, svg);
+
+    ["card", "metal"].forEach(function (who, r) {
+      var y = top + r * rowH + 6, th = 20, v = m[who];
+      var lab = el("text", { x: x0 - 10, y: y + th / 2 + 4, class: "bar-label", "text-anchor": "end" }, svg);
+      lab.textContent = WHO[who];
+      var g = el("g", { class: "hit", tabindex: "0" }, svg);
+      if (v === null) {
+        el("rect", { x: x0, y: y, width: plotW, height: th, fill: "var(--" + who + "-wash)", rx: 4 }, g);
+        var p = el("text", { x: x0 + 8, y: y + th / 2 + 4, class: "bar-pending" }, g); p.textContent = "not yet measured";
+        return;
+      }
+      var w = Math.max(6, plotW * v / scale);
+      // square at the baseline, 4px rounded at the data end
+      var d = "M" + x0 + "," + y + " h" + (w - 4) + " a4,4 0 0 1 4,4 v" + (th - 8) + " a4,4 0 0 1 -4,4 H" + x0 + " Z";
+      el("path", { d: d, fill: "var(--" + who + ")", class: "bar" }, g);
+      el("rect", { x: x0, y: y, width: w, height: th, fill: "none", class: "focus", rx: 4 }, g);
+      var val = el("text", { x: x0 + w + 8, y: y + th / 2 + 4, class: "bar-value" }, g);
+      val.textContent = fmt(v, m.unit);
+      var text = WHO[who] + ": " + fmt(v, m.unit) + (m.err && m.err[who] != null ? " ± " + m.err[who] : "") + (m.run[who] ? "\n" + m.run[who] : "");
+      g.addEventListener("mousemove", function (e) { showTip(text, e.clientX, e.clientY); });
+      g.addEventListener("mouseleave", hideTip);
+      g.addEventListener("focus", function () { var b = g.getBoundingClientRect(); showTip(text, b.left, b.top + b.height); });
+      g.addEventListener("blur", hideTip);
+    });
+    box.appendChild(svg);
+    if (m.foot) { var f = document.createElement("p"); f.className = "foot"; f.textContent = m.foot; box.appendChild(f); }
+    return box;
+  }
+
+  var GROUPS = { "7b": "Qwen2.5-7B Q4_K_M", "27b": "Qwen3.8-27B UD Q4_K_M", "sd": "SDXL-Turbo" };
+  var tbody = document.querySelector("#results tbody");
+  Object.keys(RUNS).forEach(function (group) {
+    var host = document.querySelector('.charts[data-group="' + group + '"]');
+    RUNS[group].forEach(function (m) {
+      host.appendChild(chart(m, group));
+      ["card", "metal"].forEach(function (who) {
+        var tr = document.createElement("tr");
+        var c0 = document.createElement("td"); c0.textContent = GROUPS[group] + ", " + m.title.toLowerCase();
+        var c1 = document.createElement("td"); c1.className = "who"; var dot = document.createElement("i"); dot.className = "dot " + who; c1.appendChild(dot); c1.appendChild(document.createTextNode(WHO[who]));
+        var c2 = document.createElement("td"); c2.className = "num"; c2.textContent = m[who] === null ? "pending" : (m.unit === "seconds" ? m[who].toFixed(2) : m[who].toFixed(2)) + (m.err && m.err[who] != null ? " ± " + m.err[who] : "");
+        var c3 = document.createElement("td"); c3.textContent = m.unit;
+        var c4 = document.createElement("td"); c4.textContent = m.run[who] || ""; c4.style.fontFamily = "var(--mono)"; c4.style.fontSize = "12px"; c4.style.color = "var(--muted)";
+        [c0, c1, c2, c3, c4].forEach(function (c) { tr.appendChild(c); });
+        tbody.appendChild(tr);
+      });
+    });
+  });
+})();
+</script>

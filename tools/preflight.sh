@@ -1,18 +1,48 @@
 #!/bin/sh
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 DART_STALE=${DART_STALE:-$([ -d /Volumes/512SSD/EGPU ] && echo /Volumes/512SSD/EGPU/.dart-stale || echo $R/.dart-stale)}   # shared with the EGPU tree when it exists
-# Read-only pre-flight for the AORUS RTX5090 AI BOX + TinyGPU dext. Prints a verdict. Touches nothing.
+# Read-only pre-flight for an NVIDIA card in a Thunderbolt enclosure + TinyGPU dext. Prints a verdict. Touches nothing.
 # An ABORT names every rule that tripped on the verdict line, so a check that aborts and later clears on its own leaves
 # a reason behind rather than only a verdict (B, 2026-09-14: one that did not cost a minute; the next could cost a session).
 abort=0; why=""
 fail() { abort=1; why="${why:+$why; }$1"; }
 echo "== $(date '+%F %T')  preflight =="
-echo "-- Thunderbolt --"; system_profiler SPThunderboltDataType 2>/dev/null | awk '/AORUS/{f=1} f&&/Device Name|Mode|Speed|Link Status/{print "   "$0} f&&NR>200{exit}' | head -6
-system_profiler SPThunderboltDataType 2>/dev/null | grep -q "AORUS" || { echo "   AORUS box NOT on the Thunderbolt bus"; fail "box not on the Thunderbolt bus"; }
-echo "-- PCI --"; system_profiler SPPCIDataType 2>/dev/null | awk '/0x2b85/{f=1} f&&/Link|Driver Installed|Tunnel/{print "   "$0} /pci10de,22e8/{exit}'
-system_profiler SPPCIDataType 2>/dev/null | grep -A12 "0x2b85" | grep -q "Link up" || { echo "   5090 link NOT up"; fail "PCI link not up"; }
+# THE CARD IS DETECTED, NOT NAMED. This gate hardcoded the AORUS enclosure and the 5090's 0x2b85, so on 2026-09-17 it
+# returned ABORT three times running with a healthy 3060 (GA106, 0x2504, Razer Core X V2) sitting on the bus with its
+# link up: the gate was not refusing the card, it could not SEE it, and said "do not touch the GPU" about a card it had
+# never looked at. A gate that cannot see the hardware is worse than no gate, because it is believed. What the rules
+# actually need is that SOME NVIDIA display function is on the bus with its link up - not which one. EGPU_GPU_DEVID pins
+# an expected id when that is wanted; unset, whatever NVIDIA card is plugged in is the card.
+pci=$(system_profiler SPPCIDataType 2>/dev/null)
+gpu=$(echo "$pci" | awk '
+  /^ *Type: /            { vga = ($0 ~ /VGA|Display|3D/) ? 1 : 0; nv = 0; devid = "" }
+  /^ *Vendor ID: 0x10de/ { nv = 1 }
+  /^ *Device ID: /       { if (vga && nv) devid = $3 }
+  /^ *Link Width: /      { if (vga && nv && devid != "") w = $3 }
+  /^ *Link Speed: /      { if (vga && nv && devid != "") sp = $3 " " $4 }
+  /^ *Link Status: /     { if (vga && nv && devid != "") { print devid, w, sp, ($0 ~ /Link up/ ? "up" : "down"); exit } }')
+# NOT `set -- $gpu`: that overwrites the positional parameters, and $1 is how --selftest is recognised twenty lines
+# below. Doing it that way quietly turned the selftest into an ordinary run that printed a verdict and exited 0 - a
+# self-test that cannot fail, introduced by the very edit that added this detection (2026-09-17).
+DEVID=$(echo "$gpu" | cut -d' ' -f1); LWIDTH=$(echo "$gpu" | cut -d' ' -f2)
+LSPEED=$(echo "$gpu" | cut -d' ' -f3-4); LSTATE=$(echo "$gpu" | cut -d' ' -f5)
+[ -n "$LWIDTH" ] || LWIDTH=?; [ -n "$LSTATE" ] || LSTATE=down
+echo "-- Thunderbolt --"
+system_profiler SPThunderboltDataType 2>/dev/null | awk '/Vendor Name: (Apple|$)/{next} /Device Name|Vendor Name/{print "   "$0}' | grep -v "MacBook\|iMac\|Mac " | head -4
+echo "-- PCI --"
+if [ -z "$DEVID" ]; then echo "   no NVIDIA display function on the PCI bus"; fail "no NVIDIA GPU on the bus"
+else
+  echo "   NVIDIA $DEVID, link $LSTATE, $LWIDTH at $LSPEED"
+  echo "$pci" | awk -v d="$DEVID" '$0 ~ d {f=1} f&&/Driver Installed|Tunnel|Link Status/{print "   "$0} f&&/Link Status/{exit}'
+  [ "$LSTATE" = up ] || { echo "   $DEVID link NOT up"; fail "PCI link not up"; }
+  [ -z "${EGPU_GPU_DEVID:-}" ] || [ "$EGPU_GPU_DEVID" = "$DEVID" ] || \
+    { echo "   expected EGPU_GPU_DEVID=$EGPU_GPU_DEVID but found $DEVID"; fail "unexpected GPU $DEVID"; }
+fi
 echo "-- IOKit nub --"
-nub=$(ioreg -l -w0 2>/dev/null | awk '/"device-id" = <852b0000>/{f=1} f{print; if(++n>70) exit}')
+# ioreg spells the device id little-endian, so 0x2504 is <04250000> and 0x2b85 was <852b0000>: built from whichever
+# card was detected above rather than written out for one of them.
+LE=$(printf '%s%s0000' "$(echo "$DEVID" | cut -c5-6)" "$(echo "$DEVID" | cut -c3-4)")
+nub=$(ioreg -l -w0 2>/dev/null | awk -v m="\"device-id\" = <$LE>" 'index($0,m){f=1} f{print; if(++n>70) exit}')
 # the dart flag is thousands of hex digits and is reported below instead; dumping it here buries every other line
 echo "$nub" | grep -E 'IOPCIResourced|IODEXTMatchCount' | sed 's/^ *[| ]*/   /'
 echo "$nub" | grep -q '"IOPCIResourced" = Yes' || { echo "   IOPCIResourced missing"; fail "IOPCIResourced missing"; }
@@ -101,6 +131,5 @@ if [ -n "$s1" ]; then
 fi
 echo "-- socket / lock --"; ls -la "$TMPDIR/tinygpu.sock" "$TMPDIR/nv_usb4.lock" 2>&1 | sed 's/^/   /' | cut -c1-90
 echo "-- power --"; pmset -g 2>/dev/null | grep -E "powermode|lowpowermode" | sed 's/^/   /'
-echo "-- gpu lock --"; $R/tools/gpu-lock.sh status | sed 's/^/   /'
 [ $abort -eq 0 ] && echo "VERDICT: OK to proceed (one GPU step at a time)" || echo "VERDICT: ABORT - do not touch the GPU [$why]"
 exit $abort

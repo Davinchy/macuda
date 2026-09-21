@@ -13,7 +13,7 @@ print(f"FLR rpc returned in {t_flr:.3f}s")
 t1 = time.perf_counter()
 while True:
   v = d.cfg(0x00)
-  if v == 0x2b8510de: break
+  if v == pre[0x00]: break   # the card's own vendor/device from the snapshot, not the 5090's: on a 3060 this waited the whole budget and exited 3
   if time.perf_counter() - t1 > BUDGET: print(f"config VID/DID still 0x{v:08x} after {BUDGET}s"); sys.exit(3)
   time.sleep(0.01)
 print(f"config space sane after {time.perf_counter()-t1:.3f}s; COMMAND now 0x{d.command():04x}")

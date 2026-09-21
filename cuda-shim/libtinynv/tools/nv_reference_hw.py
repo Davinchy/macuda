@@ -18,15 +18,28 @@ be zero, would still pass. The claimed mask catches both.
 """
 from __future__ import annotations
 import os
-import json, pathlib, struct, sys
+import json, pathlib, re, struct, sys
 
 sys.path.insert(0, os.environ.get("TINYGRAD_SRC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "tinygrad")))
 from tinygrad.runtime.autogen import nv_570 as g  # noqa: E402
 
-PREFIX, QMD_BYTES = "NVCEC0_QMDV05_00_", 384
-FIELDS = {**{n[len(PREFIX):]: v for n, v in vars(g).items() if n.startswith(PREFIX) and isinstance(v, tuple)},
-          **{f"{n[len(PREFIX):]}_{i}": fn(i) for n, fn in vars(g).items() if n.startswith(PREFIX) and callable(fn)
+# The descriptor's field table, chosen from the SNAPSHOT rather than fixed: a Blackwell card's oracle builds 384 bytes
+# of QMD v5 and an Ampere card's builds 256 of v3, with different field names and a field or two only one of them has
+# (SM_GLOBAL_CACHING_ENABLE is Ampere's). Reading a v3 snapshot against the v5 table fails on the first name that moved.
+def _table(prefix: str):
+  return {**{n[len(prefix):]: v for n, v in vars(g).items() if n.startswith(prefix) and isinstance(v, tuple)},
+          **{f"{n[len(prefix):]}_{i}": fn(i) for n, fn in vars(g).items() if n.startswith(prefix) and callable(fn)
              for i in range(8)}}
+
+def select_arch(compute_class: int) -> None:
+  """v5 from Blackwell's compute class upwards, v3 below it - the same test the oracle's own QMD makes."""
+  global PREFIX, QMD_BYTES, FIELDS
+  v5 = compute_class >= g.BLACKWELL_COMPUTE_A
+  PREFIX, QMD_BYTES = ("NVCEC0_QMDV05_00_", 384) if v5 else ("NVC6C0_QMDV03_00_", 256)
+  FIELDS = _table(PREFIX)
+
+PREFIX, QMD_BYTES = "NVCEC0_QMDV05_00_", 384
+FIELDS = _table(PREFIX)
 
 def claimed_mask(field_writes: list[dict]) -> bytes:
   """Which bits of the block the oracle's field writes touched, one bit per bit, in the same order as the bytes."""
@@ -107,6 +120,8 @@ def decode(blob: bytes) -> list[str]:
 def main(snap_path: str, out_path: str) -> int:
   snap = json.load(open(snap_path))
   dev = snap["device"]
+  # pick the descriptor layout the card that produced this snapshot actually uses, before reading a single field
+  select_arch(int(dev.get("compute_class", "0x0"), 16))
   # The descriptor bytes have to come from the submit, not from the launch that built them. A launch's release and the
   # chaining onto it are written afterwards, by the release and by the next launch, so the copy taken while encoding the
   # launch is the descriptor before those - and the field list, read at the end, already has them. Taking one from each
@@ -115,10 +130,15 @@ def main(snap_path: str, out_path: str) -> int:
   if len(final) != len(snap["execs"]):
     print(f"  {len(final)} descriptors were submitted but {len(snap['execs'])} launches were encoded")
     return 1
-  lines = [f"# from {snap_path}: descriptors and command buffers a 5090 was handed, captured in the driver",
+  # the card is named from the snapshot, not written in: this file used to say "a 5090" whatever produced the capture
+  lines = [f"# from {snap_path}: descriptors and command buffers a {dev.get('arch', '?')} card was handed, "
+           f"captured in the driver",
            f"# tinygrad {snap.get('tinygrad_commit','?')}, {dev['arch']} sm_version {dev['sm_version']}, "
            f"{len(snap['execs'])} launches, {len(snap['submits'])} command buffers",
-           f"device slm_per_thread={int(dev['slm_per_thread'])} sass_version={int(dev['sass_version'], 16)} "
+           # the descriptor generation is STATED rather than left to be inferred from the slot size, so a reader and the
+           # C test agree about which layout these bytes are in without deriving it from a rounding
+           f"device qmd_version={5 if QMD_BYTES == 384 else 3} sm_version={int(dev['sm_version'], 16)} "
+           f"slm_per_thread={int(dev['slm_per_thread'])} sass_version={int(dev['sass_version'], 16)} "
            f"shared_window={dev['shared_mem_window']} local_window={dev['local_mem_window']} "
            f"num_gpcs={dev['num_gpcs']} num_tpc_per_gpc={dev['num_tpc_per_gpc']} "
            f"num_sm_per_tpc={dev['num_sm_per_tpc']} max_warps_per_sm={dev['max_warps_per_sm']}"]
@@ -132,17 +152,37 @@ def main(snap_path: str, out_path: str) -> int:
     releases = []
     for w in built:
       for k, v in w.items():
-        if k.startswith("release_structure_size_"): releases.append("ts" if v == 0 else "no")
+        # BOTH SPELLINGS. Blackwell names these release_structure_size_<i> and Ampere names them
+        # release<i>_structure_size, and testing only the first meant every Ampere launch was recorded as releasing
+        # nothing - so the C test never built a release, and the descriptor it produced was missing bytes the card had.
+        if k.startswith("release_structure_size_") or re.match(r"^release\d_structure_size$", k):
+          releases.append("ts" if v == 0 else "no")
     chained = any("dependent_qmd0_enable" in w for w in built)
-    grid = [next(v for w in built for k, v in w.items() if k == f"grid_{d}") for d in ("width", "height", "depth")]
+    # The grid is grid_* on Blackwell and cta_raster_* on Ampere, and the two derived sizes carry a _shifted suffix on
+    # one and not the other. A snapshot names its own architecture's fields, so they are looked up by either spelling
+    # rather than by the one this file was first written against.
+    def anyof(src, *names):
+      for n in names:
+        for w in (src if isinstance(src, list) else [src]):
+          if n in w: return w[n]
+      raise SystemExit(f"the snapshot sets none of {names}: is it from a driver this file knows?")
+    def shifted(src, stem):
+      for w in (src if isinstance(src, list) else [src]):
+        for k, v in w.items():
+          if k == stem: return v
+          if k.startswith(stem + "_shifted"): return v << int(k[len(stem) + len("_shifted"):])
+      raise SystemExit(f"the snapshot sets no field with stem {stem!r}")
+    grid = [anyof(built, f"grid_{d}", f"cta_raster_{d}") for d in ("width", "height", "depth")]
     block = [next(v for w in built for k, v in w.items() if k == f"cta_thread_dimension{j}") for j in range(3)]
 
     # A program size that gives back the prefetch size the card was handed. The snapshot does not carry the size itself -
     # the oracle keeps it in a local - and the field is clamped, so this is the one input reconstructed rather than read.
     # It reaches exactly one field, which is compared like every other.
-    lines.append(f"launch={i} regs={tmpl['register_count']} shmem={tmpl['shared_memory_size_shifted7'] << 7} "
-                 f"slm_per_thread={tmpl['shader_local_memory_high_size_shifted4'] << 4} "
-                 f"prog_size={tmpl['program_prefetch_size'] << 8} const0_size={tmpl['constant_buffer_size_shifted4_0']} "
+    lines.append(f"launch={i} regs={anyof(tmpl, 'register_count', 'register_count_v')} "
+                 f"shmem={shifted(tmpl, 'shared_memory_size')} "
+                 f"slm_per_thread={shifted(tmpl, 'shader_local_memory_high_size')} "
+                 f"prog_size={tmpl['program_prefetch_size'] << 8} "
+                 f"const0_size={anyof(tmpl, 'constant_buffer_size_shifted4_0', 'constant_buffer_size_0')} "
                  f"grid={','.join(map(str, grid))} block={','.join(map(str, block))} "
                  f"releases={','.join(releases) or '-'} chain={int(chained)} "
                  f"cbuf0_dwords={e['cbuf_0_len']} qmd_slot={e['qmd_sz']}")

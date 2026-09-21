@@ -36,6 +36,9 @@ int tinynv_gpu_init_sw(tinynv_gpu_t *g);
 // Start the firmware: the chain of trust, then waiting for GSP-RM to say it is up. This talks to the GPU.
 int tinynv_gpu_init_hw(tinynv_gpu_t *g);
 
+// Leave the card the way NVIDIA's driver does: GSP-RM told, halted, and its region torn down. tinynv_gpu_close does
+// this first unless TINYNV_UNLOAD=0. Returns 0 when there was nothing to unload or it succeeded.
+int tinynv_gpu_unload(tinynv_gpu_t *g);
 void tinynv_gpu_close(tinynv_gpu_t *g);
 
 #endif

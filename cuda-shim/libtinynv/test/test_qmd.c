@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
   // constant buffer 0's driver parameters, which the kernel reads its memory windows out of
   uint32_t dwords = (uint32_t)field_from(derived, "cbuf0_dwords ");
   uint32_t *cb0 = calloc(dwords, 4);
-  CHECK(tinynv_qmd_cbuf0(cb0, dwords, field_from(device, "shared_window "), field_from(device, "local_window "), NULL, NULL) == dwords,
+  CHECK(tinynv_qmd_cbuf0(cb0, dwords, 0, field_from(device, "shared_window "), field_from(device, "local_window "), NULL, NULL) == dwords,
         "constant buffer 0 came back the wrong length");
   static uint8_t want_cb[4096];
   if (value_of(ref, "cbuf0", hex, sizeof(hex))) {
@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
   {
     uint32_t geo[TINYNV_QMD_CBUF0_MIN_DWORDS];
     const uint32_t grid[3] = {0x111, 0x222, 0x333}, block[3] = {0x444, 0x555, 0x666};
-    tinynv_qmd_cbuf0(geo, TINYNV_QMD_CBUF0_MIN_DWORDS, 0, 0, grid, block);
+    tinynv_qmd_cbuf0(geo, TINYNV_QMD_CBUF0_MIN_DWORDS, 0, 0, 0, grid, block);
     for (int i = 0; i < 3; i++) {
       CHECK(geo[TINYNV_CBUF0_NCTAID + i] == grid[i], "gridDim[%d] is not at constant buffer word %d", i,
             TINYNV_CBUF0_NCTAID + i);
@@ -202,7 +202,7 @@ int main(int argc, char **argv) {
             TINYNV_CBUF0_NTID + i);
     }
     // and with none given it must match the oracle exactly, which is what every comparison above depends on
-    tinynv_qmd_cbuf0(geo, TINYNV_QMD_CBUF0_MIN_DWORDS, 0, 0, NULL, NULL);
+    tinynv_qmd_cbuf0(geo, TINYNV_QMD_CBUF0_MIN_DWORDS, 0, 0, 0, NULL, NULL);
     CHECK(!geo[TINYNV_CBUF0_NCTAID] && !geo[TINYNV_CBUF0_NTID],
           "asking for no geometry still wrote some, which would break every comparison against the oracle");
   }

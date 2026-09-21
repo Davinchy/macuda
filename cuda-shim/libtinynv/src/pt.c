@@ -77,6 +77,12 @@ int tinynv_pt_writable(tinynv_mm_t *mm, const tinynv_pt_t *pt, uint32_t idx) {
   uint64_t w[2];
   if (!tinynv_pt_is_page(mm, pt, idx)) return -1;
   entry_read(mm, pt, idx, w);
+  // The second generation says read-only in a bit of its own; the third folded it into the page control field, so the
+  // same question is asked of different bits depending on which tree this is.
+  if (mm->dev->mmu_ver == 2) {
+    if (!NV_GET_E(w, NV_MMU_VER2_PTE, VALID)) return -1;
+    return !NV_GET_E(w, NV_MMU_VER2_PTE, READ_ONLY);
+  }
   if (!NV_GET_E(w, NV_MMU_VER3_PTE, VALID)) return -1;
   uint32_t pcf = (uint32_t)NV_GET_E(w, NV_MMU_VER3_PTE, PCF);
   return !(pcf == TINYNV_PCF_RO_CACHED || pcf == TINYNV_PCF_RO_UNCACHED);
@@ -89,6 +95,11 @@ int tinynv_pt_valid(tinynv_mm_t *mm, const tinynv_pt_t *pt, uint32_t idx) {
   // that decides how to decode. In faithful mode so does this, so the streams match operation for operation. Not at the
   // lowest level: there the oracle's test answers "a page" without reading anything, so there is nothing to mirror.
   if (tinynv_is_faithful() && pt->lv < mm->levels - 1) entry_read(mm, pt, idx, w);
+  if (mm->dev->mmu_ver == 2) {
+    if (tinynv_pt_is_page(mm, pt, idx)) return (int)NV_GET_E(w, NV_MMU_VER2_PTE, VALID);
+    return is_dual(mm, pt->lv) ? NV_GET_E(w, NV_MMU_VER2_DUAL_PDE, APERTURE_SMALL) != 0
+                               : NV_GET_E(w, NV_MMU_VER2_PDE, APERTURE) != 0;
+  }
   if (tinynv_pt_is_page(mm, pt, idx)) return (int)NV_GET_E(w, NV_MMU_VER3_PTE, VALID);
   return is_dual(mm, pt->lv) ? NV_GET_E(w, NV_MMU_VER3_DUAL_PDE, APERTURE_SMALL) != 0
                              : NV_GET_E(w, NV_MMU_VER3_PDE, APERTURE) != 0;
@@ -98,6 +109,11 @@ static uint64_t entry_target(tinynv_mm_t *mm, const tinynv_pt_t *pt, uint32_t id
   uint64_t w[2];
   if (tinynv_is_faithful()) entry_read(mm, pt, idx, w); // the oracle's accessor reads once more than it needs to
   entry_read(mm, pt, idx, w);
+  // The second generation's table pointers are spelled _SYS; the third's are not, and only its lowest level is.
+  if (mm->dev->mmu_ver == 2) {
+    if (is_dual(mm, pt->lv)) return NV_GET_E(w, NV_MMU_VER2_DUAL_PDE, ADDRESS_SMALL_SYS) << 12;
+    return NV_GET_E(w, NV_MMU_VER2_PDE, ADDRESS_SYS) << 12;
+  }
   if (is_dual(mm, pt->lv)) return NV_GET_E(w, NV_MMU_VER3_DUAL_PDE, ADDRESS_SMALL) << 12;
   return NV_GET_E(w, NV_MMU_VER3_PDE, ADDRESS) << 12;
 }
@@ -110,6 +126,35 @@ static int supports_huge_page(tinynv_mm_t *mm, const tinynv_pt_t *pt, uint64_t p
 void tinynv_pt_set_entry(tinynv_mm_t *mm, const tinynv_pt_t *pt, uint32_t idx, uint64_t paddr, int table,
                          uint32_t flags, int valid) {
   uint64_t w[2] = {0, 0};
+  // The second generation, which is what an Ampere card's tree is made of. Same shape - a leaf, a plain table pointer,
+  // and a dual one at the level above the leaves - but three differences that matter: cacheability is a VOL bit rather
+  // than a page control field, a table pointer is spelled ADDRESS..._SYS, and a table entry carries NO_ATS where the
+  // third generation carries a page control field.
+  if (mm->dev->mmu_ver == 2) {
+    if (!table) {
+      NV_PUT(w, NV_MMU_VER2_PTE, VALID, valid);
+      NV_PUT(w, NV_MMU_VER2_PTE, ADDRESS_SYS, paddr >> 12);
+      NV_PUT(w, NV_MMU_VER2_PTE, APERTURE, (flags & TINYNV_PTE_SYSMEM) ? 2 : 0);
+      NV_PUT(w, NV_MMU_VER2_PTE, KIND, 6);
+      NV_PUT(w, NV_MMU_VER2_PTE, VOL, (flags & TINYNV_PTE_UNCACHED) ? 1 : 0);
+      // The oracle never asks for a read-only leaf during a boot, so it does not encode one and there is nothing to
+      // match here. The flag exists in this driver and tinynv_pt_writable reads this bit back, so it is honoured -
+      // which only differs from the oracle when a caller asks for something the oracle never asks for.
+      if (flags & TINYNV_PTE_READONLY) NV_PUT(w, NV_MMU_VER2_PTE, READ_ONLY, 1);
+    } else if (is_dual(mm, pt->lv)) {
+      NV_PUT(w, NV_MMU_VER2_DUAL_PDE, IS_PTE, 0);
+      NV_PUT(w, NV_MMU_VER2_DUAL_PDE, APERTURE_SMALL, valid ? 1 : 0);
+      NV_PUT(w, NV_MMU_VER2_DUAL_PDE, ADDRESS_SMALL_SYS, paddr >> 12);
+      NV_PUT(w, NV_MMU_VER2_DUAL_PDE, NO_ATS, 1);
+    } else {
+      NV_PUT(w, NV_MMU_VER2_PDE, IS_PTE, 0);
+      NV_PUT(w, NV_MMU_VER2_PDE, APERTURE, valid ? 1 : 0);
+      NV_PUT(w, NV_MMU_VER2_PDE, ADDRESS_SYS, paddr >> 12);
+      NV_PUT(w, NV_MMU_VER2_PDE, NO_ATS, 1);
+    }
+    entry_write(mm, pt, idx, w);
+    return;
+  }
   if (!table) {
     uint32_t pcf = (flags & TINYNV_PTE_READONLY) ? ((flags & TINYNV_PTE_UNCACHED) ? TINYNV_PCF_RO_UNCACHED : TINYNV_PCF_RO_CACHED)
                                                  : ((flags & TINYNV_PTE_UNCACHED) ? TINYNV_PCF_RW_UNCACHED : TINYNV_PCF_RW_CACHED);
@@ -268,6 +313,12 @@ int tinynv_mm_page_tables(tinynv_mm_t *mm, uint64_t root, uint64_t vaddr, uint64
 // confusing - the driver was right that something was there and wrong about what.
 //
 // Walking per entry is not slow: an invalid entry high in the tree skips everything beneath it in one step.
+// What the collision actually was, filled in beside the address so a refusal names the entry rather than only the
+// address. "0x1000000000 is already mapped" is true and useless; which level, which index and what the entry holds is
+// the difference between reading this code and fixing it.
+static int clash_lv = -1, clash_idx = -1;
+static uint64_t clash_entry;
+
 static int range_is_mapped(tinynv_mm_t *mm, uint64_t root, uint64_t vaddr, uint64_t size, uint64_t *where) {
   tinynv_pt_walk_t look;
   tinynv_pt_walk_begin(&look, mm, root, vaddr, 0);
@@ -280,6 +331,9 @@ static int range_is_mapped(tinynv_mm_t *mm, uint64_t root, uint64_t vaddr, uint6
       uint64_t at = vaddr + run.off + (uint64_t)e * run.covers;
       if (tinynv_pt_is_page(mm, &run.pt, run.idx + e)) {
         if (where) *where = at;
+        uint64_t w[2] = {0, 0};
+        entry_read(mm, &run.pt, run.idx + e, w);
+        clash_lv = run.pt.lv; clash_idx = (int)(run.idx + e); clash_entry = w[0];
         return 1;
       }
       // Valid and not a page: a table an earlier mapping left behind. Whether this range is free depends on what is
@@ -333,8 +387,9 @@ int tinynv_mm_map_range(tinynv_mm_t *mm, uint64_t root, uint64_t vaddr, uint64_t
   int busy = range_is_mapped(mm, root, vaddr, size, &clash);
   if (busy < 0) return -1;
   if (busy)
-    return tinynv_fail("mapping %#llx+%#llx: %#llx is already mapped", (unsigned long long)vaddr,
-                       (unsigned long long)size, (unsigned long long)clash);
+    return tinynv_fail("mapping %#llx+%#llx: %#llx is already mapped by level %d entry %d = %#llx (of %d levels)",
+                       (unsigned long long)vaddr, (unsigned long long)size, (unsigned long long)clash,
+                       clash_lv, clash_idx, (unsigned long long)clash_entry, mm->levels);
   int rc;
   tinynv_pt_run_t run;
   uint64_t left, off;

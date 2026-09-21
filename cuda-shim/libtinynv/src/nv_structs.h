@@ -168,6 +168,7 @@ TINYNV_AT(tinynv_libos_region_t, loc, 25);
 #define TINYNV_MSG_FUNCTION_CONTINUATION_RECORD 71
 #define TINYNV_MSG_FUNCTION_GSP_SET_SYSTEM_INFO 72
 #define TINYNV_MSG_FUNCTION_SET_REGISTRY 73
+#define TINYNV_MSG_FUNCTION_UNLOADING_GUEST_DRIVER 47
 #define TINYNV_MSG_EVENT_GSP_INIT_DONE 4097
 #define TINYNV_MSG_EVENT_GSP_RUN_CPU_SEQUENCER 4098
 #define TINYNV_MSG_EVENT_MMU_FAULT_QUEUED 4101
@@ -220,6 +221,12 @@ TINYNV_SIZE(tinynv_registry_entry_t, 16);
 TINYNV_AT(tinynv_registry_entry_t, type, 4);
 TINYNV_AT(tinynv_registry_entry_t, data, 8);
 TINYNV_AT(tinynv_registry_entry_t, length, 12);
+// rpc_unloading_guest_driver_v1F_07 (generated/g_rpc-structures.h): what GSP-RM is told when the driver is going away.
+// Two NvBools and a level; the oracle sends 0, 0 and bit 6 (__GPU_STATE_FLAGS_FAST_UNLOAD), and so does this.
+typedef struct { uint8_t bInPMTransition, bGc6Entering, _pad[2]; uint32_t newLevel; } tinynv_unloading_guest_driver_t;
+TINYNV_SIZE(tinynv_unloading_guest_driver_t, 8);
+TINYNV_AT(tinynv_unloading_guest_driver_t, bGc6Entering, 1);
+TINYNV_AT(tinynv_unloading_guest_driver_t, newLevel, 4);
 
 // --- the resource manager's objects ---------------------------------------------------------------------------------
 // Everything the GPU does is an object in a tree inside GSP-RM: a client at the root, a device under it, a subdevice for
@@ -422,9 +429,18 @@ TINYNV_AT(tinynv_copy_pdes_t, levels, 40);
 // --- a channel ------------------------------------------------------------------------------------------------------
 // Work reaches the GPU through a channel: a ring of pointers to command buffers, plus several small areas GSP-RM keeps
 // the channel's state in. The classes are per architecture; these are Blackwell's.
-#define TINYNV_CLASS_GPFIFO 0xc96f
-#define TINYNV_CLASS_COMPUTE 0xcec0
-#define TINYNV_CLASS_DMA_COPY 0xcab5
+// One set per architecture, and an object allocated under the wrong one does not fail cleanly: GSP-RM accepts the
+// allocation and the engine then answers to methods the driver is not sending. dev.c picks the set from the chip and
+// puts it in tinynv_dev_t, so nothing here is reachable without having chosen.
+#define TINYNV_CLASS_GPFIFO_AMPERE      0xc56f
+#define TINYNV_CLASS_COMPUTE_AMPERE     0xc7c0
+#define TINYNV_CLASS_DMA_COPY_AMPERE    0xc7b5
+#define TINYNV_CLASS_COMPUTE_ADA        0xc9c0
+// the class the descriptor generation turns on: at or above this, a launch descriptor is v5; below it, v3
+#define TINYNV_CLASS_COMPUTE_BLACKWELL_A 0xcdc0
+#define TINYNV_CLASS_GPFIFO_BLACKWELL   0xc96f
+#define TINYNV_CLASS_COMPUTE_BLACKWELL  0xcec0
+#define TINYNV_CLASS_DMA_COPY_BLACKWELL 0xcab5
 
 typedef struct { uint64_t base, size; uint32_t addressSpace, cacheAttrib; } tinynv_memory_desc_t;
 TINYNV_SIZE(tinynv_memory_desc_t, 24);

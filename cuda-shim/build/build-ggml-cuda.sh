@@ -5,13 +5,15 @@
 #   ONLY="mmq-instance-nvfp4 mmq-instance-mxfp4" sh build/build-ggml-cuda.sh   # a subset, into the existing objects
 set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}; G=$R/llama.cpp/ggml
-export TINYCC=$R/cuda-shim/build/tinycc OBJ=$R/cuda-shim/build/obj LOGD=$R/cuda-shim/build/logs
+export TINYCC=$R/cuda-shim/build/tinycc OBJ=$R/cuda-shim/build/obj-${ARCH:-sm_120a} LOGD=$R/cuda-shim/build/logs-${ARCH:-sm_120a}
 JOBS=${JOBS:-8}
 # the architecture is passed to tinycc EXPLICITLY: the FP4 MMQ instances use Blackwell's block-scaled tensor-core MMA,
 # which ptxas only accepts for the architecture-specific target, and an inherited environment variable proved too easy to lose
 export TINYCC_ARCH=${ARCH:-sm_120a}
 ONLY=${ONLY:-}
 if [ -z "$ONLY" ]; then rm -rf "$OBJ" "$LOGD"; fi; mkdir -p "$OBJ" "$LOGD"
+# resolved once here rather than by each of the 188 tinycc invocations, each of which would otherwise link a probe
+export TINYCC_SYSROOT=${TINYCC_SYSROOT:-$(sh "$R/cuda-shim/build/sdk.sh")}
 export INC="-I$G/include -I$G/src -I$G/src/ggml-cuda"
 # docs/03-cuda-shim-plan.md §1: quantized matmul forced onto MMQ (cuBLAS only for residual GEMMs) and no virtual
 # memory management. Graphs were compiled OUT until 2026-09-19 for a good reason - ggml wraps cudaStreamBeginCapture
@@ -36,9 +38,14 @@ xargs -n1 -P"$JOBS" sh "$R/cuda-shim/build/cc-one.sh" < "$LOGD/tus.txt" | tee "$
 ok=$(grep -c '^ok' "$LOGD/results.txt"); fail=$(grep -c '^FAIL' "$LOGD/results.txt")
 echo "compiled $ok/$total ggml-cuda TUs in $(( $(date +%s) - start )) s; failed: $(grep '^FAIL' "$LOGD/results.txt" | cut -d' ' -f2 | tr '\n' ' ')"
 if [ "$ok" -gt 0 ]; then
-  # the previous archive is kept beside the new one, so the two can be linked and measured against each other
-  [ -f "$R/cuda-shim/build/libggml-cuda.a" ] && cp -f "$R/cuda-shim/build/libggml-cuda.a" "$R/cuda-shim/build/libggml-cuda.prev.a"
-  rm -f "$R/cuda-shim/build/libggml-cuda.a"
-  /opt/homebrew/opt/llvm/bin/llvm-ar rcs "$R/cuda-shim/build/libggml-cuda.a" "$OBJ"/*.o && echo "archived libggml-cuda.a = $(stat -f%z "$R/cuda-shim/build/libggml-cuda.a") bytes ($(ls "$OBJ"/*.o | wc -l | tr -d ' ') objects)"
+  # ONE ARCHIVE PER ARCHITECTURE, and the plain name is a symlink to whichever one the tree links against. This used to
+  # be a single libggml-cuda.a, so building for a second card silently destroyed the first card's archive - an hour of
+  # compiling, gone, and nothing to say which arch the surviving file held. Now `ls -l` answers that.
+  A="$R/cuda-shim/build/libggml-cuda.$TINYCC_ARCH.a"
+  rm -f "$A"
+  /opt/homebrew/opt/llvm/bin/llvm-ar rcs "$A" "$OBJ"/*.o && {
+    ln -sfn "libggml-cuda.$TINYCC_ARCH.a" "$R/cuda-shim/build/libggml-cuda.a"
+    echo "archived libggml-cuda.$TINYCC_ARCH.a = $(stat -f%z "$A") bytes ($(ls "$OBJ"/*.o | wc -l | tr -d ' ') objects); libggml-cuda.a now points at it"
+  }
 fi
 [ "$fail" -eq 0 ]

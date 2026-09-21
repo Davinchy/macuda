@@ -1,6 +1,6 @@
 #!/bin/sh
 # nv_shim_step.sh — ONE hardware step through the CUDA shim, under the protocol in docs/HANDOFF.md §3:
-#   preflight (read-only) → gpu-lock acquire → the step, its own process, log captured → quiesce cold → release.
+#   preflight (read-only) → the step, its own process, log captured → quiesce cold. (The gpu-lock was removed 2026-09-17.)
 #
 #   sh tools/nv_shim_step.sh <A|B> opverify                      value-checked op-verify, expect 450/450
 #   sh tools/nv_shim_step.sh <A|B> bench   <model.gguf> [n=128]  llama-bench: -ngl 99 -p 256 -n <n> -r 3
@@ -19,10 +19,11 @@
 #                                                   last slot of a session, Antonio's go for it by name, quiesced after
 #
 # Knobs pass through the environment exactly as the binaries read them (TINYNV_ASYNC, TINYNV_SYNC, TINYNV_ARENA_VRAM,
-# TINYNV_CHAIN_DEPTH); the startup line that records what a run actually used is echoed back, so the report never
+# TINYNV_CHAIN_DEPTH); NGL=<n> (and NGLD=<n> for the draft) offloads fewer layers than all of them, for a model bigger than
+# the card - a 27B Q4 on a 12 GB 3060 is the case (2026-09-21); the startup line that records what a run actually used is echoed back, so the report never
 # depends on what anyone remembers exporting. BIN=<dir> picks the binary set (default build/bin, the validated one);
 # the build id baked into the binary is printed BEFORE the card is touched. QUIESCE=1 quiesces cold after the step (default: idle warm);
-# DRY=1 runs on the null device with no preflight/lock/quiesce, to test this script itself.
+# DRY=1 runs on the null device with no preflight/quiesce, to test this script itself.
 # Driver test steps (gap, fault) take their binary from TREE=<worktree> (default: the main checkout) or TESTBIN=<path>.
 set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; S=$R/cuda-shim; T=${TREE:-$S}; BIN=${BIN:-$S/build/bin}; SOCK=${TINYNV_SOCKET:-${TMPDIR}tinygpu.sock}
@@ -31,14 +32,14 @@ mkdir -p $R/logs; ts=$(date +%Y%m%d-%H%M%S); log=$R/logs/shim-$step-$ts.log
 out=
 case "$step" in
   opverify) bin=$BIN/test-backend-ops-null; set -- -b CUDA0 -o GATED_DELTA_NET -o GATED_LINEAR_ATTN -o SSM_SCAN -o SSM_CONV -o SOLVE_TRI -o RMS_NORM -o ROPE ;;
-  bench)    bin=$BIN/llama-bench-null;      m=${1:?model}; n=${2:-128}; set -- -m "$m" -ngl 99 -p 256 -n "$n" -r 3 ;;
+  bench)    bin=$BIN/llama-bench-null;      m=${1:?model}; n=${2:-128}; set -- -m "$m" -ngl "${NGL:-99}" -p 256 -n "$n" -r 3 ;;
   ops)      bin=$BIN/test-backend-ops-null; ops=${1:?ops}; rx=${2:-}; set -- ${OPS_MODE:-test} -b CUDA0   # OPS_MODE=perf for throughput
             [ "$ops" != all ] && set -- "$@" -o "$ops"        # one comma-separated argument, as the suite wants it
             [ -n "$rx" ] && set -- "$@" -p "$rx"; m="ops-$(echo "$ops" | cut -c1-24 | tr ',' '+')" ;;
-  simple)   bin=$BIN/llama-simple-null;     m=${1:?model}; n=${2:-64}; p=${3:-"The three most important things to know about the Thunderbolt bus are"}; set -- -m "$m" -ngl 99 -n "$n" "$p" ;;
+  simple)   bin=$BIN/llama-simple-null;     m=${1:?model}; n=${2:-64}; p=${3:-"The three most important things to know about the Thunderbolt bus are"}; set -- -m "$m" -ngl "${NGL:-99}" -n "$n" "$p" ;;
   spec)     bin=$BIN/llama-speculative-simple-null; m=${1:?model}; md=${2:?draft model}; n=${3:-128}; dn=${4:-3}
             p=${5:-"The three most important things to know about the Thunderbolt bus are"}
-            set -- -m "$m" -md "$md" -ngl 99 -ngld 99 --spec-type "${SPEC_TYPE:-draft-mtp}" --spec-draft-n-max "$dn" -n "$n" -p "$p" ${SPEC_ARGS:-} ;;
+            set -- -m "$m" -md "$md" -ngl "${NGL:-99}" -ngld "${NGLD:-99}" --spec-type "${SPEC_TYPE:-draft-mtp}" --spec-draft-n-max "$dn" -n "$n" -p "$p" ${SPEC_ARGS:-} ;;
   sd)       bin=$BIN/sd-cli-null; m=${1:?model}; st=${2:-20};
             # the first sampling step uploads the mmapped weights, so a model file that has dropped out of the page cache makes
             # that step run at SSD speed (7-12 s instead of 1-2, seen 2026-09-15 00:26-01:05); read it here first and say how long it took,
@@ -71,13 +72,11 @@ echo "== $step  $(date '+%F %T')  binary $bin  build id $id  sdk ${sdk:-?}  log 
 case "$id" in unknown|*dirty*) echo "   WARNING: binary is not a clean build of a recent main or async-default commit"; esac
 env | grep -E '^TINYNV_' | sed 's/^/   env /' ; true
 if [ "${DRY:-0}" = 1 ]; then
-  echo "   DRY=1: null device, no preflight, no lock, no quiesce$([ "$step" = fault ] && echo '; test_hw_fault refuses to run without a socket, so this only checks the wiring')"
+  echo "   DRY=1: null device, no preflight, no quiesce$([ "$step" = fault ] && echo '; test_hw_fault refuses to run without a socket, so this only checks the wiring')"
   unset TINYNV_SOCKET
 else
   sh $R/tools/preflight.sh | tail -1 | grep -q "VERDICT: OK" || { echo "preflight ABORT — not touching the GPU"; exit 1; }
-  # the lock first (held by THIS runner's pid, refused to everyone else including this session's other runs), the server second
-  sh $R/tools/gpu-lock.sh acquire "$who" "$step $(basename "${m:-}" .gguf) $ts" "$$" || exit 1
-  sh $R/tools/tinygpu-server.sh ensure || { sh $R/tools/gpu-lock.sh release "$who" >/dev/null; exit 1; }
+  sh $R/tools/tinygpu-server.sh ensure || exit 1
   export TINYNV_SOCKET=$SOCK
 fi
 start=$(date +%s)
@@ -120,7 +119,8 @@ esac
 if [ "${DRY:-0}" != 1 ]; then
   # Default since 2026-09-14 evening: leave the firmware resident ("idle warm"). With GSP halted the AORUS box runs its fans at
   # fail-safe full speed (Antonio), and the driver resets a warm card itself on open (B). QUIESCE=1 restores the cold state.
+  # Since 2026-09-17 an Ampere card is left cold by the driver itself (GSP-RM unloaded, region torn down: TINYNV_UNLOAD=1, the
+  # default), because its reset-on-open path failed every second boot; QUIESCE=1 is then only a belt-and-braces FLR.
   [ "${QUIESCE:-0}" = 1 ] && sh $R/tools/nv_quiesce.sh 2>&1 | sed 's/^/   /'
-  sh $R/tools/gpu-lock.sh release "$who" >/dev/null
 fi
 exit $rc

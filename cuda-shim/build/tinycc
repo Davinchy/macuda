@@ -47,7 +47,9 @@ elif [ "$BACKEND" = docker ]; then
   # /ggml is the source tree read-only; /out is where the fatbin lands, so it is on the Mac the moment nvcc exits and
   # nothing has to be copied back. --network=none because a compile that reaches the network is a compile to distrust.
   mkdir -p /tmp/tinycc-fatbin
-  $DOCKER run --rm --network=none -v "$GMAC:/ggml:ro" -v /tmp/tinycc-fatbin:/out "$CUDA_IMAGE" \
+  # --platform because on Apple silicon the image is native arm64 and must be asked for as such; --user so the fatbin
+  # lands owned by whoever ran the build rather than by root, which a later run could not overwrite.
+  $DOCKER run --rm --network=none --platform linux/arm64 --user "$(id -u):$(id -g)" -v "$GMAC:/ggml:ro" -v /tmp/tinycc-fatbin:/out "$CUDA_IMAGE" \
     nvcc $NVCC_ARGS $devI $defs -o "/out/tinycc_$base.fatbin" "/ggml/$rel" >&2
   mv "/tmp/tinycc-fatbin/tinycc_$base.fatbin" "$fat"
 else
@@ -58,6 +60,12 @@ fi
 # dispatcher ran at -O0 - the per-kernel profile put the caller's cost above the runtime layer at 2.38 us a launch and the
 # MoE decode's loss at the engine waiting for the host. TINYCC_HOST_OPT overrides (-O0 for a debug build).
 HOSTOPT=${TINYCC_HOST_OPT:--O2}
-$CLANG $std $HOSTOPT -DNDEBUG -x cuda --cuda-host-only --offload-arch=$ARCH --cuda-path=$ROOT/cuda-13 -nocudalib -Wno-unknown-cuda-version \
+# The SDK is passed EXPLICITLY. Without -isysroot, Homebrew's clang looks for an SDK named after the OS it is targeting
+# - MacOSX27.sdk for macos 27 - and the Command Line Tools do not ship one under that name, so every translation unit
+# died in libc++'s math.h on an undeclared FP_NAN, which reads like a CUDA problem and is not one. build/sdk.sh already
+# answers this question by linking a one-line program; TINYCC_SYSROOT lets a caller compute it once for a whole build
+# instead of once per translation unit.
+SYSROOT=${TINYCC_SYSROOT:-$(sh "$ROOT/build/sdk.sh")}
+$CLANG $std $HOSTOPT -DNDEBUG -isysroot "$SYSROOT" -x cuda --cuda-host-only --offload-arch=$ARCH --cuda-path=$ROOT/cuda-13 -nocudalib -Wno-unknown-cuda-version \
   -include $ROOT/spike/tinycudart_compat.h -I$ROOT/cuda-13/include/cccl $hostI $defs \
   -Xclang -fcuda-include-gpubinary -Xclang "$fat" -c "$src" -o "$out"

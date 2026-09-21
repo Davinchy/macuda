@@ -31,10 +31,24 @@
 #define TINYNV_SMEM_MAX_PER_BLOCK (100 * 1024)
 
 #define TINYNV_QMD_CBUF0_MIN_DWORDS 224
+// Ampere keeps the driver's parameters at the START of the bank instead, so it needs only twelve dwords: the two
+// windows and the trap address, at [6:12]. From the oracle, and confirmed against descriptors captured off a 3060.
+#define TINYNV_QMD_V3_CBUF0_MIN_DWORDS 12
 // Where the launch geometry lives inside those driver parameters, measured on a 5090 rather than read from a header:
 // blockDim at word 216 and gridDim at word 220, each three words. See tinynv_qmd_cbuf0.
 #define TINYNV_CBUF0_NTID 216
 #define TINYNV_CBUF0_NCTAID 220
+// And Ampere's, which are at the very bottom of the bank: blockDim at dword 0 and gridDim at dword 3, leaving dwords
+// 6..11 for the two windows and the trap address exactly where the oracle puts them, with nothing overlapping.
+//
+// MEASURED, not assumed, and not from a header. The dims kernel loads its own geometry from constant bank 0 at offsets
+// the compiler chose, so the offsets are IN ITS SASS: nvdisasm of spike/dims.cu built for sm_86 stores c[0x0][0xc] to
+// p[0] (gridDim.x) and c[0x0][0x0] to p[3] (blockDim.x), and computes its block index from c[0x0][0xc] and c[0x0][0x10]
+// as gridDim.x and .y. The same reading of the sm_120 build returns 0x360 and 0x370 - dwords 216 and 220, the two
+// numbers above, which were originally found by filling the region with markers on real hardware. A method that
+// reproduces the known answer for one architecture is a method worth trusting for the other.
+#define TINYNV_QMD_V3_CBUF0_NTID 0
+#define TINYNV_QMD_V3_CBUF0_NCTAID 3
 
 typedef struct {
   uint8_t b[TINYNV_QMD_BYTES];
@@ -43,6 +57,10 @@ typedef struct {
   // the identical mistake and the bytes still agree. A claim on a bit that was already claimed is counted here instead.
   uint8_t claimed[TINYNV_QMD_BYTES];
   uint32_t overlaps;
+  // Which descriptor generation this block is. ZERO IS BLACKWELL, deliberately: every caller builds one of these with
+  // memset(0), so the default is the layout this driver had before Ampere existed and no existing call site changes.
+  // The buffer above is sized for the larger of the two, so one array serves both.
+  uint8_t v3;
 } tinynv_qmd_t;
 
 // a field, named by the two bit positions the generator emitted for it
@@ -108,7 +126,7 @@ int tinynv_qmd_chain(tinynv_qmd_t *prev, uint64_t next_qmd_addr, int prefetch);
 // Returns how many dwords were written, or 0 if the buffer is too short for them.
 // `grid` and `block` may be NULL, which leaves the geometry words zero - which is what the python oracle produces, and
 // what the byte-for-byte comparisons against it therefore expect.
-uint32_t tinynv_qmd_cbuf0(uint32_t *out, uint32_t cap, uint64_t shared_window, uint64_t local_window,
+uint32_t tinynv_qmd_cbuf0(uint32_t *out, uint32_t cap, int v3, uint64_t shared_window, uint64_t local_window,
                           const uint32_t grid[3], const uint32_t block[3]);
 
 #endif

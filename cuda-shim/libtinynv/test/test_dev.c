@@ -129,8 +129,12 @@ int main(int argc, char **argv) {
   // Skipping is opt-in and loud, because a green run that tested nothing is worse than a red one that says why. Session A
   // ran this binary from the wrong directory, got 12 operations and "all checks passed", and was one careless read away
   // from reporting the chain of trust as verified.
+  // Which image to probe for depends on how the chip boots, not on the driver's preferences: the chain-of-trust path
+  // needs the FMC the FSP verifies, and the vbios path needs booter_load, which SEC2 runs to unpack GSP-RM. Probing for
+  // the FMC on an Ampere card reported "firmware is missing" about a tree that had everything that card needs.
   tinynv_blob_t probe;
-  int have_fw = !rc && !tinynv_fw_load(g.dev.fw_name, "fmc-" TINYNV_FW_VER ".bin", NULL, &probe);
+  const char *first_image = g.dev.fmc_boot ? "fmc-" TINYNV_FW_VER ".bin" : "booter_load-" TINYNV_FW_VER ".bin";
+  int have_fw = !rc && !tinynv_fw_load(g.dev.fw_name, first_image, NULL, &probe);
   int allow_no_fw = getenv("TINYNV_ALLOW_NO_FIRMWARE") != NULL;
   if (have_fw) tinynv_fw_free(&probe);
   else if (!rc) {
@@ -161,9 +165,16 @@ int main(int argc, char **argv) {
   if (!hw) printf("gsp-rm is up: it answered on the status queue and the memory windows are retargeted\n");
   if (!hw) {
     printf("register sequences gsp-rm asked the driver to run: %u\n", g.gsp.cpu_seq_requests);
-    // the recording contains none, so the sequencer is unexercised code; if that ever changes, the number says so
-    CHECK(g.gsp.cpu_seq_requests == 0, "the recording requested %u register sequences, which it did not before",
-          g.gsp.cpu_seq_requests);
+    // Both directions are assertions, because the answer is not the same on the two boot paths and "zero or more" would
+    // check nothing. A chain-of-trust recording contains NO register sequences - there is not one register write
+    // between the chain of trust and the windows being retargeted - so the sequencer stays unexercised code there and a
+    // non-zero count means something changed. On the vbios path GSP-RM asks during its own bring-up, every time, so a
+    // count of zero there means the request was dropped rather than run, which would otherwise look like success.
+    if (g.dev.fmc_boot)
+      CHECK(g.gsp.cpu_seq_requests == 0, "the recording requested %u register sequences, which it did not before",
+            g.gsp.cpu_seq_requests);
+    else
+      CHECK(g.gsp.cpu_seq_requests >= 1, "gsp-rm asked for no register sequences on the vbios path, where it always does");
   }
   else if (!cot) printf("gsp-rm: %s\n", tinynv_last_error());
 
