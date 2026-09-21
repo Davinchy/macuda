@@ -70,8 +70,8 @@ compile at a Linux box over ssh instead, which is how this was originally built,
 
 **Fetched by `setup.sh deps`, not in the repository:** NVIDIA's `open-gpu-kernel-modules` headers at commit `81fe4fb` (release
 570.86.16, the one that added the RTX 5090; the build asserts the driver's structure sizes against them), the three signed GSP
-firmware images for 570.144 from linux-firmware (hash-pinned — five images, since Ampere boots from the VBIOS and needs
-`booter_load` and its own `bootloader` where Blackwell needs the FSP's `fmc`), and the CUDA Toolkit headers, taken out of
+firmware images for 570.144 from linux-firmware (hash-pinned — six images, since Ampere boots from the VBIOS and needs
+`booter_load`, `booter_unload` and its own `bootloader` where Blackwell needs the FSP's `fmc`), and the CUDA Toolkit headers, taken out of
 the same container image that compiles the device code. The header/firmware skew (570.86.16 / 570.144) is deliberate and
 proven by booting the card with it.
 
@@ -124,7 +124,11 @@ tinygrad's CUDA compile path); without them `test_reloc` stops the suite unless 
 ## Run
 
 The card is operated through one protocol, and the scripts enforce it: **read-only preflight → lock → one step as its own process →
-release, leaving the card idle warm** (firmware resident, nothing submitted). Two processes on the card at once wedge it.
+release, leaving the card cold** on an Ampere card and idle warm on a Blackwell one. Cold means what NVIDIA's own driver leaves
+behind: GSP-RM told to unload and halted, then `booter_unload` tearing its write-protected region down, so the next open boots the
+recorded cold path and never resets a warm card (`TINYNV_UNLOAD=0` keeps the firmware resident instead; see docs/bench/ampere-3060-20260917.md
+for why the reset path is not trusted on a 3060). Idle warm means firmware resident, nothing submitted. Two processes on the card at
+once wedge it.
 
 **Card-free is not host-free.** On 2026-09-16 the Thunderbolt tunnel dropped and re-enumerated twice with the card idle, both times
 under a full Metal prefill (the Mac's own GPU flat out with a 50 GB model mapped) while the laptop was powered by the enclosure's USB-C
@@ -147,8 +151,10 @@ sh tools/soak.sh 2 256                                  # hours, max tokens: a s
 The runner (`nv_shim_step.sh`) does the preflight, takes the lock with its pid, makes sure the TinyGPU server is up (never replacing a
 live one), runs the step, echoes back the driver's startup line (build id, submission mode, arena, chain depth — *trust that line, not
 what you exported*), marks a step that died by signal or never had the card to itself, and releases. `BIN=<dir>` picks a binary set,
-`DRY=1` runs the step on the null device, `QUIESCE=1` halts the firmware after (cold; the enclosure's fans go to full speed when GSP is
-down — that is not heat). `tinynv-smi` (`cuda-shim/build/shim/nv/tinynv-smi`) reads temperature, power and clocks the driver
+`DRY=1` runs the step on the null device. **`QUIESCE=1` is required on every step on an Ampere card** (see docs/bench/ampere-3060-20260917.md:
+it snapshots the card's PCI configuration while it is valid and puts it back after its reset, and a card that loses that configuration
+under a running firmware cannot be repaired any other way short of a replug); with GSP halted the enclosure's fans go to full speed —
+that is not heat. `tinynv-smi` (`cuda-shim/build/shim/nv/tinynv-smi`) reads temperature, power and clocks the driver
 publishes four times a second, without opening the card.
 
 **Recovery.** `tools/nv_quiesce.sh` (FLR via the dext, halts GSP), `tools/nv_e3_flr.py`, `tools/nv_temp.py` need the tinygrad checkout
