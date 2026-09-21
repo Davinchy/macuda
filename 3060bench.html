@@ -71,7 +71,7 @@
   <header>
     <div class="eyebrow">macuda · Apple M3 Max, 48 GB · macOS 27.0 · 2026-09-21</div>
     <h1>An RTX 3060 over Thunderbolt, against the M3 Max's own GPU</h1>
-    <p class="lede">The same three models on the same Mac, twice. Once on a 12 GB RTX 3060 in a Razer Core X V2, driven by macuda's own userspace driver with no NVIDIA software on the machine. Once on the M3 Max through Apple Metal.</p>
+    <p class="lede">The same four models on the same Mac, twice. Once on a 12 GB RTX 3060 in a Razer Core X V2, driven by macuda's own userspace driver with no NVIDIA software on the machine. Once on the M3 Max through Apple Metal.</p>
     <div class="legend">
       <span><i class="sw card"></i>RTX 3060, macuda (sm_86, cubins built by nvcc in a container)</span>
       <span><i class="sw metal"></i>M3 Max, Metal (llama.cpp and stable-diffusion.cpp Metal backends)</span>
@@ -88,6 +88,12 @@
     <h2>Qwen3.8-27B, unsloth UD Q4_K_M</h2>
     <p class="sub">15.32 GiB of weights and 65 layers. The M3 Max holds all of it. The 3060 holds 44 layers in its 12 GB and leaves 21 to the CPU, or 38 layers when its MTP draft head (1.27 GiB) shares the card. Speculative decoding paid on neither side here: the 3060 is bound by its CPU layers, and the Metal draft path ran far slower than plain decoding.</p>
     <div class="charts" data-group="27b"></div>
+  </section>
+
+  <section id="smoe">
+    <h2>Qwen3.5-35B-A3B, Q4_K_M</h2>
+    <p class="sub">A mixture of experts: 20.5 GiB of weights, 256 experts per layer, 8 used per token, about 3B parameters active. The M3 Max holds all of it. The 3060 holds the attention and the experts of 13 of its 40 layers; the other 27 layers' experts run on the CPU (<code>-ncmoe 27</code>).</p>
+    <div class="charts" data-group="moe"></div>
   </section>
 
   <section id="ssd">
@@ -133,6 +139,12 @@
         run: { card: "logs/shim-bench-20260921-104648.log", metal: "logs/metal-bench-27b-20260921-104831.log" }, foot: "tg128. 3060: 44 of 65 layers on the card" },
       { key: "mtp", title: "Speculative decode with the MTP head", unit: "tokens/s", better: "higher", card: 11.48, metal: 3.37, err: null,
         run: { card: "logs/shim-spec-20260921-104756.log", metal: "logs/metal-spec-27b-20260921-104831.log" }, foot: "llama-speculative-simple, draft-mtp, 4 drafted. Accepted 39% on the 3060 (38 layers on the card), 32% on Metal" }
+    ],
+    "moe": [
+      { key: "pp", title: "Prompt processing", unit: "tokens/s", better: "higher", card: 91.94, metal: 1144.39, err: { card: 3.20, metal: 15.60 },
+        run: { card: "macuda-main/logs/shim-bench-20260921-131107.log", metal: "logs/metal-bench-moe-20260921-113726.log" }, foot: "pp256. 3060: experts of 13 of 40 layers on the card, link at 2.5 GT/s that run" },
+      { key: "tg", title: "Text generation", unit: "tokens/s", better: "higher", card: 37.06, metal: 66.77, err: { card: 1.75, metal: 0.12 },
+        run: { card: "macuda-main/logs/shim-bench-20260921-131107.log", metal: "logs/metal-bench-moe-20260921-113726.log" }, foot: "tg128. The CPU-side experts bound the card's number" }
     ],
     "sd": [
       { key: "img", title: "One image, start to finish", unit: "seconds", better: "lower", card: 5.51, metal: 6.50, err: null,
@@ -218,7 +230,7 @@
     return box;
   }
 
-  var GROUPS = { "7b": "Qwen2.5-7B Q4_K_M", "27b": "Qwen3.8-27B UD Q4_K_M", "sd": "SDXL-Turbo" };
+  var GROUPS = { "7b": "Qwen2.5-7B Q4_K_M", "27b": "Qwen3.8-27B UD Q4_K_M", "moe": "Qwen3.5-35B-A3B Q4_K_M", "sd": "SDXL-Turbo" };
   var tbody = document.querySelector("#results tbody");
   Object.keys(RUNS).forEach(function (group) {
     var host = document.querySelector('.charts[data-group="' + group + '"]');
