@@ -1733,8 +1733,22 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
   // lose its configuration was the one with the link locked, and the loss had always come 1.5 s into init - where the
   // firmware, left to itself, drops the link to Gen1 for power. TINYNV_PCIE_LINK_SPEED=off sends the two entries the
   // recording sends and nothing else.
+  // "auto", the default on a live vbios-path card since 2026-09-21 evening: at the instant of every loss of the
+  // card's configuration the link read Gen4, on boots that had opened at Gen1 and on boots that sent LOCK_AT_LOAD
+  // alike - the firmware retrains the link to its maximum about 1.5 s into init, before any lock applies, and this
+  // enclosure clears the endpoint's configuration on that transition. Boots that open at Gen4 never lose, because
+  // there is nothing to retrain to. So: read the generation the link is on now and forbid every generation above it.
+  // On a Gen1 link that is a clean boot on a slow link; on a Gen4 one, a clean boot on a fast link; a re-enumeration
+  // is what moves the card from the first to the second.
   const char *ls = getenv("TINYNV_PCIE_LINK_SPEED");
-  if (!ls && g->dev.pci->live && !g->dev.fmc_boot) ls = "lock";
+  if (!ls && g->dev.pci->live && !g->dev.fmc_boot) ls = "auto";
+  char auto_buf[8];
+  if (ls && !strcmp(ls, "auto")) {
+    unsigned lgen = 0, lw = 0;
+    tinynv_dev_link(&g->dev, &lgen, &lw);
+    if (lgen >= 1 && lgen <= 5) { snprintf(auto_buf, sizeof auto_buf, "gen%u", lgen); ls = auto_buf; }
+    else ls = "lock";
+  }
   if (ls && *ls && strcmp(ls, "off") && g->dev.pci->live) {
     uint32_t v = 1u << 31;                       // LOCK_AT_LOAD
     int gen = !strncmp(ls, "gen", 3) ? atoi(ls + 3) : 0;

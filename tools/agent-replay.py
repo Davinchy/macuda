@@ -36,7 +36,7 @@ def source_file(rng, name, n):
 
 def tool_output(rng, turn):
     lines = [f"[tool: {rng.choice(['grep','read_file','run_tests','git diff'])}] turn {turn}"]
-    for i in range(rng.randrange(60, 90)):
+    for i in range(rng.randrange(8, 14)):   # small blocks, so the fill lands within a couple of hundred tokens of its target
         lines.append(f"src/{rng.choice(['gsp','exec','dev','mmu','flcn'])}.c:{rng.randrange(1, 2400)}: {rng.choice(['tinynv_fail(','if (rc) return','memcpy(','nv_wr32(','// ','static int '])}{rng.choice(['queue','slot','desc','window','region'])}_{rng.randrange(1000)} {rng.choice(['ok','FAIL','skipped','0x%08x' % rng.randrange(1<<32)])}")
     return "\n".join(lines) + "\n"
 
@@ -62,7 +62,7 @@ def main():
     files = ["gsp.c", "exec.c", "dev.c", "mmu.c", "flcn.c", "submit.c"]
     per_file = max(40, a.first_tokens // (len(files) * 28))
     for f in files: prompt += source_file(rng, f, per_file)
-    prompt = fill_to(url, prompt, a.first_tokens, lambda: source_file(rng, "extra.c", 30))
+    prompt = fill_to(url, prompt, a.first_tokens, lambda: source_file(rng, "extra.c", 6))
     prompt += "\n## Task\nFind why the second boot in one enumeration loses the card's windows, and propose a fix with file:line references.\n"
 
     rows = []; t_all = time.time()
@@ -85,7 +85,7 @@ def main():
         pn = timings.get("prompt_n", -1); pms = timings.get("prompt_ms", 0.0)
         gn = timings.get("predicted_n", -1); gms = timings.get("predicted_ms", 0.0)
         cached = timings.get("cache_n", timings.get("tokens_cached", total - pn if pn >= 0 else -1))
-        reprocessed = pn >= 0 and pn >= 0.9 * total
+        reprocessed = turn > 1 and pn >= 0 and pn >= 0.9 * total   # turn 1 has nothing to reuse
         rows.append({"turn": turn, "prompt_tokens": total, "processed": pn, "cached": cached, "ttft_s": round(ttft or 0, 3),
                      "prompt_tps": round(pn / pms * 1000, 1) if pms else None, "gen_tokens": gn,
                      "gen_tps": round(gn / gms * 1000, 2) if gms else None, "turn_s": round(wall, 2), "cache_miss": reprocessed})
