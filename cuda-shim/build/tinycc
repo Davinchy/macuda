@@ -12,9 +12,13 @@ CLANG=/opt/homebrew/opt/llvm/bin/clang++
 # CUDA container on this Mac, which is the default when no host is set. The container needs no GPU, no NVIDIA driver and
 # no container runtime hooks: --fatbin compiles DEVICE code for sm_120 and never executes it. nvidia/cuda publishes
 # arm64 images, so on Apple Silicon this runs natively rather than under emulation.
+#
+# The backend is still called `docker` because that is what it was, but the runtime under it is whichever of Apple's
+# `container` and Docker this machine has - build/container-runtime.sh decides, and the invocation below is identical
+# on both.
 BACKEND=${TINYCC_BACKEND:-$([ -n "${TINYCC_HOST:-}" ] && echo ssh || echo docker)}
 CUDA_IMAGE=${TINYCC_CUDA_IMAGE:-nvidia/cuda:13.0.3-devel-ubuntu24.04}
-DOCKER=${DOCKER:-docker}
+DOCKER=$(sh "$(dirname "$0")/container-runtime.sh")
 if [ "$BACKEND" = ssh ]; then
   HOST=${TINYCC_HOST:?set TINYCC_HOST=user@host, the Linux box with nvcc}; KEY=${TINYCC_KEY:-}   # TINYCC_KEY: ssh identity file, optional
 fi

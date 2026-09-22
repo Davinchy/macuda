@@ -46,7 +46,7 @@ sh install.sh
 
 `DEFS_EXTRA` adds to the build's own defines and is not needed for graphs: `build-ggml-cuda.sh` has carried `-DGGML_CUDA_USE_GRAPHS` in its defaults since 19 September, so a plain `sh install.sh` already matches the published graph-enabled configuration.
 
-The installer can install missing CMake and LLVM packages, Docker Desktop and TinyGPU.app. Start Docker Desktop if using the local compiler container. TinyGPU's DriverKit extension still requires user approval through macOS; after the app is installed, run:
+The installer can install missing CMake and LLVM packages, a container runtime (Apple's `container` on macOS 26 and later, otherwise Docker Desktop) and TinyGPU.app. If using the local compiler container, make sure that runtime is running: `container system start`, or start Docker Desktop. TinyGPU's DriverKit extension still requires user approval through macOS; after the app is installed, run:
 
 ```sh
 /Applications/TinyGPU.app/Contents/MacOS/TinyGPU install
@@ -82,12 +82,12 @@ sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf
 | GPU | RTX 5090 in a Thunderbolt enclosure; measurements use an AORUS AI BOX |
 | Host toolchain | Xcode Command Line Tools or Xcode, CMake, Python 3 and Homebrew LLVM at `/opt/homebrew/opt/llvm` |
 | Hardware access | TinyGPU.app and its approved DriverKit extension, `org.tinygrad.tinygpu.driver2` |
-| GPU compiler | Docker with the configured CUDA image, or a Linux machine with CUDA 13 accessible over SSH |
+| GPU compiler | A container runtime with the configured CUDA image — Apple's `container` (macOS 26+) or Docker — or a Linux machine with CUDA 13 accessible over SSH |
 | Storage | Build artifacts, downloaded dependencies and model files; the installer checks available space |
 
-**Compiler options.** With `TINYCC_HOST` unset, `tinycc` uses `nvidia/cuda:13.0.3-devel-ubuntu24.04` through Docker. The container compiles device code only and requires no GPU access or NVIDIA container runtime. To use an SSH compiler host, set `TINYCC_HOST=user@linux-box` before installation or the build; use `TINYCC_KEY` if an explicit SSH identity is required. The published benchmark builds used the SSH path.
+**Compiler options.** With `TINYCC_HOST` unset, `tinycc` uses `nvidia/cuda:13.0.3-devel-ubuntu24.04` through a local container runtime. `cuda-shim/build/container-runtime.sh` picks Apple's `container` when it is installed (macOS 26+, `brew install container`, a lightweight VM per container) and Docker otherwise; `CONTAINER_RUNTIME=<command>` forces one. Both take the same invocation. The container compiles device code only and requires no GPU access or NVIDIA container runtime. To use an SSH compiler host, set `TINYCC_HOST=user@linux-box` before installation or the build; use `TINYCC_KEY` if an explicit SSH identity is required. The published benchmark builds used the SSH path.
 
-**Fetched dependencies.** `setup.sh deps` obtains NVIDIA headers at commit `81fe4fb` (release 570.86.16), hash-pinned GSP firmware 570.144 and CUDA Toolkit headers. Toolkit headers come from the configured Linux host, the Docker image or `CUDA_INCLUDE_SRC`. These dependencies are not committed to this repository. The header and firmware versions are intentionally different and have been validated together on the test GPU.
+**Fetched dependencies.** `setup.sh deps` obtains NVIDIA headers at commit `81fe4fb` (release 570.86.16), hash-pinned GSP firmware 570.144 and CUDA Toolkit headers. Toolkit headers come from the configured Linux host, the CUDA image through whichever container runtime is in use, or `CUDA_INCLUDE_SRC`. These dependencies are not committed to this repository. The header and firmware versions are intentionally different and have been validated together on the test GPU.
 
 **Optional development dependencies.** Some offline reference tests and recovery tools use the tinygrad checkouts and Python environment described in [env.sh](env.sh). These are separate from the application build prerequisites.
 

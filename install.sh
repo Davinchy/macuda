@@ -13,8 +13,9 @@
 # The one genuinely Linux-only piece is nvcc, which compiles ggml's ~190 CUDA translation units for the card. This
 # installer runs it in a CUDA container instead of on a separate Linux machine: nvidia/cuda publishes arm64 images, so
 # nvcc runs natively on Apple Silicon, and because it only ever compiles device code (--fatbin, never executed here) the
-# container needs no GPU, no NVIDIA driver and no special runtime. The alternative — a Linux box over ssh — is still
-# supported and faster if you have one: set TINYCC_HOST=user@box and it will be used instead.
+# container needs no GPU, no NVIDIA driver and no special runtime. Either runtime serves: Apple's own `container`
+# (macOS 26+, a lightweight VM per container, no desktop app) when it is installed, Docker otherwise. The alternative —
+# a Linux box over ssh — is still supported and faster if you have one: set TINYCC_HOST=user@box instead.
 set -u
 R=$(cd "$(dirname "$0")" && pwd); cd "$R"
 mode=${1:-all}
@@ -67,12 +68,21 @@ fi
 # ---------------------------------------------------------------- the linux half
 head_ "The CUDA (Linux) half"
 if [ -n "${TINYCC_HOST:-}" ]; then
-  ok "TINYCC_HOST=$TINYCC_HOST — the device compile will use that box over ssh, and Docker is not needed"
+  ok "TINYCC_HOST=$TINYCC_HOST — the device compile will use that box over ssh, and no container runtime is needed"
+elif command -v container > /dev/null 2>&1; then
+  # Apple's own runtime, preferred where it exists: a lightweight VM per container on Virtualization.framework, no
+  # Docker Desktop to install or keep running. It takes the same run/-v/--network=none invocation Docker does.
+  ok "Apple's container at $(command -v container)"
+  if container system status > /dev/null 2>&1; then ok "its service is running"
+  else bad "the container service (installed, but not started)" "run: container system kernel set --recommended && container system start"
+  fi
 elif command -v docker > /dev/null 2>&1; then
   ok "docker at $(command -v docker)"
   if docker info > /dev/null 2>&1; then ok "the Docker daemon is running"
   else bad "the Docker daemon (installed, but not running)" "open Docker Desktop (open -a Docker) and wait for it to say Running"
   fi
+elif [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ] 2>/dev/null; then
+  bad "a container runtime for nvcc, or a Linux box" "run: brew install container   (Apple's, macOS 26+), or brew install --cask docker, or set TINYCC_HOST=user@box"
 else
   bad "Docker, or a Linux box with nvcc" "run: brew install --cask docker   (then open it once), or set TINYCC_HOST=user@box"
 fi
@@ -102,10 +112,21 @@ if [ "$mode" != build ] && [ "$miss" -gt 0 ]; then
     case $f in cmake) command -v cmake > /dev/null 2>&1 && continue;; llvm) [ -x /opt/homebrew/opt/llvm/bin/clang++ ] && continue;; esac
     ask "brew install $f ?" && brew install $f
   done
-  if [ -z "${TINYCC_HOST:-}" ] && ! command -v docker > /dev/null 2>&1; then
+  # Apple's runtime first on macOS 26+: a formula rather than a 1 GB desktop app, and nothing to leave running.
+  if [ -z "${TINYCC_HOST:-}" ] && ! command -v container > /dev/null 2>&1 && ! command -v docker > /dev/null 2>&1 \
+     && [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ] 2>/dev/null; then
+    ask "brew install container ? (Apple's container runtime — it runs the nvcc container in a lightweight VM)" \
+      && brew install container && container system kernel set --recommended && container system start
+  fi
+  if [ -z "${TINYCC_HOST:-}" ] && ! command -v container > /dev/null 2>&1 && ! command -v docker > /dev/null 2>&1; then
     ask "brew install --cask docker ? (Docker Desktop, ~1 GB — it runs the nvcc container)" && brew install --cask docker
   fi
-  if command -v docker > /dev/null 2>&1 && ! docker info > /dev/null 2>&1 && [ -z "${TINYCC_HOST:-}" ]; then
+  if command -v container > /dev/null 2>&1 && ! container system status > /dev/null 2>&1 && [ -z "${TINYCC_HOST:-}" ]; then
+    ask "start Apple's container service now?" \
+      && { container system kernel set --recommended > /dev/null 2>&1; container system start; }
+  fi
+  if command -v docker > /dev/null 2>&1 && ! command -v container > /dev/null 2>&1 \
+     && ! docker info > /dev/null 2>&1 && [ -z "${TINYCC_HOST:-}" ]; then
     ask "start Docker Desktop now and wait for it?" && { open -a Docker; printf '         waiting for the Docker daemon'
       i=0; until docker info > /dev/null 2>&1 || [ $i -ge 90 ]; do printf '.'; sleep 2; i=$((i+1)); done; echo
       docker info > /dev/null 2>&1 && echo "         Docker is up" || { echo "         Docker did not come up; start it by hand and re-run"; exit 1; }; }
@@ -121,7 +142,7 @@ if [ "$mode" != build ] && [ "$miss" -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------- build
-head_ "Building (this takes a while: llama.cpp ~5 min, the CUDA half ~10-30 min the first time)"
+head_ "Building (llama.cpp ~5 min; the CUDA half ~3-5 min once the image is here, plus a 4 GB pull the first time)"
 set -e
 echo "== 1/6 headers and firmware (NVIDIA's open-gpu-kernel-modules headers, GSP firmware, CUDA headers)"
 sh setup.sh deps
@@ -133,7 +154,10 @@ echo "== 4/6 the shim itself (libtinynv + libtinycudart + libtinycublas; no GPU 
 sh setup.sh shim
 echo "== 5/6 ggml's CUDA backend — device code through nvcc, host code through clang"
 if [ -z "${TINYCC_HOST:-}" ]; then
-  docker image inspect "$CUDA_IMAGE" > /dev/null 2>&1 || { echo "   pulling $CUDA_IMAGE (~4 GB, once)"; docker pull "$CUDA_IMAGE"; }
+  # Whichever runtime the shim's own scripts will use, asked once so the image is there before 190 compiles start
+  # racing for it. `image inspect` and `image pull` are spelled the same by both.
+  RT=$(sh cuda-shim/build/container-runtime.sh)
+  "$RT" image inspect "$CUDA_IMAGE" > /dev/null 2>&1 || { echo "   pulling $CUDA_IMAGE with $RT (~4 GB, once)"; "$RT" image pull "$CUDA_IMAGE"; }
 fi
 sh cuda-shim/build/build-ggml-cuda.sh
 echo "== 6/6 linking the binaries against the shim"

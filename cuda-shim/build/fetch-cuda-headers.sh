@@ -14,13 +14,19 @@ elif [ -n "${TINYCC_HOST:-}" ]; then
   scp -q -r ${TINYCC_KEY:+-i "$TINYCC_KEY"} "$TINYCC_HOST:/usr/local/cuda/include" "$DEST/"
 else
   # No Linux box: take them out of the same CUDA container that compiles the device code, so there is exactly one
-  # source of CUDA on the machine and the headers match the nvcc that will be used. `docker create` makes a container
-  # without running it; nothing here executes CUDA or needs a GPU.
+  # source of CUDA on the machine and the headers match the nvcc that will be used. Nothing here executes CUDA or
+  # needs a GPU.
+  #
+  # Copied out through a bind mount rather than `docker create` + `docker cp`, because Apple's `container` has no cp
+  # subcommand and this way both runtimes take the same path - the container writes into a directory on the Mac and
+  # the files are there the moment it exits.
   IMAGE=${TINYCC_CUDA_IMAGE:-nvidia/cuda:13.0.3-devel-ubuntu24.04}
-  command -v ${DOCKER:-docker} > /dev/null 2>&1 || { echo "no CUDA headers source: set CUDA_INCLUDE_SRC=<local .../include>, or TINYCC_HOST=user@box, or install Docker (see install.sh)"; exit 1; }
-  echo "taking the CUDA headers out of $IMAGE (no GPU involved)"
-  cid=$(${DOCKER:-docker} create "$IMAGE" /bin/true)
-  ${DOCKER:-docker} cp "$cid:/usr/local/cuda/include" "$DEST/" && ${DOCKER:-docker} rm -f "$cid" > /dev/null
+  RT=$(sh "$(dirname "$0")/container-runtime.sh")
+  command -v "$RT" > /dev/null 2>&1 || { echo "no CUDA headers source: set CUDA_INCLUDE_SRC=<local .../include>, or TINYCC_HOST=user@box, or install a container runtime - Apple's (brew install container) or Docker (see install.sh)"; exit 1; }
+  echo "taking the CUDA headers out of $IMAGE with $RT (no GPU involved)"
+  mkdir -p "$DEST/include"
+  "$RT" run --rm --network=none -v "$DEST:/dest" "$IMAGE" \
+    sh -c 'cp -R /usr/local/cuda/include/. /dest/include/'
 fi
 # clang reads version.txt/version.json to decide whether it knows this CUDA; 12.8 is the newest the pinned Homebrew clang
 # accepts, the headers are whatever the box has (13.0), and tinycc passes -Wno-unknown-cuda-version for the difference.
