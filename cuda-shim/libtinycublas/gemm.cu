@@ -230,9 +230,12 @@ extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f32_tc(
 // 16-byte aligned; the host falls back to the first-cut kernel otherwise. Same epilogue: f32 tile through shared memory,
 // alpha/beta, f32/f16/bf16 out, coalesced column-major stores.
 #include <cuda_pipeline.h>
-template <int OPA, int OPB, int BM, int BN, int WN_FRAGS>
-__device__ __forceinline__ void tinyblas_gemm_f16_tc2(
-    const __half* A, const __half* B, void* C,
+// T is the input element: __half for the f16 kernels, __nv_bfloat16 for the bf16 ones (2026-09-21: bf16 GEMMs used to take
+// the scalar tinyblas_gemm_f32, which held a bf16 Qwen2.5-3B prompt to 307 tok/s on the 5090). wmma's m16n16k16 takes
+// either with f32 accumulation (sm_80 and later), and cp.async and the zero fill copy bytes, so nothing else changes.
+template <typename T, int OPA, int OPB, int BM, int BN, int WN_FRAGS>
+__device__ __forceinline__ void tinyblas_gemm_tc2(
+    const T* A, const T* B, void* C,
     long long sA, long long sB, long long sC,
     int m, int n, int k, int lda, int ldb, int ldc,
     float alpha, float beta, int out_dtype) {
@@ -241,8 +244,8 @@ __device__ __forceinline__ void tinyblas_gemm_f16_tc2(
   // B tile: OPB==0 -> Bs[n][k] (k contiguous, col_major fragment, ldm = BK+PAD); OPB==1 -> Bs[k][n] (row_major, ldm = BN+PAD)
   constexpr int A_ROWS = OPA == 0 ? BK : BM, A_COLS = OPA == 0 ? BM : BK, A_LD = A_COLS + PAD;
   constexpr int B_ROWS = OPB == 0 ? BN : BK, B_COLS = OPB == 0 ? BK : BN, B_LD = B_COLS + PAD;
-  __shared__ __align__(128) __half As[NBUF][A_ROWS * A_LD];
-  __shared__ __align__(128) __half Bs[NBUF][B_ROWS * B_LD];
+  __shared__ __align__(128) T As[NBUF][A_ROWS * A_LD];
+  __shared__ __align__(128) T Bs[NBUF][B_ROWS * B_LD];
   __shared__ __align__(128) float  stage[NWARPS][16 * 16];   // one 16x16 f32 fragment per warp for the general epilogue
   A += (long long)blockIdx.z * sA;
   B += (long long)blockIdx.z * sB;
@@ -259,19 +262,19 @@ __device__ __forceinline__ void tinyblas_gemm_f16_tc2(
     #pragma unroll
     for (int c = 0; c < (A_ROWS * A_COLS / 8) / NT; c++) {
       int chunk = tid + c * NT; int row = chunk / (A_COLS / 8), col8 = (chunk % (A_COLS / 8)) * 8;
-      const __half* src; bool ok;
+      const T* src; bool ok;
       if (OPA == 0) { int gk = k0 + row, gm = m0 + col8; ok = gk < k && gm < m; src = A + gm + (long long)gk * lda; }   // As[k][m]: 8 consecutive m
       else          { int gm = m0 + row, gk = k0 + col8; ok = gm < m && gk < k; src = A + gk + (long long)gm * lda; }   // As[m][k]: 8 consecutive k
-      __half* dst = &As[buf][row * A_LD + col8];
+      T* dst = &As[buf][row * A_LD + col8];
       if (ok) __pipeline_memcpy_async(dst, src, 16); else *(uint4*)dst = make_uint4(0, 0, 0, 0);
     }
     #pragma unroll
     for (int c = 0; c < (B_ROWS * B_COLS / 8) / NT; c++) {
       int chunk = tid + c * NT; int row = chunk / (B_COLS / 8), col8 = (chunk % (B_COLS / 8)) * 8;
-      const __half* src; bool ok;
+      const T* src; bool ok;
       if (OPB == 0) { int gn = n0 + row, gk = k0 + col8; ok = gn < n && gk < k; src = B + gk + (long long)gn * ldb; }   // Bs[n][k]: 8 consecutive k
       else          { int gk = k0 + row, gn = n0 + col8; ok = gk < k && gn < n; src = B + gn + (long long)gk * ldb; }   // Bs[k][n]: 8 consecutive n
-      __half* dst = &Bs[buf][row * B_LD + col8];
+      T* dst = &Bs[buf][row * B_LD + col8];
       if (ok) __pipeline_memcpy_async(dst, src, 16); else *(uint4*)dst = make_uint4(0, 0, 0, 0);
     }
     __pipeline_commit();
@@ -288,16 +291,16 @@ __device__ __forceinline__ void tinyblas_gemm_f16_tc2(
       #pragma unroll
       for (int i = 0; i < 2; i++) {
         const int mi = wm * 32 + i * 16;
-        if (OPA == 0) { wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::col_major> a; wmma::load_matrix_sync(a, &As[buf][kk * A_LD + mi], A_LD);
+        if (OPA == 0) { wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::col_major> a; wmma::load_matrix_sync(a, &As[buf][kk * A_LD + mi], A_LD);
           #pragma unroll
           for (int j = 0; j < WN_FRAGS; j++) { const int ni = wn * (16 * WN_FRAGS) + j * 16;
-            if (OPB == 0) { wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b; wmma::load_matrix_sync(b, &Bs[buf][ni * B_LD + kk], B_LD); wmma::mma_sync(acc[i][j], a, b, acc[i][j]); }
-            else          { wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b; wmma::load_matrix_sync(b, &Bs[buf][kk * B_LD + ni], B_LD); wmma::mma_sync(acc[i][j], a, b, acc[i][j]); } }
-        } else { wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a; wmma::load_matrix_sync(a, &As[buf][mi * A_LD + kk], A_LD);
+            if (OPB == 0) { wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::col_major> b; wmma::load_matrix_sync(b, &Bs[buf][ni * B_LD + kk], B_LD); wmma::mma_sync(acc[i][j], a, b, acc[i][j]); }
+            else          { wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::row_major> b; wmma::load_matrix_sync(b, &Bs[buf][kk * B_LD + ni], B_LD); wmma::mma_sync(acc[i][j], a, b, acc[i][j]); } }
+        } else { wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::row_major> a; wmma::load_matrix_sync(a, &As[buf][mi * A_LD + kk], A_LD);
           #pragma unroll
           for (int j = 0; j < WN_FRAGS; j++) { const int ni = wn * (16 * WN_FRAGS) + j * 16;
-            if (OPB == 0) { wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b; wmma::load_matrix_sync(b, &Bs[buf][ni * B_LD + kk], B_LD); wmma::mma_sync(acc[i][j], a, b, acc[i][j]); }
-            else          { wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b; wmma::load_matrix_sync(b, &Bs[buf][kk * B_LD + ni], B_LD); wmma::mma_sync(acc[i][j], a, b, acc[i][j]); } }
+            if (OPB == 0) { wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::col_major> b; wmma::load_matrix_sync(b, &Bs[buf][ni * B_LD + kk], B_LD); wmma::mma_sync(acc[i][j], a, b, acc[i][j]); }
+            else          { wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::row_major> b; wmma::load_matrix_sync(b, &Bs[buf][kk * B_LD + ni], B_LD); wmma::mma_sync(acc[i][j], a, b, acc[i][j]); } }
         }
       }
     }
@@ -306,6 +309,12 @@ __device__ __forceinline__ void tinyblas_gemm_f16_tc2(
   // Epilogue, fragment by fragment. A fragment that is fully inside the matrix with alpha 1, beta 0 and f32 output goes
   // straight to memory as a column-major 16x16 block; everything else is staged through the warp's own 16x16 buffer so
   // alpha, beta, bounds and the output type are handled per element.
+  // THE DIRECT STORE'S OWN CONTRACT (G's review of the bf16 fix, 2026-09-21): store_matrix_sync needs a 32-byte-aligned
+  // destination and, for float, a leading dimension that is a multiple of 4. Fragment corners sit at multiples of 16 rows
+  // and columns, so both hold for every fragment exactly when C's base (after the batch offset) is 32-byte aligned and
+  // ldc % 4 == 0. Anything else takes the staged path. This used to store directly whatever ldc was: ldc = 33 passed
+  // dispatch, because the host checks only the inputs.
+  const bool direct_ok = (ldc & 3) == 0 && (((unsigned long long)Cb) & 31) == 0;
   const int lane = tid & 31;
   #pragma unroll
   for (int i = 0; i < 2; i++) {
@@ -313,7 +322,7 @@ __device__ __forceinline__ void tinyblas_gemm_f16_tc2(
     for (int j = 0; j < WN_FRAGS; j++) {
       const int gm0 = m0 + wm * 32 + i * 16, gn0 = n0 + wn * (16 * WN_FRAGS) + j * 16;
       if (gm0 >= m || gn0 >= n) continue;
-      if (out_dtype == 0 && alpha == 1.f && beta == 0.f && gm0 + 16 <= m && gn0 + 16 <= n) {
+      if (direct_ok && out_dtype == 0 && alpha == 1.f && beta == 0.f && gm0 + 16 <= m && gn0 + 16 <= n) {
         wmma::store_matrix_sync((float*)Cb + gm0 + (long long)gn0 * ldc, acc[i][j], ldc, wmma::mem_col_major);
         continue;
       }
@@ -337,14 +346,24 @@ __device__ __forceinline__ void tinyblas_gemm_f16_tc2(
     }
   }
 }
-extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_f16_tc2_nn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_f16_tc2<0,0,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
-extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2s_nn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_f16_tc2<0,0,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
-extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_f16_tc2_nt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_f16_tc2<0,1,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
-extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2s_nt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_f16_tc2<0,1,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
-extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_f16_tc2_tn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_f16_tc2<1,0,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
-extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2s_tn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_f16_tc2<1,0,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
-extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_f16_tc2_tt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_f16_tc2<1,1,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
-extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2s_tt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_f16_tc2<1,1,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_f16_tc2_nn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__half,0,0,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2s_nn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__half,0,0,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_f16_tc2_nt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__half,0,1,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2s_nt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__half,0,1,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_f16_tc2_tn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__half,1,0,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2s_tn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__half,1,0,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_f16_tc2_tt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__half,1,1,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2s_tt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__half,1,1,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+
+// the same kernels for bf16 inputs (llama.cpp's bf16 weights: cublasGemmEx CUDA_R_16BF, COMPUTE_32F, f32 out, op T/N)
+extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_bf16_tc2_nn(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,0,0,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2s_nn(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,0,0,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_bf16_tc2_nt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,0,1,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2s_nt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,0,1,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_bf16_tc2_tn(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,1,0,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2s_tn(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,1,0,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_bf16_tc2_tt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,1,1,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2s_tt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,1,1,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Bandwidth probes (2026-09-14): read-only kernels reach ~1570 GB/s on this card, every read+write copy caps at ~508.

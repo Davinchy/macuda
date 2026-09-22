@@ -1,0 +1,4 @@
+bench_gemm_contract align f16 ldc33 (tinyblas_gemm_f16_tc2s_tn): err 0.00e+00 PASS
+bench_gemm_contract align f16 base16 (tinyblas_gemm_f16_tc2s_tn): err 0.00e+00 PASS
+bench_gemm_contract align bf16 ldc33 (tinyblas_gemm_bf16_tc2s_tn): err 0.00e+00 PASS
+bench_gemm_contract align bf16 base16 (tinyblas_gemm_bf16_tc2s_tn): err 0.00e+00 PASS

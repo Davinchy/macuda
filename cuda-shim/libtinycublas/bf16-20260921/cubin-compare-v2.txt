@@ -1,0 +1,50 @@
+committed gemm.cubin (v1, ddedbafa) vs v2 (7fce087a), sm_120, SASS hashed with addresses stripped:
+tinyblas_bw_read 1a561bf604057074 1a561bf604057074 SAME
+tinyblas_bw_write 6c2600541e28298c 6c2600541e28298c SAME
+tinyblas_gemm_bf16_tc2_nn 9ef7e0565c2fe0c9 d0b66fab8a109a5b CHANGED
+tinyblas_gemm_bf16_tc2_nt cc3346417b3625b6 e5a9d27a57cacfba CHANGED
+tinyblas_gemm_bf16_tc2s_nn f5faffe823c265ad 2a42760298e6735d CHANGED
+tinyblas_gemm_bf16_tc2s_nt 12a221dd03ac328e 385b4f093d162813 CHANGED
+tinyblas_gemm_bf16_tc2s_tn 85afde33ea210a8c 4ee8e8ef43bf6fcc CHANGED
+tinyblas_gemm_bf16_tc2s_tt d549d82d3c19b922 fee79a5741094a75 CHANGED
+tinyblas_gemm_bf16_tc2_tn 66dcddbf6dc61bf1 54bfd32ef9350e22 CHANGED
+tinyblas_gemm_bf16_tc2_tt 04532f4bf0826206 f8de5b1657696dc3 CHANGED
+tinyblas_gemm_f16_tc2_nn 4cf492cf9034e139 6de926b5714d0a48 CHANGED
+tinyblas_gemm_f16_tc2_nt 37a0708ce2d9f1d3 4921e32e7da068b1 CHANGED
+tinyblas_gemm_f16_tc2s_nn e4c8c269ed23b1f7 02e523a5a0e27e29 CHANGED
+tinyblas_gemm_f16_tc2s_nt de387438c509ed77 53f07c11ac534c16 CHANGED
+tinyblas_gemm_f16_tc2s_tn d6fe8a98152d68eb b9bfcdf21e4e8e10 CHANGED
+tinyblas_gemm_f16_tc2s_tt 2e2c94832f3f6230 bdcf51b719a8d1f8 CHANGED
+tinyblas_gemm_f16_tc2_tn 0847b1602ff33715 1b5ecdb154b2f49c CHANGED
+tinyblas_gemm_f16_tc2_tt d277981d8022bf9d e99f2d5f26f015f8 CHANGED
+tinyblas_gemm_f16_tc 31a731077eeba9e3 31a731077eeba9e3 SAME
+tinyblas_gemm_f32 258f7f88ef27a6bb 258f7f88ef27a6bb SAME
+tinyblas_gemm_f32_tc ab227544ddfed685 ab227544ddfed685 SAME
+tinyblas_trsm_rupn_f32 8d136c714b34e42c 8d136c714b34e42c SAME
+
+global store widths in the direct-store kernels (no vector store, so no alignment dependence in the compiled code):
+gemm_sm86_v1.cubin tinyblas_gemm_bf16_tc2s_tn:      96 STG.E     128 STG.E.U16 
+gemm_sm86_v1.cubin tinyblas_gemm_f16_tc2s_tn:      96 STG.E     128 STG.E.U16 
+gemm_sm86_v1.cubin tinyblas_gemm_bf16_tc2_tn:     192 STG.E     256 STG.E.U16 
+gemm_sm120.cubin tinyblas_gemm_bf16_tc2s_tn:      96 STG.E     128 STG.E.U16 
+gemm_sm120.cubin tinyblas_gemm_f16_tc2s_tn:      96 STG.E     128 STG.E.U16 
+gemm_sm120.cubin tinyblas_gemm_bf16_tc2_tn:     192 STG.E     256 STG.E.U16 
+gemm_sm120_v2.cubin tinyblas_gemm_bf16_tc2s_tn:      96 STG.E     128 STG.E.U16 
+gemm_sm120_v2.cubin tinyblas_gemm_f16_tc2s_tn:      96 STG.E     128 STG.E.U16 
+gemm_sm120_v2.cubin tinyblas_gemm_bf16_tc2_tn:     192 STG.E     256 STG.E.U16 
+
+main 715b281 gemm.cubin (b5b2da1a) vs v2 (7fce087a): every kernel main held
+tinyblas_bw_read 1a561bf604057074 1a561bf604057074 SAME
+tinyblas_bw_write 6c2600541e28298c 6c2600541e28298c SAME
+tinyblas_gemm_f16_tc 31a731077eeba9e3 31a731077eeba9e3 SAME
+tinyblas_gemm_f16_tc2_nn 4cf492cf9034e139 6de926b5714d0a48 CHANGED
+tinyblas_gemm_f16_tc2_nt 37a0708ce2d9f1d3 4921e32e7da068b1 CHANGED
+tinyblas_gemm_f16_tc2s_nn e4c8c269ed23b1f7 02e523a5a0e27e29 CHANGED
+tinyblas_gemm_f16_tc2s_nt de387438c509ed77 53f07c11ac534c16 CHANGED
+tinyblas_gemm_f16_tc2s_tn d6fe8a98152d68eb b9bfcdf21e4e8e10 CHANGED
+tinyblas_gemm_f16_tc2s_tt 2e2c94832f3f6230 bdcf51b719a8d1f8 CHANGED
+tinyblas_gemm_f16_tc2_tn 0847b1602ff33715 1b5ecdb154b2f49c CHANGED
+tinyblas_gemm_f16_tc2_tt d277981d8022bf9d e99f2d5f26f015f8 CHANGED
+tinyblas_gemm_f32 258f7f88ef27a6bb 258f7f88ef27a6bb SAME
+tinyblas_gemm_f32_tc ab227544ddfed685 ab227544ddfed685 SAME
+tinyblas_trsm_rupn_f32 8d136c714b34e42c 8d136c714b34e42c SAME

@@ -1,0 +1,2 @@
+all-NaN: v1 0 (ACCEPTED), v2 inf (refused)
+one NaN: v1 0 (ACCEPTED), v2 inf (refused)

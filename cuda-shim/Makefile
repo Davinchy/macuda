@@ -25,7 +25,7 @@ CUDART   := $(BUILD)/libtinycudart.a
 CUBLAS   := $(BUILD)/libtinycublas.a
 
 .PHONY: all test clean FORCE
-all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke
+all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke $(BUILD)/cublas_contract
 
 $(NV_LIB): FORCE
 	@$(MAKE) --no-print-directory -C libtinynv BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
@@ -75,12 +75,16 @@ $(BUILD)/gemm_cubin.c: libtinycublas/gemm.cubin
 $(BUILD)/gemm_cubin.o: $(BUILD)/gemm_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# the Ex entry points' type contract (G's review of the bf16 fix): matching A/B, a defined compute type, on the null device
+$(BUILD)/cublas_contract: test/cublas_contract.c $(CUDART) $(CUBLAS) $(NV_LIB)
+	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 $(BUILD)/link_smoke: test/link_smoke.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 
 test: all coverage
 	@$(MAKE) --no-print-directory -C libtinynv test BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
 	$(BUILD)/link_smoke
+	env -u TINYNV_SOCKET -u TINYNV_PCI $(BUILD)/cublas_contract
 
 # every cuda*/cublas* symbol the compiled ggml-cuda archive needs must be defined by the shim (skipped if the archive is absent)
 .PHONY: coverage
