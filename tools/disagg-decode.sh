@@ -1,6 +1,6 @@
 #!/bin/sh
-# disagg-decode.sh — the METAL half of the disaggregated-inference experiment (V1, 2026-09-16). NO card: this runs the
-# offline-ai-kit's own Metal llama-server on the Mac GPU; no lock, no preflight, nothing from A.
+# disagg-decode.sh — the METAL half of the disaggregated-inference experiment (V1, 2026-09-16). NO card: this runs a
+# Metal llama-server on the Mac GPU (tools/metal-bin.sh finds it, METAL_BIN overrides); no lock, no preflight, nothing from A.
 #
 #   sh tools/disagg-decode.sh baseline [prompt-file] [n]       Metal alone: full prefill + n greedy tokens; the reference
 #   sh tools/disagg-decode.sh restore  [prompt-file] [n] [state-name]
@@ -12,8 +12,8 @@
 # server on 8090 is untouched. Timings come from the server's own timings block, not wall clocks.
 set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
-K=/Volumes/512SSD/LocalCode/offline-ai-kit; BIN=${METAL_BIN:-$K/bin/llama-server}
-MODEL=${MODEL:-$K/models/Qwen3-Coder-Next-UD-Q4_K_XL.gguf}
+BIN=$(sh "$R/tools/metal-bin.sh")
+MODEL=${MODEL:-$(sh "$R/tools/find-model.sh" Qwen3-Coder-Next-UD-Q4_K_XL.gguf)}
 mode=${1:?baseline|restore}; PROMPT=${2:-$R/logs/disagg/prompt-24k.txt}; N=${3:-128}; NAME=${4:-coder-next-24k.bin}
 STATE=${STATE:-$R/logs/disagg}; PORT=${PORT:-8091}; CTX=${CTX:-40960}
 mkdir -p "$STATE"; ts=$(date +%Y%m%d-%H%M%S); SLOG=$STATE/metal-$mode-server-$ts.log; OUT=$STATE/metal-$mode-$ts

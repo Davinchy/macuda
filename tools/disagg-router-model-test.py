@@ -13,10 +13,17 @@ recorded for it. A refit that cannot reproduce the points it came from is the bu
 
   python3 tools/disagg-router-model-test.py       exit 0 = every check passed; 2 = a model file is not on this Mac
 """
-import importlib.util, os, sys, types
+import importlib.util, os, subprocess, sys, types
 
-CODER = "/Volumes/512SSD/LocalCode/offline-ai-kit/models/Qwen3-Coder-Next-UD-Q4_K_XL.gguf"
-MOE35 = "/Volumes/512SSD/EGPU_MAC_Nvidia/models/Qwen3.5-35B-A3B-Q4_K_M.gguf"
+# The two models this checks against, found wherever they are rather than where they sit on one Mac: tools/find-model.sh
+# searches $MODELS_DIR, this tree's models/ and the offline-ai-kit's. A file that is nowhere exits 2 below, as before.
+def _model(*names):
+    here = os.path.dirname(os.path.abspath(__file__))
+    return subprocess.run(["sh", os.path.join(here, "find-model.sh"), *names],
+                          capture_output=True, text=True).stdout.strip()
+
+CODER = _model("Qwen3-Coder-Next-UD-Q4_K_XL.gguf")
+MOE35 = _model("Qwen3.5-35B-A3B-Q4_K_M.gguf")
 GIB = float(1 << 30)
 
 

@@ -32,7 +32,7 @@
 # DRY=1 is not supported: the null device cannot exercise the expert-streaming path this depends on.
 set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; cd "$R" || exit 2
-K=/Volumes/512SSD/LocalCode/offline-ai-kit; METAL_BIN=${METAL_BIN:-$K/bin/llama-server}
+METAL_BIN=$(sh "$R/tools/metal-bin.sh")
 CARD_BIN=${BIN:-$R/cuda-shim/build/bin/llama-server-null}
 ST=$R/logs/disagg/batch; mkdir -p "$ST"; PIDF=$ST/pids; META=$ST/meta
 CARD_PORT=${CARD_PORT:-8092}; METAL_PORT=${METAL_PORT:-8091}

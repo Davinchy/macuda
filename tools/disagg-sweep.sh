@@ -44,7 +44,7 @@ if [ "$side" = card ]; then
   "$BIN" -m "$MODEL" -ngl 999 --n-cpu-moe "$NCPUMOE" --no-host --no-repack -c "$CTX" -b "$UB" -ub "$UB" -fa on \
     --parallel 1 --no-warmup --host 127.0.0.1 --port "$PORT" --slot-save-path "$STATE/" ${SERVER_ARGS:-} > "$SLOG" 2>&1 &
 else
-  K=/Volumes/512SSD/LocalCode/offline-ai-kit; BIN=${METAL_BIN:-$K/bin/llama-server}; PORT=${PORT:-8091}
+  BIN=$(sh "$R/tools/metal-bin.sh"); PORT=${PORT:-8091}
   test -x "$BIN" || { echo "no Metal server at $BIN"; exit 2; }
   echo "sweep metal: $(date '+%F %T') $TAG ctx=$CTX; server log $SLOG"
   "$BIN" -m "$MODEL" -ngl 999 -c "$CTX" -b 4096 -ub 512 -fa on --parallel 1 --no-warmup \

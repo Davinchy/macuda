@@ -19,7 +19,7 @@
 # Everything is killed on exit, whatever happens.
 set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; cd "$R" || exit 2
-MODEL=${MODEL:?set MODEL=/path/to/a/small.gguf}; K=/Volumes/512SSD/LocalCode/offline-ai-kit; METAL_BIN=${METAL_BIN:-$K/bin/llama-server}
+MODEL=${MODEL:?set MODEL=/path/to/a/small.gguf}; METAL_BIN=$(sh "$R/tools/metal-bin.sh")
 NULL_BIN=${NULL_BIN:-$R/cuda-shim/build/bin/llama-server-null}
 ST=$R/logs/disagg/rt; mkdir -p "$ST"; ts=$(date +%Y%m%d-%H%M%S); L=$ST/test-$ts
 test -f "$MODEL" || { echo "no model at $MODEL"; exit 2; }

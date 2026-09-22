@@ -26,7 +26,8 @@ cmd=${1:-status}; shift 2>/dev/null || true
 case "$cmd" in
   start)
     M=${1:-$R/models/Qwen3.8-27B-UD-Q4_K_M.gguf}; PORT=${2:-8090}
-    MTP=${MTP-$R/models/mtp-Qwen3.8-27B-Q4_0.gguf}
+    # either place the README's `hf download --local-dir models/` may have put it; MTP= still serves without one
+    MTP=${MTP-$(sh "$R/tools/find-model.sh" mtp-Qwen3.8-27B-Q4_0.gguf MTP/mtp-Qwen3.8-27B-Q4_0.gguf)}
     test -f "$M" || { echo "no model at $M"; exit 2; }; test -x "$BIN" || { echo "no server binary at $BIN"; exit 2; }
     [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null && { echo "already running (pid $(cat "$PIDF")); stop it first"; exit 1; }
     spec=""; if [ -n "$MTP" ]; then test -f "$MTP" || { echo "no MTP head at $MTP (MTP= to serve without one)"; exit 2; }

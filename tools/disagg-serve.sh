@@ -17,7 +17,7 @@
 # and a 24576 ubatch (see tools/disagg-prefill.sh for why each is load-bearing).
 set -u
 R=${EGPU_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}; cd "$R" || exit 2
-K=/Volumes/512SSD/LocalCode/offline-ai-kit; METAL_BIN=${METAL_BIN:-$K/bin/llama-server}; CARD_BIN=${BIN:-$R/cuda-shim/build/bin/llama-server-null}
+METAL_BIN=$(sh "$R/tools/metal-bin.sh"); CARD_BIN=${BIN:-$R/cuda-shim/build/bin/llama-server-null}
 # STATE is where slot state is written and read: the card saves the KV there and Metal restores it. It is NOT a log
 # directory - the save is hundreds of MB per request and its speed is on the critical path of every handoff. Measured
 # 2026-09-20: on the tree's own volume (100% full, 41 MB/s) an 18,914-token save took 13.5 s, MORE than the 8.4 s of
@@ -36,7 +36,7 @@ wait_health() { i=0; until [ "$(curl -s -o /dev/null -w '%{http_code}' "http://1
   kill -0 "$2" 2>/dev/null || { echo "   pid $2 (port $1) died; tail of $3:"; tail -6 "$3" | cut -c1-160; return 1; }; sleep 0.5; done; }
 case "$cmd" in
   start)
-    M=${2:-/Volumes/512SSD/LocalCode/offline-ai-kit/models/Qwen3-Coder-Next-UD-Q4_K_XL.gguf}
+    M=${2:-$(sh "$R/tools/find-model.sh" Qwen3-Coder-Next-UD-Q4_K_XL.gguf)}
     test -f "$M" || { echo "no model at $M"; exit 2; }; test -x "$CARD_BIN" || { echo "no card binary at $CARD_BIN"; exit 2; }; test -x "$METAL_BIN" || { echo "no Metal server at $METAL_BIN"; exit 2; }
     [ -f "$PIDF" ] && { echo "pids file exists ($PIDF): stop first"; exit 1; }
     ts=$(date +%Y%m%d-%H%M%S); CL=$ST/card-$ts.log; ML=$ST/metal-$ts.log; RL=$ST/router-$ts.log
