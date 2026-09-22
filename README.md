@@ -41,10 +41,10 @@ sh install.sh check
 Check mode reports missing prerequisites without installing packages or building the project. Install Homebrew and Xcode Command Line Tools first if requested. The full installer prompts before supported dependency installations and then builds the stack:
 
 ```sh
-DEFS_EXTRA=-DGGML_CUDA_USE_GRAPHS sh install.sh
+sh install.sh
 ```
 
-The explicit graph flag matches the published graph-enabled benchmark configuration. The current build script does not enable `GGML_CUDA_USE_GRAPHS` unless it is supplied through `DEFS_EXTRA`.
+`DEFS_EXTRA` adds to the build's own defines and is not needed for graphs: `build-ggml-cuda.sh` has carried `-DGGML_CUDA_USE_GRAPHS` in its defaults since 19 September, so a plain `sh install.sh` already matches the published graph-enabled configuration.
 
 The installer can install missing CMake and LLVM packages, Docker Desktop and TinyGPU.app. Start Docker Desktop if using the local compiler container. TinyGPU's DriverKit extension still requires user approval through macOS; after the app is installed, run:
 

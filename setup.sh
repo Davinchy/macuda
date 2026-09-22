@@ -63,15 +63,32 @@ sd() {
   echo "stable-diffusion.cpp/build-null built"
 }
 shim() { ( cd cuda-shim && rm -rf build/shim/nv && make -s ) && echo "shim built: libtinynv build id $(strings cuda-shim/build/shim/nv/libtinynv.a | grep -oE '^[0-9a-f]{7}(-dirty)?$|^nogit(-dirty)?$' | head -1)"; }
-cuda() { sh cuda-shim/build/build-ggml-cuda.sh; }
+# The archive AND the registry object that has to be linked beside it. One without the other links nothing, so they
+# are built by one step rather than left to be remembered separately.
+cuda() { sh cuda-shim/build/build-ggml-cuda.sh && sh cuda-shim/build/build-backend-reg.sh; }
+# One link, with its failure kept: the output is filtered for display, but the status decides. $4, when given, is the
+# CMake tree whose link line is replayed (stable-diffusion.cpp's rather than llama.cpp's).
+link_one() {
+  n=$3
+  if out=$(if [ -n "${4:-}" ]; then L=$4 sh build/link-null.sh "$1" "$2" "$3"; else sh build/link-null.sh "$1" "$2" "$3"; fi 2>&1); then
+    printf '%s\n' "$out" | grep -vE 'duplicate|warning' | tail -1
+  else
+    printf '%s\n' "$out" | grep -vE 'duplicate|warning' | tail -5
+    echo "LINKING FAILED for $(basename "$n") - the reason is the last lines above, and nothing below this would have run"
+    exit 1
+  fi
+}
 link() {
   test -f cuda-shim/build/libggml-cuda.a || { echo "no cuda-shim/build/libggml-cuda.a: build it with  sh setup.sh cuda  (nvcc in a container here, or on TINYCC_HOST)"; exit 1; }
+  # Built here too, not only in the cuda step: it is cheap, it is the object every link below needs, and a tree that
+  # has the archive but not this one used to fail seven times over and still report success.
+  test -f cuda-shim/build/ggml-backend-reg.cuda.o || sh cuda-shim/build/build-backend-reg.sh
   cd cuda-shim
   for t in 'tests test-backend-ops' 'examples/simple llama-simple' 'examples/speculative-simple llama-speculative-simple' 'tools/server llama-server' 'tools/mtmd llama-mtmd-cli' 'tools/llama-bench llama-bench'; do
-    d=${t%% *}; n=${t##* }; sh build/link-null.sh "$d" "$n" "$R/cuda-shim/build/bin/$n-null" 2>&1 | grep -vE 'duplicate|warning' | tail -1
+    d=${t%% *}; n=${t##* }; link_one "$d" "$n" "$R/cuda-shim/build/bin/$n-null"
   done
   if [ -f "$R/stable-diffusion.cpp/build-null/examples/cli/CMakeFiles/sd-cli.dir/link.txt" ]; then
-    L=$R/stable-diffusion.cpp/build-null sh build/link-null.sh examples/cli sd-cli "$R/cuda-shim/build/bin/sd-cli-null" 2>&1 | grep -vE 'duplicate|warning' | tail -1
+    link_one examples/cli sd-cli "$R/cuda-shim/build/bin/sd-cli-null" "$R/stable-diffusion.cpp/build-null"
   fi
   ls -1 build/bin
 }
