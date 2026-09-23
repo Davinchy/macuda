@@ -9,6 +9,13 @@
 //   REF       split(S) against a double-precision host reference, max|x-ref|/max|ref| <= 2e-3 (f32 out)
 //   R         (D, 02:2x) plan-free: max|split - fp64| / max|unsplit tc2s over the FULL k - fp64| <= 2, same inputs. EXACT
 //             cuts slices with the kernel's own rule; this row never uses it, so a dropped K remainder fails here.
+//   BURST     (D's F1, 03:30) 8 split-K GEMMs launched back to back on ONE stream with NO sync between them, sharing one
+//             workspace and one counter array, as one cublas handle does; each output then checked with R against its own
+//             fp64 reference (and for non-finite values). This is the row that reads the NORMAL-mode hazard: chained
+//             launches with state carried across calls. Run it with the knobs unset.
+//   argv[2] = "twostreams": ONLY the burst, alternating across TWO streams that share the workspace - the case the design
+//             forbids (ggml keeps one handle per stream). It is the arm that shows BURST can fail; predicted FAIL, unless
+//             this driver serialises streams, which would then be the finding.
 // The last line is "RESULT: PASS ..." or "RESULT: FAIL ..." - the slot driver keys on it, so no other outcome word may
 // appear on it.
 // On the NULL device nothing executes: every row reads memory the kernels never wrote, so a null run is a PLUMBING check
@@ -44,14 +51,56 @@ static size_t blob(tinynv_kernel_t k, unsigned char *out, const void **vals, con
   return len;
 }
 
-static void gemm(tinynv_kernel_t k, int split, uint64_t A, uint64_t B, uint64_t C, int m, int n, int kk, int lda, int ldb, int ldc,
-                 uint64_t ws, uint64_t cnt, int S){
+static void gemm_on(tinynv_stream_t s, int sync, tinynv_kernel_t k, int split, uint64_t A, uint64_t B, uint64_t C, int m, int n, int kk,
+                    int lda, int ldb, int ldc, uint64_t ws, uint64_t cnt, int S){
   int64_t z = 0; float alpha = 1.f, beta = 0.f; int out = 0;
   const void *v[18] = { &A, &B, &C, &z, &z, &z, &m, &n, &kk, &lda, &ldb, &ldc, &alpha, &beta, &out, &ws, &cnt, &S };
   const int sz[18] = { 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 4 };
   unsigned char p[256]; size_t len = blob(k, p, v, sz, split ? 18 : 15, split ? 108 : 84);
-  CK(tinynv_launch(st, k, (m + 63) / 64, (n + 63) / 64, split ? S : 1, 128, 1, 1, 0, p, len));
-  CK(tinynv_stream_sync(st));
+  CK(tinynv_launch(s, k, (m + 63) / 64, (n + 63) / 64, split ? S : 1, 128, 1, 1, 0, p, len));
+  if (sync) CK(tinynv_stream_sync(s));
+}
+static void gemm(tinynv_kernel_t k, int split, uint64_t A, uint64_t B, uint64_t C, int m, int n, int kk, int lda, int ldb, int ldc,
+                 uint64_t ws, uint64_t cnt, int S){ gemm_on(st, 1, k, split, A, B, C, m, n, kk, lda, ldb, ldc, ws, cnt, S); }
+
+// BURST: NB split GEMMs of the q/o shape, each on its own inputs and output, one workspace, no sync until all are issued.
+static int burst(tinynv_device_t d, tinynv_kernel_t ks, tinynv_kernel_t kk, int nstreams){
+  enum { NB = 8 }; const int m = 2048, n = 32, k = 2048, S = 8; const size_t na = (size_t)m * k, nbv = (size_t)n * k, nc = (size_t)m * n, tiles = 32;
+  printf("BURST: entered - %d split GEMMs m=%d n=%d k=%d S=%d, one workspace, %d stream(s), no sync between launches\n", NB, m, n, k, S, nstreams);
+  tinynv_stream_t s2 = st; if (nstreams == 2) CK(tinynv_stream_create(d, &s2));
+  uint16_t *hA = malloc(na * 2 * NB), *hB = malloc(nbv * 2); for (size_t i = 0; i < na * NB; i++) hA[i] = f2bf(frand()); for (size_t i = 0; i < nbv; i++) hB[i] = f2bf(frand());
+  tinynv_devptr_t dA, dB, dC, dP, ws, cnt;
+  CK(tinynv_malloc(d, na * 2 * NB, &dA)); CK(tinynv_malloc(d, nbv * 2, &dB)); CK(tinynv_malloc(d, nc * 4 * NB, &dC)); CK(tinynv_malloc(d, nc * 4, &dP));
+  CK(tinynv_malloc(d, (size_t)S * tiles * 64 * 64 * 4, &ws)); CK(tinynv_malloc(d, tiles * 4, &cnt));
+  CK(tinynv_memcpy_htod(st, dA, hA, na * 2 * NB)); CK(tinynv_memcpy_htod(st, dB, hB, nbv * 2)); CK(tinynv_memset(st, cnt, 0, tiles * 4));
+  CK(tinynv_memset(st, dC, 0xff, nc * 4 * NB)); CK(tinynv_stream_sync(st));
+  for (int i = 0; i < NB; i++)
+    gemm_on((i & 1) ? s2 : st, 0, kk, 1, dA + (uint64_t)i * na * 2, dB, dC + (uint64_t)i * nc * 4, m, n, k, k, k, m, ws, cnt, S);
+  CK(tinynv_stream_sync(st)); if (s2 != st) CK(tinynv_stream_sync(s2));
+  float *got = malloc(nc * 4 * NB), *part = malloc(nc * 4); CK(tinynv_memcpy_dtoh(st, got, dC, nc * 4 * NB)); CK(tinynv_stream_sync(st));
+  unsigned hc[32]; CK(tinynv_memcpy_dtoh(st, hc, cnt, sizeof hc)); CK(tinynv_stream_sync(st));
+  int nz = 0; for (int t = 0; t < 32; t++) nz += hc[t] != 0;
+  int bad = 0; double worst = 0;
+  for (int i = 0; i < NB; i++){
+    CK(tinynv_memset(st, dP, 0xff, nc * 4)); gemm(ks, 0, dA + (uint64_t)i * na * 2, dB, dP, m, n, k, k, k, m, 0, 0, 1);
+    CK(tinynv_memcpy_dtoh(st, part, dP, nc * 4)); CK(tinynv_stream_sync(st));
+    const uint16_t *a = hA + (size_t)i * na; const float *g = got + (size_t)i * nc; double e1 = 0, eon = 0; int nf = 0;
+    for (int j = 0; j < n; j++) for (int r_ = 0; r_ < m; r_++){
+      double r = 0; for (int t = 0; t < k; t++) r += (double)bf2f(a[(size_t)r_ * k + t]) * (double)bf2f(hB[(size_t)j * k + t]);
+      size_t e = r_ + (size_t)j * m; nf += !isfinite(part[e]) || !isfinite(g[e]);
+      e1 = fmax(e1, fabs((double)part[e] - r)); eon = fmax(eon, fabs((double)g[e] - r));
+    }
+    double R = nf ? INFINITY : e1 > 0 ? eon / e1 : (eon > 0 ? INFINITY : 1.0);
+    printf("  burst[%d] on stream %d: R %.3g%s\n", i, (i & 1) && nstreams == 2 ? 2 : 1, R, nf ? " (non-finite)" : "");
+    if (!(R <= 2.0)) bad++; if (R > worst) worst = R;
+  }
+  int f = bad || nz;
+  if (f) printf("  BURST FAIL: %d of %d outputs over R 2 (worst %.3g), %d counter(s) nonzero\n", bad, NB, worst, nz);
+  else printf("  BURST PASS: all %d outputs R <= 2 (worst %.3g), counters all zero\n", NB, worst);
+  tinynv_free(d, dA); tinynv_free(d, dB); tinynv_free(d, dC); tinynv_free(d, dP); tinynv_free(d, ws); tinynv_free(d, cnt);
+  if (s2 != st) tinynv_stream_destroy(s2);
+  free(hA); free(hB); free(got); free(part);
+  return f;
 }
 
 int main(int argc, char **argv){
@@ -67,6 +116,11 @@ int main(int argc, char **argv){
   tinynv_module_t mod; CK(tinynv_module_load(d, cub, cl, &mod));
   tinynv_kernel_t ks, kk; CK(tinynv_get_kernel(mod, "tinyblas_gemm_bf16_tc2s_tn", &ks)); CK(tinynv_get_kernel(mod, "tinyblas_gemm_bf16_tc2k_tn", &kk));
   CK(tinynv_stream_create(d, &st));
+  if (argc > 2 && !strcmp(argv[2], "twostreams")) {   // the arm that must be able to FAIL: two streams, one workspace
+    int f = burst(d, ks, kk, 2);
+    printf("RESULT: %s - twostreams burst%s\n", f ? "FAIL" : "PASS", null_dev ? " (NULL DEVICE: VOID as evidence)" : "");
+    return f;
+  }
   const struct { const char *name; int m, n, k, S; } cs[] = {
     { "k/v (3B decode)", 256, 32, 2048, 16 }, { "q/o (3B decode)", 2048, 32, 2048, 8 }, { "down (3B decode)", 2048, 32, 11008, 8 },
     { "tails (k remainder)", 200, 20, 1000, 5 } };
@@ -129,7 +183,9 @@ int main(int argc, char **argv){
     tinynv_free(d, dA); tinynv_free(d, dB); tinynv_free(d, dC); tinynv_free(d, dP); tinynv_free(d, ws); tinynv_free(d, cnt);
     free(hA); free(hB); free(exp_); free(part); free(got); free(hc);
   }
-  if (fails) printf("RESULT: FAIL - %d row(s) of %d%s\n", fails, ncases * 5, null_dev ? " (NULL DEVICE: VOID as evidence)" : "");
-  else printf("RESULT: PASS - all %d rows%s\n", ncases * 5, null_dev ? " (NULL DEVICE: VOID as evidence)" : "");
+  fails += burst(d, ks, kk, 1);
+  const int rows = ncases * 5 + 1;
+  if (fails) printf("RESULT: FAIL - %d row(s) of %d%s\n", fails, rows, null_dev ? " (NULL DEVICE: VOID as evidence)" : "");
+  else printf("RESULT: PASS - all %d rows%s\n", rows, null_dev ? " (NULL DEVICE: VOID as evidence)" : "");
   return fails;
 }
