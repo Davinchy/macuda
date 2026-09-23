@@ -17,10 +17,11 @@ mut(){ # name, sed expression
   sed "$2" gemm.cu > "m_$1.cu"
   nl=$(diff gemm.cu "m_$1.cu" | grep -c '^>'); echo "=== MUTANT $1: $nl line(s) changed (must be 1)"
   [ "$nl" = 1 ] || { echo "MUTANT $1 VOID: the sed did not change exactly one line"; return; }
-  mk "m_$1.cu" "m_$1.cubin"; ./test_splitk "m_$1.cubin" | grep -E 'FAIL|RESULT|ERROR' | head -8; r=$?
+  mk "m_$1.cu" "m_$1.cubin"; ./test_splitk "m_$1.cubin" | grep -E '^CASE|FAIL|RESULT|ERROR'
   echo "MUTANT $1 exit: see RESULT above (must be >= 1 FAIL)"
 }
 mut drop_slice 's/for (int q = 0; q < S; q++) sum +=/for (int q = 0; q < S - 1; q++) sum +=/'
 mut reverse_order 's/for (int q = 0; q < S; q++) sum += __ldcg(base + (long long)q \*/for (int q = S - 1; q >= 0; q--) sum += __ldcg(base + (long long)q */'
+mut drop_remainder 's/nk_all = (k + BK - 1) \/ BK, per = SPLIT ? (nk_all + S - 1) \/ S : nk_all;/nk_all = (k + BK - 1) \/ BK, per = SPLIT ? nk_all \/ S : nk_all;/'
 mut no_reset 's/    if (tid == 0) cnt\[bz \* tiles + tile\] = 0u;/    ;/'
 echo "=== done $(date)"

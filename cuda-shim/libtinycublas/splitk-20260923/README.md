@@ -21,7 +21,15 @@ as a prereg.
   `4ee3b384…` (`build-gemm-cubin.sh`).
 
 **Evidence, all card-free. The 3090 box's clock is CST = Mac + 1 h.**
-- `run-3090-2.out`: `test_splitk.cu` on the RTX 3090 (sm_86), from the `gemm.cu` that is committed here.
+- **`run-3090-3.out` supersedes `-2`** (same `gemm.cu` bbb21c8d; the test gained D's plan-free **R** row). Reference:
+  **36/36**. R reads 0.08–0.75 on every case, so the split result is CLOSER to fp64 than the unsplit kernel. Four
+  mutants, each one sed line:
+  - drop_slice: 25 FAIL;
+  - reverse_order: 12 FAIL, on EXACT only. That is expected: order changes rounding, not accuracy;
+  - **drop_remainder** (per = nk/S, floor): 10 FAIL, including **R on the two cases with a remainder**. The decode
+    shapes divide evenly, so they cannot show this;
+  - no_reset: 30 FAIL.
+- `run-3090-2.out`: `test_splitk.cu` on the RTX 3090 (sm_86), from the `gemm.cu` that is committed here, before R.
   - **Reference: 30 PASS, 0 FAIL.** Six cases: the 3B decode k/v, q/o and down shapes, tails (m 200, n 20, k 1000),
     an empty last slice, and batch 3. Five rows each:
     - EXACT: `==` against the ordered host sum of tc2s run on each slice;

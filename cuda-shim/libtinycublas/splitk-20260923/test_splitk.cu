@@ -7,6 +7,9 @@
 //           direct store writes the accumulator bits unchanged. The two kernels share one main loop, so the partials
 //           must be identical and the only arithmetic the split adds is that ordered sum.
 //   REF     split(S) against a double-precision host reference, with the contract test's gate (2e-3 f32 out, 1e-2 bf16 out).
+//   R       (D, 02:2x) plan-free: max|split - fp64| over the FULL k, divided by the same for the UNSPLIT tc2s kernel on the
+//           same inputs, must be <= 2. EXACT cuts slices with the kernel's own rule, so a rule that dropped a K remainder
+//           or overlapped slices would pass it; this row never uses the rule.
 //   AGAIN   the same GEMM a second time on the same ws/cnt with C poisoned in between: must be EXACT again (the counters
 //           reset themselves), and every counter must read 0 afterwards.
 // Mutants are separate cubins built from a sed of gemm.cu (run-3090.sh); each must make this test exit nonzero.
@@ -112,6 +115,24 @@ static void run(const Case& c){
     const double rel = maxerr / maxref, tol = out ? 1e-2 : 2e-3;
     if (nonfinite || !(rel <= tol)) { printf("  REF FAIL: rel %.3g (tol %.0e), %d non-finite\n", rel, tol, nonfinite); fails++; }
     else printf("  REF PASS: rel %.3g (tol %.0e)\n", rel, tol);
+    if (out == 0) {   // R: the unsplit kernel over the full k on the same inputs, against the same doubles
+      printf("  R: entered\n");
+      std::vector<float> s1(sC * nb);
+      for (int b = 0; b < nb; b++) {
+        launch("tinyblas_gemm_bf16_tc2s_tn", dA + b * sA * 2, dB + b * sB * 2, dP, 0, 0, 0, m, n, k, k, k, m, 1.f, 0.f, 0, 0, 0, -1, 1);
+        CK(cuMemcpyDtoH(s1.data() + b * sC, dP, sC * 4));
+      }
+      double e1 = 0, eon = 0;
+      for (int b = 0; b < nb; b++) for (int j = 0; j < n; j++) for (int i = 0; i < m; i++){
+        double r = 0;
+        for (int kk = 0; kk < k; kk++) r += (double)__bfloat162float(hA[b * sA + (long long)i * k + kk]) * (double)__bfloat162float(hB[b * sB + (long long)j * k + kk]);
+        const long long e = b * sC + i + (long long)j * m; float g; memcpy(&g, &c1[e * 4], 4);
+        e1 = fmax(e1, fabs((double)s1[e] - r)); eon = fmax(eon, fabs((double)g - r));
+      }
+      const double R = e1 > 0 ? eon / e1 : (eon > 0 ? INFINITY : 1.0);
+      if (!(R <= 2.0)) { printf("  R FAIL: split err %.3g vs unsplit %.3g, R %.3g (> 2)\n", eon, e1, R); fails++; }
+      else printf("  R PASS: split err %.3g vs unsplit %.3g, R %.3g (<= 2)\n", eon, e1, R);
+    }
   }
   cuMemFree(dA); cuMemFree(dB); cuMemFree(dC); cuMemFree(dP); cuMemFree(ws); cuMemFree(cnt);
 }

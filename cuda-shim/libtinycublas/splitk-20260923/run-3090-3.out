@@ -1,0 +1,195 @@
+=== host: pop-os Wed Sep 23 03:24:37 AM CST 2026 up:  03:24:37 up 9 days, 20 min,  4 users,  load average: 0.15, 0.24, 0.33
+NVIDIA GeForce RTX 3090, 580.126.18, 1 MiB, 24576 MiB, 0 %
+toolkit: Build cuda_13.0.r13.0/compiler.36424714_0
+gemm.cu sha256: bbb21c8d5c671761  test sha256: a9c27d313056afbb
+=== REFERENCE ARM
+device: NVIDIA GeForce RTX 3090
+cubin: ref.cubin
+CASE kv (3B decode) m=256 n=32 k=2048 S=16 batch=1
+  EXACT: entered
+  EXACT PASS: 8192 of 8192 equal
+  AGAIN: entered
+  AGAIN PASS: 8192 of 8192 equal
+  COUNTERS PASS: all 4 zero
+  REF out=f32 alpha=1 beta=0: entered
+  REF PASS: rel 2.75e-07 (tol 2e-03)
+  R: entered
+  R PASS: split err 1.64e-05 vs unsplit 0.000176, R 0.0931 (<= 2)
+  REF out=bf16 alpha=0.75 beta=0.5: entered
+  REF PASS: rel 0.00278 (tol 1e-02)
+CASE q/o (3B decode) m=2048 n=32 k=2048 S=8 batch=1
+  EXACT: entered
+  EXACT PASS: 65536 of 65536 equal
+  AGAIN: entered
+  AGAIN PASS: 65536 of 65536 equal
+  COUNTERS PASS: all 32 zero
+  REF out=f32 alpha=1 beta=0: entered
+  REF PASS: rel 2.46e-07 (tol 2e-03)
+  R: entered
+  R PASS: split err 1.58e-05 vs unsplit 0.000199, R 0.0796 (<= 2)
+  REF out=bf16 alpha=0.75 beta=0.5: entered
+  REF PASS: rel 0.00257 (tol 1e-02)
+CASE down (3B decode) m=2048 n=32 k=11008 S=8 batch=1
+  EXACT: entered
+  EXACT PASS: 65536 of 65536 equal
+  AGAIN: entered
+  AGAIN PASS: 65536 of 65536 equal
+  COUNTERS PASS: all 32 zero
+  REF out=f32 alpha=1 beta=0: entered
+  REF PASS: rel 1.28e-06 (tol 2e-03)
+  R: entered
+  R PASS: split err 0.000196 vs unsplit 0.0024, R 0.082 (<= 2)
+  REF out=bf16 alpha=0.75 beta=0.5: entered
+  REF PASS: rel 0.00218 (tol 1e-02)
+CASE tails m=200 n=20 k=1000 S=5 batch=1
+  EXACT: entered
+  EXACT PASS: 4000 of 4000 equal
+  AGAIN: entered
+  AGAIN PASS: 4000 of 4000 equal
+  COUNTERS PASS: all 4 zero
+  REF out=f32 alpha=1 beta=0: entered
+  REF PASS: rel 1.79e-07 (tol 2e-03)
+  R: entered
+  R PASS: split err 8e-06 vs unsplit 4.93e-05, R 0.162 (<= 2)
+  REF out=bf16 alpha=0.75 beta=0.5: entered
+  REF PASS: rel 0.00296 (tol 1e-02)
+CASE empty last slice m=128 n=64 k=96 S=4 batch=1
+  EXACT: entered
+  EXACT PASS: 8192 of 8192 equal
+  AGAIN: entered
+  AGAIN PASS: 8192 of 8192 equal
+  COUNTERS PASS: all 2 zero
+  REF out=f32 alpha=1 beta=0: entered
+  REF PASS: rel 1.16e-07 (tol 2e-03)
+  R: entered
+  R PASS: split err 1.49e-06 vs unsplit 1.99e-06, R 0.749 (<= 2)
+  REF out=bf16 alpha=0.75 beta=0.5: entered
+  REF PASS: rel 0.00228 (tol 1e-02)
+CASE batch 3 m=256 n=48 k=512 S=4 batch=3
+  EXACT: entered
+  EXACT PASS: 36864 of 36864 equal
+  AGAIN: entered
+  AGAIN PASS: 36864 of 36864 equal
+  COUNTERS PASS: all 12 zero
+  REF out=f32 alpha=1 beta=0: entered
+  REF PASS: rel 1.76e-07 (tol 2e-03)
+  R: entered
+  R PASS: split err 5.53e-06 vs unsplit 2.07e-05, R 0.267 (<= 2)
+  REF out=bf16 alpha=0.75 beta=0.5: entered
+  REF PASS: rel 0.00261 (tol 1e-02)
+RESULT: 0 FAIL(s)
+REFERENCE rc=0 (must be 0)
+=== MUTANT drop_slice: 1 line(s) changed (must be 1)
+CASE kv (3B decode) m=256 n=32 k=2048 S=16 batch=1
+  EXACT FAIL: 8192 of 8192 differ; first at 0: got -8.36166859 want -7.91736603
+  AGAIN FAIL: 8192 of 8192 differ; first at 0: got -8.36166859 want -7.91736603
+  REF FAIL: rel 0.245 (tol 2e-03), 0 non-finite
+  R FAIL: split err 14.6 vs unsplit 0.000176, R 8.3e+04 (> 2)
+  REF FAIL: rel 0.247 (tol 1e-02), 0 non-finite
+CASE q/o (3B decode) m=2048 n=32 k=2048 S=8 batch=1
+  EXACT FAIL: 65536 of 65536 differ; first at 0: got 12.8752537 want 7.44484138
+  AGAIN FAIL: 65536 of 65536 differ; first at 0: got 12.8752537 want 7.44484138
+  REF FAIL: rel 0.352 (tol 2e-03), 0 non-finite
+  R FAIL: split err 22.7 vs unsplit 0.000199, R 1.14e+05 (> 2)
+  REF FAIL: rel 0.35 (tol 1e-02), 0 non-finite
+CASE down (3B decode) m=2048 n=32 k=11008 S=8 batch=1
+  EXACT FAIL: 65536 of 65536 differ; first at 0: got 29.2015705 want 22.0871201
+  AGAIN FAIL: 65536 of 65536 differ; first at 0: got 29.2015705 want 22.0871201
+  REF FAIL: rel 0.369 (tol 2e-03), 0 non-finite
+  R FAIL: split err 56.4 vs unsplit 0.0024, R 2.35e+04 (> 2)
+  REF FAIL: rel 0.369 (tol 1e-02), 0 non-finite
+CASE tails m=200 n=20 k=1000 S=5 batch=1
+  EXACT FAIL: 4000 of 4000 differ; first at 0: got 4.42995834 want 1.62087512
+  AGAIN FAIL: 4000 of 4000 differ; first at 0: got 4.42995834 want 1.62087512
+  REF FAIL: rel 0.299 (tol 2e-03), 0 non-finite
+  R FAIL: split err 13.3 vs unsplit 4.93e-05, R 2.71e+05 (> 2)
+  REF FAIL: rel 0.302 (tol 1e-02), 0 non-finite
+CASE empty last slice m=128 n=64 k=96 S=4 batch=1
+CASE batch 3 m=256 n=48 k=512 S=4 batch=3
+  EXACT FAIL: 36864 of 36864 differ; first at 0: got -7.83775234 want -6.23579216
+  AGAIN FAIL: 36864 of 36864 differ; first at 0: got -7.83775234 want -6.23579216
+  REF FAIL: rel 0.498 (tol 2e-03), 0 non-finite
+  R FAIL: split err 15.6 vs unsplit 2.07e-05, R 7.53e+05 (> 2)
+  REF FAIL: rel 0.49 (tol 1e-02), 0 non-finite
+RESULT: 25 FAIL(s)
+MUTANT drop_slice exit: see RESULT above (must be >= 1 FAIL)
+=== MUTANT reverse_order: 1 line(s) changed (must be 1)
+CASE kv (3B decode) m=256 n=32 k=2048 S=16 batch=1
+  EXACT FAIL: 5941 of 8192 differ; first at 0: got -7.9173665 want -7.91736603
+  AGAIN FAIL: 5941 of 8192 differ; first at 0: got -7.9173665 want -7.91736603
+CASE q/o (3B decode) m=2048 n=32 k=2048 S=8 batch=1
+  EXACT FAIL: 40149 of 65536 differ; first at 0: got 7.44484043 want 7.44484138
+  AGAIN FAIL: 40149 of 65536 differ; first at 0: got 7.44484043 want 7.44484138
+CASE down (3B decode) m=2048 n=32 k=11008 S=8 batch=1
+  EXACT FAIL: 40091 of 65536 differ; first at 0: got 22.0871162 want 22.0871201
+  AGAIN FAIL: 40091 of 65536 differ; first at 0: got 22.0871162 want 22.0871201
+CASE tails m=200 n=20 k=1000 S=5 batch=1
+  EXACT FAIL: 2014 of 4000 differ; first at 1: got 0.926464081 want 0.926464319
+  AGAIN FAIL: 2014 of 4000 differ; first at 1: got 0.926464081 want 0.926464319
+CASE empty last slice m=128 n=64 k=96 S=4 batch=1
+  EXACT FAIL: 1264 of 8192 differ; first at 0: got -3.72340655 want -3.72340679
+  AGAIN FAIL: 1264 of 8192 differ; first at 0: got -3.72340655 want -3.72340679
+CASE batch 3 m=256 n=48 k=512 S=4 batch=3
+  EXACT FAIL: 14987 of 36864 differ; first at 3: got -4.41397905 want -4.41397858
+  AGAIN FAIL: 14987 of 36864 differ; first at 3: got -4.41397905 want -4.41397858
+RESULT: 12 FAIL(s)
+MUTANT reverse_order exit: see RESULT above (must be >= 1 FAIL)
+=== MUTANT drop_remainder: 1 line(s) changed (must be 1)
+CASE kv (3B decode) m=256 n=32 k=2048 S=16 batch=1
+CASE q/o (3B decode) m=2048 n=32 k=2048 S=8 batch=1
+CASE down (3B decode) m=2048 n=32 k=11008 S=8 batch=1
+CASE tails m=200 n=20 k=1000 S=5 batch=1
+  EXACT FAIL: 4000 of 4000 differ; first at 0: got 4.56082058 want 1.62087512
+  AGAIN FAIL: 4000 of 4000 differ; first at 0: got 4.56082058 want 1.62087512
+  REF FAIL: rel 0.17 (tol 2e-03), 0 non-finite
+  R FAIL: split err 7.58 vs unsplit 4.93e-05, R 1.54e+05 (> 2)
+  REF FAIL: rel 0.171 (tol 1e-02), 0 non-finite
+CASE empty last slice m=128 n=64 k=96 S=4 batch=1
+  EXACT FAIL: 8192 of 8192 differ; first at 0: got 0 want -3.72340679
+  AGAIN FAIL: 8192 of 8192 differ; first at 0: got 0 want -3.72340679
+  REF FAIL: rel 1 (tol 2e-03), 0 non-finite
+  R FAIL: split err 12.9 vs unsplit 1.99e-06, R 6.46e+06 (> 2)
+  REF FAIL: rel 0.972 (tol 1e-02), 0 non-finite
+CASE batch 3 m=256 n=48 k=512 S=4 batch=3
+RESULT: 10 FAIL(s)
+MUTANT drop_remainder exit: see RESULT above (must be >= 1 FAIL)
+=== MUTANT no_reset: 1 line(s) changed (must be 1)
+CASE kv (3B decode) m=256 n=32 k=2048 S=16 batch=1
+  AGAIN FAIL: 8192 of 8192 differ; first at 0: got nan want -7.91736603
+  COUNTERS FAIL: 4 of 4 nonzero after the GEMM
+  REF FAIL: rel 1.01 (tol 2e-03), 0 non-finite
+  R FAIL: split err 60.2 vs unsplit 0.000176, R 3.43e+05 (> 2)
+  REF FAIL: rel 1.01 (tol 1e-02), 0 non-finite
+CASE q/o (3B decode) m=2048 n=32 k=2048 S=8 batch=1
+  AGAIN FAIL: 65536 of 65536 differ; first at 0: got nan want 7.44484138
+  COUNTERS FAIL: 32 of 32 nonzero after the GEMM
+  REF FAIL: rel 0.998 (tol 2e-03), 0 non-finite
+  R FAIL: split err 64.2 vs unsplit 0.000199, R 3.23e+05 (> 2)
+  REF FAIL: rel 0.995 (tol 1e-02), 0 non-finite
+CASE down (3B decode) m=2048 n=32 k=11008 S=8 batch=1
+  AGAIN FAIL: 65536 of 65536 differ; first at 0: got nan want 22.0871201
+  COUNTERS FAIL: 32 of 32 nonzero after the GEMM
+  REF FAIL: rel 1 (tol 2e-03), 0 non-finite
+  R FAIL: split err 154 vs unsplit 0.0024, R 6.41e+04 (> 2)
+  REF FAIL: rel 0.999 (tol 1e-02), 0 non-finite
+CASE tails m=200 n=20 k=1000 S=5 batch=1
+  AGAIN FAIL: 4000 of 4000 differ; first at 0: got nan want 1.62087512
+  COUNTERS FAIL: 4 of 4 nonzero after the GEMM
+  REF FAIL: rel 0.978 (tol 2e-03), 0 non-finite
+  R FAIL: split err 43.6 vs unsplit 4.93e-05, R 8.85e+05 (> 2)
+  REF FAIL: rel 1.02 (tol 1e-02), 0 non-finite
+CASE empty last slice m=128 n=64 k=96 S=4 batch=1
+  AGAIN FAIL: 8192 of 8192 differ; first at 0: got nan want -3.72340679
+  COUNTERS FAIL: 2 of 2 nonzero after the GEMM
+  REF FAIL: rel 1.07 (tol 2e-03), 0 non-finite
+  R FAIL: split err 13.8 vs unsplit 1.99e-06, R 6.93e+06 (> 2)
+  REF FAIL: rel 0.976 (tol 1e-02), 0 non-finite
+CASE batch 3 m=256 n=48 k=512 S=4 batch=3
+  AGAIN FAIL: 36864 of 36864 differ; first at 0: got nan want -6.23579216
+  COUNTERS FAIL: 12 of 12 nonzero after the GEMM
+  REF FAIL: rel 0.979 (tol 2e-03), 0 non-finite
+  R FAIL: split err 30.7 vs unsplit 2.07e-05, R 1.48e+06 (> 2)
+  REF FAIL: rel 0.97 (tol 1e-02), 0 non-finite
+RESULT: 30 FAIL(s)
+MUTANT no_reset exit: see RESULT above (must be >= 1 FAIL)
+=== done Wed Sep 23 03:26:32 AM CST 2026

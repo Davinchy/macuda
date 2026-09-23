@@ -7,6 +7,10 @@
 //   AGAIN     the same split GEMM again on the same ws/cnt, C poisoned with NaN in between: EXACT again
 //   COUNTERS  every counter reads 0 afterwards
 //   REF       split(S) against a double-precision host reference, max|x-ref|/max|ref| <= 2e-3 (f32 out)
+//   R         (D, 02:2x) plan-free: max|split - fp64| / max|unsplit tc2s over the FULL k - fp64| <= 2, same inputs. EXACT
+//             cuts slices with the kernel's own rule; this row never uses it, so a dropped K remainder fails here.
+// The last line is "RESULT: PASS ..." or "RESULT: FAIL ..." - the slot driver keys on it, so no other outcome word may
+// appear on it.
 // On the NULL device nothing executes: every row reads memory the kernels never wrote, so a null run is a PLUMBING check
 // only and prints that it is VOID as evidence. Only a run whose first line names a real card counts.
 // The parameter blobs are built from tinynv_kernel_info's offsets, not from a struct, and checked against the layout
@@ -64,8 +68,10 @@ int main(int argc, char **argv){
   tinynv_kernel_t ks, kk; CK(tinynv_get_kernel(mod, "tinyblas_gemm_bf16_tc2s_tn", &ks)); CK(tinynv_get_kernel(mod, "tinyblas_gemm_bf16_tc2k_tn", &kk));
   CK(tinynv_stream_create(d, &st));
   const struct { const char *name; int m, n, k, S; } cs[] = {
-    { "k/v (3B decode)", 256, 32, 2048, 16 }, { "q/o (3B decode)", 2048, 32, 2048, 8 }, { "down (3B decode)", 2048, 32, 11008, 8 } };
-  for (int c = 0; c < 3; c++){
+    { "k/v (3B decode)", 256, 32, 2048, 16 }, { "q/o (3B decode)", 2048, 32, 2048, 8 }, { "down (3B decode)", 2048, 32, 11008, 8 },
+    { "tails (k remainder)", 200, 20, 1000, 5 } };
+  const int ncases = sizeof cs / sizeof cs[0];
+  for (int c = 0; c < ncases; c++){
     const int m = cs[c].m, n = cs[c].n, k = cs[c].k, S = cs[c].S;
     printf("CASE %s m=%d n=%d k=%d S=%d\n", cs[c].name, m, n, k, S);
     const size_t na = (size_t)m * k, nbv = (size_t)n * k, nc = (size_t)m * n, tiles = (size_t)((m + 63) / 64) * ((n + 63) / 64);
@@ -106,9 +112,22 @@ int main(int argc, char **argv){
     }
     double rel = maxerr / maxref;
     if (nonfinite || !(rel <= 2e-3)) { printf("  REF FAIL: rel %.3g, %d non-finite\n", rel, nonfinite); fails++; } else printf("  REF PASS: rel %.3g (tol 2e-3)\n", rel);
+    printf("  R: entered\n");
+    CK(tinynv_memset(st, dP, 0xff, nc * 4));
+    gemm(ks, 0, dA, dB, dP, m, n, k, k, k, m, 0, 0, 1);                     // the unsplit kernel over the full k: no plan
+    CK(tinynv_memcpy_dtoh(st, part, dP, nc * 4)); CK(tinynv_stream_sync(st));
+    double e1 = 0, eon = 0;
+    for (int j = 0; j < n; j++) for (int i = 0; i < m; i++){
+      double r = 0; for (int t = 0; t < k; t++) r += (double)bf2f(hA[(size_t)i * k + t]) * (double)bf2f(hB[(size_t)j * k + t]);
+      size_t e = i + (size_t)j * m; e1 = fmax(e1, fabs((double)part[e] - r)); eon = fmax(eon, fabs((double)got[e] - r));
+    }
+    double R = e1 > 0 ? eon / e1 : (eon > 0 ? INFINITY : 1.0);
+    if (!(R <= 2.0)) { printf("  R FAIL: split err %.3g vs unsplit %.3g, R %.3g (> 2)\n", eon, e1, R); fails++; }
+    else printf("  R PASS: split err %.3g vs unsplit %.3g, R %.3g (<= 2)\n", eon, e1, R);
     tinynv_free(d, dA); tinynv_free(d, dB); tinynv_free(d, dC); tinynv_free(d, dP); tinynv_free(d, ws); tinynv_free(d, cnt);
     free(hA); free(hB); free(exp_); free(part); free(got); free(hc);
   }
-  printf("RESULT: %d FAIL(s)%s\n", fails, null_dev ? "  (NULL DEVICE: VOID as evidence)" : "");
+  if (fails) printf("RESULT: FAIL - %d row(s) of %d%s\n", fails, ncases * 5, null_dev ? " (NULL DEVICE: VOID as evidence)" : "");
+  else printf("RESULT: PASS - all %d rows%s\n", ncases * 5, null_dev ? " (NULL DEVICE: VOID as evidence)" : "");
   return fails;
 }
