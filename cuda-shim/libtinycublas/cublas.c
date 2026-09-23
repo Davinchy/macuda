@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "tinynv.h"
 #include <cublas_v2.h>   // cuBLAS types (handle/status/operation/computeType) from the CUDA-13 tree; C-compatible
 
@@ -26,10 +27,10 @@ extern int tinycudart_trace(void); extern void tinycudart_count_launch(const cha
 extern unsigned char gemm_cubin[]; extern unsigned int gemm_cubin_len;   // gemm.cubin embedded by the Makefile (xxd -i)
 static tinynv_module_t g_mod; static int g_mod_tried;
 static tinynv_kernel_t tinycublas_kernel(const char* name){   // any kernel in the embedded cubin, resolved once
-  static struct { const char* name; tinynv_kernel_t k; int tried; } cache[24]; 
+  static struct { const char* name; tinynv_kernel_t k; int tried; } cache[32];   /* 27 names since split-K; a full cache returns NULL */
   if (!g_mod && !g_mod_tried){ g_mod_tried=1; if (tinynv_module_load(tinycudart_device(), gemm_cubin, gemm_cubin_len, &g_mod)!=TINYNV_OK){ fprintf(stderr,"[tinycublas] cubin failed to load\n"); g_mod=NULL; } }
   if (!g_mod) return NULL;
-  for (int i=0;i<24;i++){
+  for (int i=0;i<32;i++){
     if (cache[i].name && !strcmp(cache[i].name,name)) return cache[i].k;
     if (!cache[i].name){ cache[i].name=name; if (tinynv_get_kernel(g_mod,name,&cache[i].k)!=TINYNV_OK){ fprintf(stderr,"[tinycublas] %s not in the cubin\n",name); cache[i].k=NULL; } return cache[i].k; }
   }
@@ -46,11 +47,33 @@ static const char* const tc2_names[2][8]={
    "tinyblas_gemm_bf16_tc2s_nn","tinyblas_gemm_bf16_tc2s_nt","tinyblas_gemm_bf16_tc2s_tn","tinyblas_gemm_bf16_tc2s_tt"}};
 static tinynv_kernel_t tinycublas_gemm_tc2_kernel(int bf16, int opA, int opB, int small){
   return tinycublas_kernel(tc2_names[bf16?1:0][(small?4:0)+(opA?2:0)+(opB?1:0)]); }
+// SPLIT-K (B, 2026-09-23; root docs/review/20260923-smalln-design-B.md). A decode GEMM with n <= 64 has ONE block row, and
+// with m = 256 or 2048 that is 4 or 32 blocks on 170 SMs: below one block per SM, bandwidth tracked block count almost
+// exactly (smalln-fix-prereg §8.1). tc2k is tc2s with the k-loop cut into S slices; the last block of each tile sums the
+// slices in order. OFF unless TINYCUBLAS_SPLITK=1 until a card timing says it pays (the design's bands); with it unset
+// every GEMM takes exactly the kernel it took before, so the unset run is the reference arm.
+static const char* const tc2k_names[2][4]={
+  {"tinyblas_gemm_f16_tc2k_nn","tinyblas_gemm_f16_tc2k_nt","tinyblas_gemm_f16_tc2k_tn","tinyblas_gemm_f16_tc2k_tt"},
+  {"tinyblas_gemm_bf16_tc2k_nn","tinyblas_gemm_bf16_tc2k_nt","tinyblas_gemm_bf16_tc2k_tn","tinyblas_gemm_bf16_tc2k_tt"}};
+static int splitk_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TINYCUBLAS_SPLITK"); v=(e&&*e=='1')?1:0; } return v; }
+#define SPLITK_WS_BYTES (8u<<20)   /* S x tiles x 64x64 f32: q/o at n<=64, S 8, 32 tiles = 4 MiB */
+#define SPLITK_CNT_N    16384u     /* one counter per output tile per batch element */
+// The plan is a pure function of the shape (the design's row 1): the number of k-slices, 1 = do not split.
+int tinycublas_splitk_plan(int m, int n, int k, int batch){
+  if (m <= 0 || n <= 0 || k <= 0 || batch <= 0) return 1;
+  long long gx=(m+63)/64, gy=(n+63)/64;
+  if (gy != 1) return 1;                                       // n > 64: never split (gx >= 170 leaves S at 1 below)
+  int S=1; while (gx*S < 170 && S < 16) S*=2;                  // smallest power of two reaching 170 blocks, at most 16
+  while (S > 1 && k < 128*S) S/=2;                             // every slice keeps at least 4 k-tiles of 32
+  if (S == 1) return 1;
+  if ((long long)batch*S*gx*gy*64*64*4 > SPLITK_WS_BYTES || batch*gx*gy > SPLITK_CNT_N || (long long)batch*S > 65535) return 1;
+  return S;
+}
 static int tc2_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TINYCUBLAS_GEMM"); v=!(e&&strcmp(e,"v1")==0); } return v; }
 // The tensor-core path takes every f16-input GEMM unless TINYCUBLAS_TC=0 asks for the scalar kernel (a bisect knob).
 static int tc_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TINYCUBLAS_TC"); v=(e&&*e=='0')?0:1; } return v; }
 
-struct tinyblas_handle { tinynv_stream_t stream; int math_mode; };
+struct tinyblas_handle { tinynv_stream_t stream; int math_mode; tinynv_devptr_t ws, cnt; };   // ws/cnt: split-K, 0 unless the knob is on
 
 static int dtype_code(cudaDataType t){ return t==CUDA_R_32F?0 : t==CUDA_R_16F?1 : t==CUDA_R_16BF?2 : -1; }
 // cublas alpha/beta are in the COMPUTE type: CUBLAS_COMPUTE_16F means they are __half, not float. ggml's f16 matmul uses
@@ -97,6 +120,27 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
     // which would put 20 blocks on 170 SMs, so those take 64x64 tiles (four times the blocks, half the threads each)
     long long blocks128 = (long long)((m+127)/128) * ((n+127)/128) * batch;
     int small = blocks128 < 2LL * 170;
+    int S = (small && h && h->ws) ? tinycublas_splitk_plan(m, n, k, batch) : 1;
+    if (S > 1) {
+      tinynv_kernel_t kk = tinycublas_kernel(tc2k_names[in_dtype==2?1:0][oa*2+ob]);
+      if (!kk) return CUBLAS_STATUS_NOT_INITIALIZED;
+      struct __attribute__((packed)) { uint64_t A,B,C; int64_t sA,sB,sC; int32_t m,n,k,lda,ldb,ldc; float alpha,beta; int32_t out, pad; uint64_t ws,cnt; int32_t S; } q2;
+      memset(&q2, 0, sizeof q2);
+      q2.A=(uint64_t)A; q2.B=(uint64_t)B; q2.C=(uint64_t)C; q2.sA=sA; q2.sB=sB; q2.sC=sC; q2.m=m; q2.n=n; q2.k=k; q2.lda=lda; q2.ldb=ldb; q2.ldc=ldc;
+      q2.alpha=alpha; q2.beta=beta; q2.out=out_dtype; q2.ws=h->ws; q2.cnt=h->cnt; q2.S=S;
+      // Offsets read from the sm_120 cubin's EIATTR_KPARAM_INFO for tinyblas_gemm_bf16_tc2k_tn (ordinals 14..17 at 0x50,
+      // 0x58, 0x60, 0x68), not derived by hand: the pointer after out_dtype is 8-aligned, so four bytes of padding sit at 84.
+      _Static_assert(offsetof(__typeof__(q2), out) == 0x50 && offsetof(__typeof__(q2), ws) == 0x58 && offsetof(__typeof__(q2), cnt) == 0x60
+                     && offsetof(__typeof__(q2), S) == 0x68 && sizeof(q2) == 0x6c, "tc2k param blob must match the cubin's KPARAM_INFO");
+      unsigned gx=(unsigned)((m+63)/64), gy=(unsigned)((n+63)/64), gz=(unsigned)(batch*S);
+      const char* kname=tc2k_names[in_dtype==2?1:0][oa*2+ob];
+      static int said; if (!said++) fprintf(stderr,"[tinycublas] split-K ON (TINYCUBLAS_SPLITK=1): first %s m=%d n=%d k=%d batch=%d S=%d grid=(%u,%u,%u)\n",kname,m,n,k,batch,S,gx,gy,gz);
+      if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%u) block=(128,1,1) m=%d n=%d k=%d out=%d S=%d\n",kname,gx,gy,gz,m,n,k,out_dtype,S);
+      tinycudart_count_launch(kname, gx,gy,gz); double t0=tinycudart_now_ns();
+      tinynv_status_t st = tinynv_launch(h->stream, kk, gx,gy,gz, 128,1,1, 0, &q2, sizeof(q2));
+      tinycudart_time_launch(kname, gx,gy,gz, tinycudart_now_ns()-t0);
+      return st==TINYNV_OK ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_EXECUTION_FAILED;
+    }
     tinynv_kernel_t kern = tinycublas_gemm_tc2_kernel(in_dtype==2, oa, ob, small);
     if (!kern) return CUBLAS_STATUS_NOT_INITIALIZED;
     const int tile = small ? 64 : 128, nthreads = small ? 128 : 256;
@@ -166,8 +210,21 @@ static cublasStatus_t launch_gemm(struct tinyblas_handle* h, cublasOperation_t o
 }
 
 cublasStatus_t cublasCreate_v2(cublasHandle_t* h){ struct tinyblas_handle* t=calloc(1,sizeof(*t)); t->stream=tinycudart_default_stream(); *h=(cublasHandle_t)t;
-  return tinycublas_gemm_kernel() ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_NOT_INITIALIZED; }
-cublasStatus_t cublasDestroy_v2(cublasHandle_t h){ free(h); return CUBLAS_STATUS_SUCCESS; }
+  if (!tinycublas_gemm_kernel()) return CUBLAS_STATUS_NOT_INITIALIZED;
+  // Split-K's workspace and counters are made HERE, not at the first GEMM, so nothing is allocated or memset inside a graph
+  // capture. The counters start at zero and every split GEMM leaves them at zero. A refusal leaves the handle unsplit.
+  if (splitk_enabled()){
+    tinynv_device_t d=tinycudart_device(); tinynv_stream_t s=tinycudart_default_stream();
+    if (tinynv_malloc(d, SPLITK_WS_BYTES, &t->ws)!=TINYNV_OK || tinynv_malloc(d, SPLITK_CNT_N*4, &t->cnt)!=TINYNV_OK
+        || tinynv_memset(s, t->cnt, 0, SPLITK_CNT_N*4)!=TINYNV_OK || tinynv_stream_sync(s)!=TINYNV_OK){
+      fprintf(stderr,"[tinycublas] split-K workspace REFUSED; this handle does not split\n");
+      if (t->ws) tinynv_free(d, t->ws); if (t->cnt) tinynv_free(d, t->cnt); t->ws=t->cnt=0;
+    }
+  }
+  return CUBLAS_STATUS_SUCCESS; }
+cublasStatus_t cublasDestroy_v2(cublasHandle_t h){ struct tinyblas_handle* t=(struct tinyblas_handle*)h;
+  if (t && t->ws) tinynv_free(tinycudart_device(), t->ws); if (t && t->cnt) tinynv_free(tinycudart_device(), t->cnt);
+  free(h); return CUBLAS_STATUS_SUCCESS; }
 cublasStatus_t cublasSetStream_v2(cublasHandle_t h, cudaStream_t s){ ((struct tinyblas_handle*)h)->stream=(tinynv_stream_t)s; return CUBLAS_STATUS_SUCCESS; }
 cublasStatus_t cublasSetMathMode(cublasHandle_t h, cublasMath_t m){ ((struct tinyblas_handle*)h)->math_mode=(int)m; return CUBLAS_STATUS_SUCCESS; }
 cublasStatus_t cublasSgemm_v2(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m,int n,int k,

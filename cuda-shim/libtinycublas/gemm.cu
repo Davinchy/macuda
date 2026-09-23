@@ -233,12 +233,18 @@ extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f32_tc(
 // T is the input element: __half for the f16 kernels, __nv_bfloat16 for the bf16 ones (2026-09-21: bf16 GEMMs used to take
 // the scalar tinyblas_gemm_f32, which held a bf16 Qwen2.5-3B prompt to 307 tok/s on the 5090). wmma's m16n16k16 takes
 // either with f32 accumulation (sm_80 and later), and cp.async and the zero fill copy bytes, so nothing else changes.
-template <typename T, int OPA, int OPB, int BM, int BN, int WN_FRAGS>
+// SPLIT (B, 2026-09-23, docs/review/20260923-smalln-design-B.md): gridDim.z = batch * S, and block z works k-tiles
+// [slice*per, slice*per + per) of batch element z / S. Each block stores its f32 tile to ws; the block that brings
+// cnt[tile] to S-1 sums the S partials IN SLICE ORDER (never arrival order, so the result is deterministic), applies
+// alpha/beta once, stores C, and puts cnt[tile] back to 0 for the next GEMM. No second launch and no memset. With SPLIT
+// false every added line is compiled out and the kernel is the one it was.
+template <typename T, int OPA, int OPB, int BM, int BN, int WN_FRAGS, bool SPLIT = false>
 __device__ __forceinline__ void tinyblas_gemm_tc2(
     const T* A, const T* B, void* C,
     long long sA, long long sB, long long sC,
     int m, int n, int k, int lda, int ldb, int ldc,
-    float alpha, float beta, int out_dtype) {
+    float alpha, float beta, int out_dtype,
+    float* ws = nullptr, unsigned* cnt = nullptr, int S = 1) {
   enum { BK = 32, PAD = 8, NBUF = 2, NWARPS = (BM / 32) * (BN / (16 * WN_FRAGS)), NT = NWARPS * 32, WCOLS = BN / (16 * WN_FRAGS) };
   // A tile: OPA==0 -> As[k][m] (m contiguous, col_major fragment, ldm = BM+PAD); OPA==1 -> As[m][k] (row_major, ldm = BK+PAD)
   // B tile: OPB==0 -> Bs[n][k] (k contiguous, col_major fragment, ldm = BK+PAD); OPB==1 -> Bs[k][n] (row_major, ldm = BN+PAD)
@@ -247,9 +253,10 @@ __device__ __forceinline__ void tinyblas_gemm_tc2(
   __shared__ __align__(128) T As[NBUF][A_ROWS * A_LD];
   __shared__ __align__(128) T Bs[NBUF][B_ROWS * B_LD];
   __shared__ __align__(128) float  stage[NWARPS][16 * 16];   // one 16x16 f32 fragment per warp for the general epilogue
-  A += (long long)blockIdx.z * sA;
-  B += (long long)blockIdx.z * sB;
-  char* Cb = (char*)C + (long long)blockIdx.z * sC * (out_dtype == 0 ? 4 : 2);
+  const unsigned bz = SPLIT ? blockIdx.z / (unsigned)S : blockIdx.z, slice = SPLIT ? blockIdx.z % (unsigned)S : 0u;   // unsigned, as blockIdx.z was
+  A += (long long)bz * sA;
+  B += (long long)bz * sB;
+  char* Cb = (char*)C + (long long)bz * sC * (out_dtype == 0 ? 4 : 2);
   const int tid = threadIdx.x, warp = tid >> 5, wm = warp / WCOLS, wn = warp % WCOLS;   // each warp: 32 rows x (16*WN_FRAGS) cols
   const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][WN_FRAGS];
@@ -279,10 +286,11 @@ __device__ __forceinline__ void tinyblas_gemm_tc2(
     }
     __pipeline_commit();
   };
-  const int nk = (k + BK - 1) / BK;
-  load_tiles(0, 0);
-  for (int t = 0; t < nk; t++) {
-    const int buf = t & 1;
+  const int nk_all = (k + BK - 1) / BK, per = SPLIT ? (nk_all + S - 1) / S : nk_all;
+  const int t0 = SPLIT ? min(nk_all, (int)slice * per) : 0, nk = SPLIT ? min(nk_all, t0 + per) : nk_all;
+  if (!SPLIT || t0 < nk) load_tiles(0, t0 * BK);   // an empty slice (t0 == nk) still stores its zero tile and counts itself
+  for (int t = t0; t < nk; t++) {
+    const int buf = (t - t0) & 1;
     if (t + 1 < nk) load_tiles(buf ^ 1, (t + 1) * BK);
     if (t + 1 < nk) __pipeline_wait_prior(1); else __pipeline_wait_prior(0);
     __syncthreads();
@@ -305,6 +313,38 @@ __device__ __forceinline__ void tinyblas_gemm_tc2(
       }
     }
     __syncthreads();
+  }
+  if (SPLIT) {
+    const int tiles = gridDim.x * gridDim.y, tile = blockIdx.x + blockIdx.y * gridDim.x;
+    float* mine = ws + ((long long)(bz * S + slice) * tiles + tile) * (BM * BN);   // column-major BM x BN, ld = BM
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+      #pragma unroll
+      for (int j = 0; j < WN_FRAGS; j++)
+        wmma::store_matrix_sync(mine + (wm * 32 + i * 16) + (long long)(wn * (16 * WN_FRAGS) + j * 16) * BM, acc[i][j], BM, wmma::mem_col_major);
+    __threadfence();
+    __syncthreads();
+    __shared__ int is_last;
+    if (tid == 0) is_last = atomicAdd(&cnt[bz * tiles + tile], 1u) == (unsigned)(S - 1);
+    __syncthreads();
+    if (!is_last) return;
+    __threadfence();
+    const float* base = ws + ((long long)bz * S * tiles + tile) * (BM * BN);
+    for (int e = tid; e < BM * BN; e += NT) {
+      const int gm = m0 + e % BM, gn = n0 + e / BM;
+      if (gm >= m || gn >= n) continue;
+      float sum = 0.f;
+      for (int q = 0; q < S; q++) sum += __ldcg(base + (long long)q * tiles * (BM * BN) + e);   // slice order; from L2, not a stale L1
+      const long long ci = gm + (long long)gn * ldc;
+      float v = alpha * sum;
+      if (beta != 0.f) {
+        float prev = out_dtype == 0 ? ((const float*)Cb)[ci] : out_dtype == 1 ? __half2float(((const __half*)Cb)[ci]) : __bfloat162float(((const __nv_bfloat16*)Cb)[ci]);
+        v += beta * prev;
+      }
+      if (out_dtype == 0) ((float*)Cb)[ci] = v; else if (out_dtype == 1) ((__half*)Cb)[ci] = __float2half(v); else ((__nv_bfloat16*)Cb)[ci] = __float2bfloat16(v);
+    }
+    if (tid == 0) cnt[bz * tiles + tile] = 0u;
+    return;
   }
   // Epilogue, fragment by fragment. A fragment that is fully inside the matrix with alpha 1, beta 0 and f32 output goes
   // straight to memory as a column-major 16x16 block; everything else is staged through the warp's own 16x16 buffer so
@@ -364,6 +404,15 @@ extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_bf16_tc2_tn(cons
 extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2s_tn(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,1,0,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
 extern "C" __global__ void __launch_bounds__(256) tinyblas_gemm_bf16_tc2_tt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,1,1,128,128,4>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
 extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2s_tt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype) { tinyblas_gemm_tc2<__nv_bfloat16,1,1,64,64,2>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype); }
+// The split-K entry points: tc2s's 64x64 tile with SPLIT on, and three arguments after out_dtype (ws, cnt, S).
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2k_nn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__half,0,0,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2k_nt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__half,0,1,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2k_tn(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__half,1,0,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_f16_tc2k_tt(const __half* A, const __half* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__half,1,1,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2k_nn(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__nv_bfloat16,0,0,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2k_nt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__nv_bfloat16,0,1,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2k_tn(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__nv_bfloat16,1,0,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
+extern "C" __global__ void __launch_bounds__(128) tinyblas_gemm_bf16_tc2k_tt(const __nv_bfloat16* A, const __nv_bfloat16* B, void* C, long long sA, long long sB, long long sC, int m, int n, int k, int lda, int ldb, int ldc, float alpha, float beta, int out_dtype, float* ws, unsigned* cnt, int S) { tinyblas_gemm_tc2<__nv_bfloat16,1,1,64,64,2,true>(A,B,C,sA,sB,sC,m,n,k,lda,ldb,ldc,alpha,beta,out_dtype,ws,cnt,S); }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Bandwidth probes (2026-09-14): read-only kernels reach ~1570 GB/s on this card, every read+write copy caps at ~508.

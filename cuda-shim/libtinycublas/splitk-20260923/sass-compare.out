@@ -1,0 +1,26 @@
+=== host: pop-os Wed Sep 23 03:13:19 AM CST 2026
+old = cuda-shim main 0438864 gemm.cu sha256 8aacfa93a3ea5e50; new sha256 bbb21c8d5c671761
+tinyblas_bw_read 1a561bf60405 1a561bf60405 SAME
+tinyblas_bw_write 6c2600541e28 6c2600541e28 SAME
+tinyblas_gemm_bf16_tc2_nn d0b66fab8a10 d0b66fab8a10 SAME
+tinyblas_gemm_bf16_tc2_nt e5a9d27a57ca e5a9d27a57ca SAME
+tinyblas_gemm_bf16_tc2s_nn 2a42760298e6 2a42760298e6 SAME
+tinyblas_gemm_bf16_tc2s_nt 385b4f093d16 385b4f093d16 SAME
+tinyblas_gemm_bf16_tc2s_tn 4ee8e8ef43bf 4ee8e8ef43bf SAME
+tinyblas_gemm_bf16_tc2s_tt fee79a574109 fee79a574109 SAME
+tinyblas_gemm_bf16_tc2_tn 54bfd32ef935 54bfd32ef935 SAME
+tinyblas_gemm_bf16_tc2_tt f8de5b165769 f8de5b165769 SAME
+tinyblas_gemm_f16_tc 31a731077eeb 31a731077eeb SAME
+tinyblas_gemm_f16_tc2_nn 6de926b5714d 6de926b5714d SAME
+tinyblas_gemm_f16_tc2_nt 4921e32e7da0 4921e32e7da0 SAME
+tinyblas_gemm_f16_tc2s_nn 02e523a5a0e2 02e523a5a0e2 SAME
+tinyblas_gemm_f16_tc2s_nt 53f07c11ac53 53f07c11ac53 SAME
+tinyblas_gemm_f16_tc2s_tn b9bfcdf21e4e b9bfcdf21e4e SAME
+tinyblas_gemm_f16_tc2s_tt bdcf51b719a8 bdcf51b719a8 SAME
+tinyblas_gemm_f16_tc2_tn 1b5ecdb154b2 1b5ecdb154b2 SAME
+tinyblas_gemm_f16_tc2_tt e99f2d5f26f0 e99f2d5f26f0 SAME
+tinyblas_gemm_f32 258f7f88ef27 258f7f88ef27 SAME
+tinyblas_gemm_f32_tc ab227544ddfe ab227544ddfe SAME
+tinyblas_trsm_rupn_f32 8d136c714b34 8d136c714b34 SAME
+new only: tinyblas_gemm_bf16_tc2k_nn tinyblas_gemm_bf16_tc2k_nt tinyblas_gemm_bf16_tc2k_tn tinyblas_gemm_bf16_tc2k_tt tinyblas_gemm_f16_tc2k_nn tinyblas_gemm_f16_tc2k_nt tinyblas_gemm_f16_tc2k_tn tinyblas_gemm_f16_tc2k_tt 
+SASS DIFF COUNT: 0

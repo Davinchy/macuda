@@ -25,7 +25,7 @@ CUDART   := $(BUILD)/libtinycudart.a
 CUBLAS   := $(BUILD)/libtinycublas.a
 
 .PHONY: all test clean FORCE
-all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke $(BUILD)/cublas_contract
+all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke $(BUILD)/cublas_contract $(BUILD)/splitk_dispatch
 
 $(NV_LIB): FORCE
 	@$(MAKE) --no-print-directory -C libtinynv BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
@@ -80,11 +80,14 @@ $(BUILD)/cublas_contract: test/cublas_contract.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 $(BUILD)/link_smoke: test/link_smoke.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
+$(BUILD)/splitk_dispatch: test/splitk_dispatch.c $(CUDART) $(CUBLAS) $(NV_LIB)
+	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 
 test: all coverage
 	@$(MAKE) --no-print-directory -C libtinynv test BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
 	$(BUILD)/link_smoke
 	env -u TINYNV_SOCKET -u TINYNV_PCI $(BUILD)/cublas_contract
+	sh test/splitk_check.sh $(BUILD)/splitk_dispatch
 
 # every cuda*/cublas* symbol the compiled ggml-cuda archive needs must be defined by the shim (skipped if the archive is absent)
 .PHONY: coverage
