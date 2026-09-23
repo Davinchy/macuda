@@ -1,7 +1,7 @@
 // Split-K dispatch rows (B, 2026-09-23; root docs/review/20260923-smalln-design-B.md §3 rows 1, 2 and 6). Card-free: the
 // null device reports launches and executes nothing. Part 1 asserts the plan, a pure function of the shape, at the
 // design's table and at every boundary it introduces. Part 2 issues the design's five decode shapes through cublasGemmEx
-// so that test/splitk_check.sh can read the launch trace in both arms (TINYCUBLAS_SPLITK=1 and unset).
+// so that test/splitk_check.sh can read the launch trace in three arms (TINYCUBLAS_SPLITK=1, =0, and unset = the default, ON since 09-23 07:15).
 #include <stdio.h>
 #include <stdint.h>
 #include <cuda_runtime_api.h>

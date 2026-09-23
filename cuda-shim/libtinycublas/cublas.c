@@ -50,12 +50,19 @@ static tinynv_kernel_t tinycublas_gemm_tc2_kernel(int bf16, int opA, int opB, in
 // SPLIT-K (B, 2026-09-23; root docs/review/20260923-smalln-design-B.md). A decode GEMM with n <= 64 has ONE block row, and
 // with m = 256 or 2048 that is 4 or 32 blocks on 170 SMs: below one block per SM, bandwidth tracked block count almost
 // exactly (smalln-fix-prereg §8.1). tc2k is tc2s with the k-loop cut into S slices; the last block of each tile sums the
-// slices in order. OFF unless TINYCUBLAS_SPLITK=1 until a card timing says it pays (the design's bands); with it unset
-// every GEMM takes exactly the kernel it took before, so the unset run is the reference arm.
+// slices in order. ON BY DEFAULT since the flip slot of 09-23 07:15 (prereg 5ae445e5, bank logs/splitk-flip-20260923-071456:
+// decode +32.1% at 32 sequences and +20.7% at 64 on Qwen2.5-3B bf16, prefill unchanged, correctness 21/21 in normal
+// mode). TINYCUBLAS_SPLITK=0 turns it off and is the reference arm: every GEMM then takes exactly the kernel it took before.
+// SCOPE (D's F2, binding): the workspace and counters are PER HANDLE. That is safe for llama.cpp, which binds each handle
+// to one stream for life (ggml-cuda common.cuh:1540-1555 at 945e0af). A caller that re-binds one handle across streams
+// with split GEMMs in flight on both - torch, vLLM - would share the counters and corrupt results (two concurrent streams
+// FAIL 5/5 on the 3090: libtinycublas/splitk-20260923/burst-3090.out). Such a caller needs per-(handle, stream) keying
+// first. libtinynv's own streams share one channel (tinynv.c:790-795), so this host path cannot race today; a driver that
+// ran streams concurrently would.
 static const char* const tc2k_names[2][4]={
   {"tinyblas_gemm_f16_tc2k_nn","tinyblas_gemm_f16_tc2k_nt","tinyblas_gemm_f16_tc2k_tn","tinyblas_gemm_f16_tc2k_tt"},
   {"tinyblas_gemm_bf16_tc2k_nn","tinyblas_gemm_bf16_tc2k_nt","tinyblas_gemm_bf16_tc2k_tn","tinyblas_gemm_bf16_tc2k_tt"}};
-static int splitk_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TINYCUBLAS_SPLITK"); v=(e&&*e=='1')?1:0; } return v; }
+static int splitk_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TINYCUBLAS_SPLITK"); v=(e&&*e=='0')?0:1; } return v; }
 #define SPLITK_WS_BYTES (8u<<20)   /* S x tiles x 64x64 f32: q/o at n<=64, S 8, 32 tiles = 4 MiB */
 #define SPLITK_CNT_N    16384u     /* one counter per output tile per batch element */
 // The plan is a pure function of the shape (the design's row 1): the number of k-slices, 1 = do not split.
