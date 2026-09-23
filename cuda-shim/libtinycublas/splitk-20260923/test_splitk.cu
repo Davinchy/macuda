@@ -138,6 +138,48 @@ static void run(const Case& c){
   cuMemFree(dA); cuMemFree(dB); cuMemFree(dC); cuMemFree(dP); cuMemFree(ws); cuMemFree(cnt);
 }
 
+// BURST (D's F1, 09-23 03:5x): 8 split GEMMs back to back, no sync, one workspace + counter array, on 1 or 2 CUDA streams.
+// Under NVIDIA's driver two streams really run concurrently, so the 2-stream arm is the race libtinynv cannot produce
+// (its streams share one channel, tinynv.c:790-795). Predicted: 1 stream PASS, 2 streams FAIL. Each output R-checked.
+static int burst(int nstreams){
+  enum { NB = 8 }; const int m = 2048, n = 32, k = 2048, S = 8, tiles = 32; const long long na = (long long)m * k, nbv = (long long)n * k, nc = (long long)m * n;
+  printf("BURST: entered - %d split GEMMs m=%d n=%d k=%d S=%d, one workspace, %d stream(s), no sync between launches\n", NB, m, n, k, S, nstreams);
+  CUstream st[2]; CK(cuStreamCreate(&st[0], CU_STREAM_NON_BLOCKING)); CK(cuStreamCreate(&st[1], CU_STREAM_NON_BLOCKING));
+  std::vector<__nv_bfloat16> hA(na * NB), hB(nbv); for (auto& x : hA) x = __float2bfloat16(frand()); for (auto& x : hB) x = __float2bfloat16(frand());
+  CUdeviceptr dA, dB, dC, dP, ws, cnt;
+  CK(cuMemAlloc(&dA, na * NB * 2)); CK(cuMemAlloc(&dB, nbv * 2)); CK(cuMemAlloc(&dC, nc * NB * 4)); CK(cuMemAlloc(&dP, nc * 4));
+  CK(cuMemAlloc(&ws, (size_t)S * tiles * 64 * 64 * 4)); CK(cuMemAlloc(&cnt, tiles * 4));
+  CK(cuMemcpyHtoD(dA, hA.data(), na * NB * 2)); CK(cuMemcpyHtoD(dB, hB.data(), nbv * 2)); CK(cuMemsetD8(cnt, 0, tiles * 4)); CK(cuMemsetD32(dC, 0x7fc00000u, nc * NB));
+  CUfunction fk; CK(cuModuleGetFunction(&fk, mod, "tinyblas_gemm_bf16_tc2k_tn"));
+  for (int i = 0; i < NB; i++){
+    CUdeviceptr A = dA + (CUdeviceptr)i * na * 2, C = dC + (CUdeviceptr)i * nc * 4; long long z = 0; int mm = m, nn = n, kk = k, ld = k, ldc = m, out = 0, SS = S; float al = 1.f, be = 0.f;
+    void* args[] = { &A, &dB, &C, &z, &z, &z, &mm, &nn, &kk, &ld, &ld, &ldc, &al, &be, &out, &ws, &cnt, &SS };
+    CK(cuLaunchKernel(fk, m / 64, 1, S, 128, 1, 1, 0, st[nstreams == 2 ? (i & 1) : 0], args, 0));
+  }
+  CK(cuCtxSynchronize());
+  std::vector<float> got(nc * NB), part(nc); CK(cuMemcpyDtoH(got.data(), dC, nc * NB * 4));
+  unsigned hc[32]; CK(cuMemcpyDtoH(hc, cnt, sizeof hc)); int nz = 0; for (int t = 0; t < 32; t++) nz += hc[t] != 0;
+  int bad = 0; double worst = 0;
+  for (int i = 0; i < NB; i++){
+    launch("tinyblas_gemm_bf16_tc2s_tn", dA + (CUdeviceptr)i * na * 2, dB, dP, 0, 0, 0, m, n, k, k, k, m, 1.f, 0.f, 0, 0, 0, -1, 1);
+    CK(cuMemcpyDtoH(part.data(), dP, nc * 4));
+    double e1 = 0, eon = 0; int nf = 0;
+    for (int j = 0; j < n; j++) for (int r_ = 0; r_ < m; r_++){
+      double r = 0; for (int t = 0; t < k; t++) r += (double)__bfloat162float(hA[i * na + (long long)r_ * k + t]) * (double)__bfloat162float(hB[(long long)j * k + t]);
+      long long e = r_ + (long long)j * m; float g = got[i * nc + e]; nf += !isfinite(part[e]) || !isfinite(g);
+      e1 = fmax(e1, fabs((double)part[e] - r)); eon = fmax(eon, fabs((double)g - r));
+    }
+    double R = nf ? INFINITY : e1 > 0 ? eon / e1 : (eon > 0 ? INFINITY : 1.0);
+    printf("  burst[%d] on stream %d: R %.3g%s\n", i, nstreams == 2 ? (i & 1) + 1 : 1, R, nf ? " (non-finite)" : "");
+    if (!(R <= 2.0)) bad++; if (R > worst) worst = R;
+  }
+  int f = bad || nz;
+  if (f) printf("  BURST FAIL: %d of %d outputs over R 2 (worst %.3g), %d counter(s) nonzero\n", bad, NB, worst, nz);
+  else printf("  BURST PASS: all %d outputs R <= 2 (worst %.3g), counters all zero\n", NB, worst);
+  cuMemFree(dA); cuMemFree(dB); cuMemFree(dC); cuMemFree(dP); cuMemFree(ws); cuMemFree(cnt); cuStreamDestroy(st[0]); cuStreamDestroy(st[1]);
+  return f;
+}
+
 int main(int argc, char** argv){
   if (argc < 2) { fprintf(stderr, "usage: %s <gemm cubin>\n", argv[0]); return 99; }
   CK(cuInit(0)); CUdevice d; CK(cuDeviceGet(&d, 0)); CUcontext ctx; CK(cuDevicePrimaryCtxRetain(&ctx, d)); CK(cuCtxSetCurrent(ctx));
@@ -151,6 +193,9 @@ int main(int argc, char** argv){
     { "empty last slice",      128, 64,    96,  4, 1 },   // nk 3, per 1: slice 3 has no k-tiles and must still count
     { "batch 3",               256, 48,   512,  4, 3 },
   };
+  if (argc > 2 && (!strcmp(argv[2], "burst1") || !strcmp(argv[2], "burst2"))) {
+    int f = burst(argv[2][5] == '2' ? 2 : 1); printf("RESULT: %s - %s\n", f ? "FAIL" : "PASS", argv[2]); return f;
+  }
   for (const Case& c : cases) run(c);
   printf("RESULT: %d FAIL(s)\n", fails);
   return fails;
