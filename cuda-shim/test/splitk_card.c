@@ -121,7 +121,9 @@ int main(int argc, char **argv){
       double r = 0; for (int t = 0; t < k; t++) r += (double)bf2f(hA[(size_t)i * k + t]) * (double)bf2f(hB[(size_t)j * k + t]);
       size_t e = i + (size_t)j * m; e1 = fmax(e1, fabs((double)part[e] - r)); eon = fmax(eon, fabs((double)got[e] - r));
     }
-    double R = e1 > 0 ? eon / e1 : (eon > 0 ? INFINITY : 1.0);
+    // fmax drops NaN, so a NaN on either side must fail here explicitly (the null run showed R PASS on unwritten output)
+    int nf = 0; for (size_t e = 0; e < nc; e++) nf += !isfinite(part[e]) || !isfinite(got[e]);
+    double R = nf ? INFINITY : e1 > 0 ? eon / e1 : (eon > 0 ? INFINITY : 1.0);
     if (!(R <= 2.0)) { printf("  R FAIL: split err %.3g vs unsplit %.3g, R %.3g (> 2)\n", eon, e1, R); fails++; }
     else printf("  R PASS: split err %.3g vs unsplit %.3g, R %.3g (<= 2)\n", eon, e1, R);
     tinynv_free(d, dA); tinynv_free(d, dB); tinynv_free(d, dC); tinynv_free(d, dP); tinynv_free(d, ws); tinynv_free(d, cnt);

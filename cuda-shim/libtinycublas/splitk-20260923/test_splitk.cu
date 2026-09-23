@@ -129,7 +129,8 @@ static void run(const Case& c){
         const long long e = b * sC + i + (long long)j * m; float g; memcpy(&g, &c1[e * 4], 4);
         e1 = fmax(e1, fabs((double)s1[e] - r)); eon = fmax(eon, fabs((double)g - r));
       }
-      const double R = e1 > 0 ? eon / e1 : (eon > 0 ? INFINITY : 1.0);
+      int nf = 0; for (long long e = 0; e < sC * nb; e++) { float g; memcpy(&g, &c1[e * 4], 4); nf += !isfinite(s1[e]) || !isfinite(g); }   // fmax drops NaN
+      const double R = nf ? INFINITY : e1 > 0 ? eon / e1 : (eon > 0 ? INFINITY : 1.0);
       if (!(R <= 2.0)) { printf("  R FAIL: split err %.3g vs unsplit %.3g, R %.3g (> 2)\n", eon, e1, R); fails++; }
       else printf("  R PASS: split err %.3g vs unsplit %.3g, R %.3g (<= 2)\n", eon, e1, R);
     }
