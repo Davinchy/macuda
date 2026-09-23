@@ -73,7 +73,29 @@ static int tc2_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TI
 // The tensor-core path takes every f16-input GEMM unless TINYCUBLAS_TC=0 asks for the scalar kernel (a bisect knob).
 static int tc_enabled(void){ static int v=-1; if(v<0){ const char* e=getenv("TINYCUBLAS_TC"); v=(e&&*e=='0')?0:1; } return v; }
 
-struct tinyblas_handle { tinynv_stream_t stream; int math_mode; tinynv_devptr_t ws, cnt; };   // ws/cnt: split-K, 0 unless the knob is on
+struct tinyblas_handle { tinynv_stream_t stream; int math_mode; tinynv_devptr_t ws, cnt; int ws_refused; };   // ws/cnt: split-K, made at the handle's FIRST splitting GEMM
+// SPLIT-K's WORKSPACE IS MADE LAZILY, at the first GEMM whose plan splits (B, 09-23, D's ruling on flip rev 4). It used to
+// be made at cublasCreate, and ggml creates its handle lazily at its first cuBLAS call (common.cuh:1540-1555 at 945e0af),
+// which is a prefill: the 8 MiB allocation, the memset and a sync were charged to that prefill (-2.9% at npl 1 in the
+// 04:52 flip slot). A handle that never splits now never allocates. No capture hazard on this path: the host runtime has
+// no stream capture (libtinycudart/cudart_api.c:86, cudaStreamBeginCapture returns NotSupported), and the guest path does
+// not use this library. The counters are zeroed by a memset on the handle's own stream, ordered before the split GEMM
+// that follows it on that stream, so no host sync is needed.
+static unsigned g_splitk_ws_allocs;   // workspace allocations made, all handles: the unit row reads it
+unsigned tinycublas_splitk_ws_allocs(void){ return g_splitk_ws_allocs; }
+static int splitk_workspace(struct tinyblas_handle* h){
+  if (h->ws) return 0;
+  if (h->ws_refused) return -1;
+  tinynv_device_t d=tinycudart_device();
+  if (tinynv_malloc(d, SPLITK_WS_BYTES, &h->ws)!=TINYNV_OK || tinynv_malloc(d, SPLITK_CNT_N*4, &h->cnt)!=TINYNV_OK
+      || tinynv_memset(h->stream, h->cnt, 0, SPLITK_CNT_N*4)!=TINYNV_OK){
+    fprintf(stderr,"[tinycublas] split-K workspace REFUSED at the first splitting GEMM; this handle does not split: %s\n", tinynv_last_error());
+    if (h->ws) tinynv_free(d, h->ws); if (h->cnt) tinynv_free(d, h->cnt); h->ws=h->cnt=0; h->ws_refused=1;
+    return -1;
+  }
+  g_splitk_ws_allocs++;
+  return 0;
+}
 
 static int dtype_code(cudaDataType t){ return t==CUDA_R_32F?0 : t==CUDA_R_16F?1 : t==CUDA_R_16BF?2 : -1; }
 // cublas alpha/beta are in the COMPUTE type: CUBLAS_COMPUTE_16F means they are __half, not float. ggml's f16 matmul uses
@@ -120,7 +142,8 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
     // which would put 20 blocks on 170 SMs, so those take 64x64 tiles (four times the blocks, half the threads each)
     long long blocks128 = (long long)((m+127)/128) * ((n+127)/128) * batch;
     int small = blocks128 < 2LL * 170;
-    int S = (small && h && h->ws) ? tinycublas_splitk_plan(m, n, k, batch) : 1;
+    int S = (small && h && splitk_enabled()) ? tinycublas_splitk_plan(m, n, k, batch) : 1;
+    if (S > 1 && splitk_workspace(h)) S = 1;   // the workspace, at this handle's first splitting GEMM; refused = no split
     if (S > 1) {
       tinynv_kernel_t kk = tinycublas_kernel(tc2k_names[in_dtype==2?1:0][oa*2+ob]);
       if (!kk) return CUBLAS_STATUS_NOT_INITIALIZED;
@@ -211,17 +234,7 @@ static cublasStatus_t launch_gemm(struct tinyblas_handle* h, cublasOperation_t o
 
 cublasStatus_t cublasCreate_v2(cublasHandle_t* h){ struct tinyblas_handle* t=calloc(1,sizeof(*t)); t->stream=tinycudart_default_stream(); *h=(cublasHandle_t)t;
   if (!tinycublas_gemm_kernel()) return CUBLAS_STATUS_NOT_INITIALIZED;
-  // Split-K's workspace and counters are made HERE, not at the first GEMM, so nothing is allocated or memset inside a graph
-  // capture. The counters start at zero and every split GEMM leaves them at zero. A refusal leaves the handle unsplit.
-  if (splitk_enabled()){
-    tinynv_device_t d=tinycudart_device(); tinynv_stream_t s=tinycudart_default_stream();
-    if (tinynv_malloc(d, SPLITK_WS_BYTES, &t->ws)!=TINYNV_OK || tinynv_malloc(d, SPLITK_CNT_N*4, &t->cnt)!=TINYNV_OK
-        || tinynv_memset(s, t->cnt, 0, SPLITK_CNT_N*4)!=TINYNV_OK || tinynv_stream_sync(s)!=TINYNV_OK){
-      fprintf(stderr,"[tinycublas] split-K workspace REFUSED; this handle does not split\n");
-      if (t->ws) tinynv_free(d, t->ws); if (t->cnt) tinynv_free(d, t->cnt); t->ws=t->cnt=0;
-    }
-  }
-  return CUBLAS_STATUS_SUCCESS; }
+  return CUBLAS_STATUS_SUCCESS; }   // split-K's workspace is NOT made here any more: see splitk_workspace
 cublasStatus_t cublasDestroy_v2(cublasHandle_t h){ struct tinyblas_handle* t=(struct tinyblas_handle*)h;
   if (t && t->ws) tinynv_free(tinycudart_device(), t->ws); if (t && t->cnt) tinynv_free(tinycudart_device(), t->cnt);
   free(h); return CUBLAS_STATUS_SUCCESS; }

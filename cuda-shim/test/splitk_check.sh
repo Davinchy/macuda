@@ -21,6 +21,9 @@ row "OFF: no tc2k launch and no entry print" "$([ "$(has "$OFF" 'tc2k')" = 0 ] &
 row "OFF: k/v -> tc2s grid (4,1,1)" "$([ "$(has "$OFF" 'launch tinyblas_gemm_bf16_tc2s_tn grid=(4,1,1)')" = 1 ] && echo 0 || echo 1)"
 row "OFF: q/o and down -> tc2s grid (32,1,1), twice" "$([ "$(has "$OFF" 'launch tinyblas_gemm_bf16_tc2s_tn grid=(32,1,1)')" = 2 ] && echo 0 || echo 1)"
 row "OFF: diffusion mix -> tc2s grid (20,4,1)" "$([ "$(has "$OFF" 'launch tinyblas_gemm_bf16_tc2s_tn grid=(20,4,1)')" = 1 ] && echo 0 || echo 1)"
+# D's unit row (lazy workspace): ON - 0 at create, 0 after the non-splitting handle, exactly 1 after the splitting one; OFF - 0 throughout
+row "ON: workspace allocations 0 / 0 / 1 (create, non-splitting handle, splitting handle)" "$([ "$(has "$ON" 'ws allocs after cublasCreate x2: 0')" = 1 ] && [ "$(has "$ON" "ws allocs after the non-splitting handle's GEMMs: 0")" = 1 ] && [ "$(has "$ON" "ws allocs after the splitting handle's 3 GEMMs: 1")" = 1 ] && echo 0 || echo 1)"
+row "OFF: workspace allocations 0 / 0 / 0" "$([ "$(has "$OFF" 'ws allocs after cublasCreate x2: 0')" = 1 ] && [ "$(has "$OFF" "ws allocs after the non-splitting handle's GEMMs: 0")" = 1 ] && [ "$(has "$OFF" "ws allocs after the splitting handle's 3 GEMMs: 0")" = 1 ] && echo 0 || echo 1)"
 [ $fails = 0 ] || { printf '%s\n' "--- ON arm output:" "$ON" "--- OFF arm output:" "$OFF" | head -60; }
 echo "splitk_check: $fails failure(s)"
 exit $fails

@@ -7,6 +7,7 @@
 #include <cuda_runtime_api.h>
 #include <cublas_v2.h>
 int tinycublas_splitk_plan(int m, int n, int k, int batch);
+unsigned tinycublas_splitk_ws_allocs(void);
 static int fails, rows;
 static void plan(const char *what, int m, int n, int k, int batch, int want) {
   int got = tinycublas_splitk_plan(m, n, k, batch); rows++;
@@ -29,18 +30,25 @@ int main(void) {
   plan("workspace bound: batch 3 of q/o is 12 MiB", 2048, 32, 2048, 3, 1);
   plan("workspace bound: batch 2 of q/o is 8 MiB", 2048, 32, 2048, 2, 8);
   printf("\n%d plan row(s), %d failure(s)\n", rows, fails);
-  cublasHandle_t h; if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) { printf("FAIL: cublasCreate\n"); return 1; }
+  // D's unit row (04:5x): the workspace is made at a handle's FIRST splitting GEMM. hN never splits (gate/up, diffusion) and
+  // must make 0 allocations; hS splits three times (k/v, q/o, down) and must make exactly 1. splitk_check.sh reads the lines.
+  cublasHandle_t hN, hS;
+  if (cublasCreate(&hN) != CUBLAS_STATUS_SUCCESS || cublasCreate(&hS) != CUBLAS_STATUS_SUCCESS) { printf("FAIL: cublasCreate\n"); return 1; }
+  printf("ws allocs after cublasCreate x2: %u\n", tinycublas_splitk_ws_allocs());
   void *A, *B, *C;
   if (cudaMalloc(&A, 64 << 20) || cudaMalloc(&B, 4 << 20) || cudaMalloc(&C, 8 << 20)) { printf("FAIL: malloc\n"); return 1; }
   const float one = 1.f, zero = 0.f;
-  const int shapes[5][3] = { {256, 32, 2048}, {2048, 32, 2048}, {2048, 32, 11008}, {11008, 32, 2048}, {1280, 256, 1280} };
+  const int shapes[5][3] = { {11008, 32, 2048}, {1280, 256, 1280}, {256, 32, 2048}, {2048, 32, 2048}, {2048, 32, 11008} };
   for (int i = 0; i < 5; i++) {
     int m = shapes[i][0], n = shapes[i][1], k = shapes[i][2];
+    cublasHandle_t h = i < 2 ? hN : hS;
+    if (i == 2) printf("ws allocs after the non-splitting handle's GEMMs: %u\n", tinycublas_splitk_ws_allocs());
     cublasStatus_t s = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &one, A, CUDA_R_16BF, k, B, CUDA_R_16BF, k, &zero, C, CUDA_R_32F, m,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     printf("gemm m=%d n=%d k=%d status %d\n", m, n, k, (int)s);
     if (s != CUBLAS_STATUS_SUCCESS) fails++;
   }
-  cublasDestroy(h);
+  printf("ws allocs after the splitting handle's 3 GEMMs: %u\n", tinycublas_splitk_ws_allocs());
+  cublasDestroy(hN); cublasDestroy(hS);
   return fails;
 }
