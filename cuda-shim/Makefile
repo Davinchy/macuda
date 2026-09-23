@@ -25,7 +25,7 @@ CUDART   := $(BUILD)/libtinycudart.a
 CUBLAS   := $(BUILD)/libtinycublas.a
 
 .PHONY: all test clean FORCE
-all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke $(BUILD)/cublas_contract $(BUILD)/splitk_dispatch
+all: $(NV_LIB) $(CUDART) $(CUBLAS) $(BUILD)/link_smoke $(BUILD)/cublas_contract $(BUILD)/splitk_dispatch $(BUILD)/splitk_card
 
 $(NV_LIB): FORCE
 	@$(MAKE) --no-print-directory -C libtinynv BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
@@ -82,6 +82,9 @@ $(BUILD)/link_smoke: test/link_smoke.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
 $(BUILD)/splitk_dispatch: test/splitk_dispatch.c $(CUDART) $(CUBLAS) $(NV_LIB)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) $< $(CUDART) $(CUBLAS) $(NV_LIB) $(DEMANGLE) -lc++ -o $@
+# the split-K kernel ON THE CARD through libtinynv (D's gate S1 on prereg b79fb72f); a probe, run by nv_shim_step.sh, never by make test
+$(BUILD)/splitk_card: test/splitk_card.c $(NV_LIB)
+	$(CC) $(CFLAGS) $< $(NV_LIB) -o $@
 
 test: all coverage
 	@$(MAKE) --no-print-directory -C libtinynv test BUILD=$(NV_BUILD) CC="cc $(SYSROOT)"
