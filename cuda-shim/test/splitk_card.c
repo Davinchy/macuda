@@ -104,6 +104,10 @@ static int burst(tinynv_device_t d, tinynv_kernel_t ks, tinynv_kernel_t kk, int 
 }
 
 int main(int argc, char **argv){
+  // Unbuffered, as test_hw_namedbar already is: a verdict that only exists in the stdio buffer is a verdict the exit
+  // path can eat. Both wedges of 2026-09-25 trapped this binary's entire run that way - the drain hung in atexit,
+  // which runs BEFORE stdio flush, and the signal that ended the process ended the buffer with it.
+  setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) { fprintf(stderr, "usage: %s <gemm.cubin (sm_120)>\n", argv[0]); return 99; }
   FILE *f = fopen(argv[1], "rb"); if (!f) { printf("ERROR: no cubin at %s\n", argv[1]); return 99; }
   fseek(f, 0, SEEK_END); long cl = ftell(f); fseek(f, 0, SEEK_SET); void *cub = malloc(cl);
