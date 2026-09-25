@@ -1,9 +1,11 @@
 # Split-K for the small-N decode GEMMs (B, 2026-09-23): the evidence on this branch
 
-Design and registered bands: root `docs/review/20260923-smalln-design-B.md`. **Default OFF.** `TINYCUBLAS_SPLITK=1`
-turns it on. With it unset, every GEMM takes exactly the kernel it took before, and the SASS below shows that kernel is
-unchanged, so the unset run is the reference arm. No card timing has been taken. The card step is requested separately,
-as a prereg.
+Design and registered bands: root `docs/review/20260923-smalln-design-B.md`. **Default ON** since the flip slot of
+2026-09-23 07:15 (prereg 5ae445e5, bank `logs/splitk-flip-20260923-071456`); `TINYCUBLAS_SPLITK=0` turns it off and is
+the reference arm, where every GEMM takes exactly the kernel it took before and the SASS below shows that kernel is
+unchanged. This line said **Default OFF** until 2026-09-25: it was written before the flip and never revised, so it told
+the reader the opposite of `cublas.c:51`'s `v=(e&&*e=='0')?0:1`. Anyone reading only this file believed the feature was
+off while it was on. The card timing this file says has not been taken WAS taken, in that flip slot.
 
 **What changed**
 - `gemm.cu`: the `tinyblas_gemm_tc2` template gains `bool SPLIT = false` and three arguments (`ws`, `cnt`, `S`).
