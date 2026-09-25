@@ -166,9 +166,9 @@ static cublasStatus_t launch_gemm_tc(struct tinyblas_handle* h, cublasOperation_
       const char* kname=tc2k_names[in_dtype==2?1:0][oa*2+ob];
       static int said; if (!said++) fprintf(stderr,"[tinycublas] split-K ON (TINYCUBLAS_SPLITK=1): first %s m=%d n=%d k=%d batch=%d S=%d grid=(%u,%u,%u)\n",kname,m,n,k,batch,S,gx,gy,gz);
       if (tinycudart_trace()) fprintf(stderr,"[trace] launch %s grid=(%u,%u,%u) block=(128,1,1) m=%d n=%d k=%d out=%d S=%d\n",kname,gx,gy,gz,m,n,k,out_dtype,S);
-      tinycudart_count_launch(kname, gx,gy,gz); double t0=tinycudart_now_ns();
+      tinycudart_count_launch(kname); double t0=tinycudart_now_ns();
       tinynv_status_t st = tinynv_launch(h->stream, kk, gx,gy,gz, 128,1,1, 0, &q2, sizeof(q2));
-      tinycudart_time_launch(kname, gx,gy,gz, tinycudart_now_ns()-t0);
+      tinycudart_time_launch(kname, tinycudart_now_ns()-t0);
       return st==TINYNV_OK ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_EXECUTION_FAILED;
     }
     tinynv_kernel_t kern = tinycublas_gemm_tc2_kernel(in_dtype==2, oa, ob, small);
