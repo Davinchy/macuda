@@ -247,6 +247,10 @@ static void quiesce_and_continue(int sig) {
   if (g_dev.booted && (broken || !g_dev.exec_ready)) tinynv_dev_quiesce(&g_dev.gpu.dev);
   if (sig == SIGSEGV || sig == SIGBUS || sig == SIGABRT) tinynv_dump_host_writes(sig);
   put_the_card_down();
+  // Said HERE, after the teardown returned and before the re-raise, because that ordering is the evidence: a death
+  // that prints this line died of the re-raised signal with the handler complete, not of a wedged handler or a
+  // default disposition that was never replaced. D's witness condition 3 (2026-09-25) keys on it.
+  fprintf(stderr, "libtinynv: signal %d: the card is down; restoring the default disposition and re-raising\n", sig);
   for (size_t i = 0; i < sizeof(g_caught) / sizeof(*g_caught); i++)
     if (g_caught[i] == sig) { sigaction(sig, &g_prev[i], NULL); break; }
   raise(sig);
