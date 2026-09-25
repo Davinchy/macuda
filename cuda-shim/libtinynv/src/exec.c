@@ -1960,6 +1960,17 @@ int tinynv_exec_load(tinynv_exec_t *ex, const tinynv_cubin_t *cb, const char *ke
     tinynv_exec_unload(&ex->g->mm, out);
     return -1;
   }
+  // WHERE EACH IMAGE LANDS (B, 2026-09-24; C8 191356): the SM-error report names a warp pc and nothing said which module
+  // held it. Print-only, once per module at its FIRST LAUNCH (this load runs inside kernel_ready_locked): the image's VA
+  // range, the kernel whose launch loaded it, and FNV-1a 64 over the cubin bytes as received - the same hash the guest
+  // shim prints under TINYCU_IMAGE_HASH=1 (shim.c:2792), so tools/b-slot/pc_map.py joins a pc to its guest library.
+  {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < cb->len; i++) { h ^= cb->img[i]; h *= 1099511628211ULL; }
+    fprintf(stderr, "tinynv: IMAGE PLACED %s [%#llx, %#llx) text +%#llx, cubin %zu bytes fnv1a64 %016llx\n", kernel,
+            (unsigned long long)out->mem.va, (unsigned long long)(out->mem.va + out->layout.len),
+            (unsigned long long)out->layout.text_off, cb->len, (unsigned long long)h);
+  }
   return 0;
 }
 
