@@ -99,6 +99,11 @@ int tinynv_arena_rewind(tinynv_exec_region_t *rg) { (void)rg; return 0; }
 int tinynv_qmd_link_check(const tinynv_qmd_t *q, int releases, uint64_t want_payload, uint64_t next_va, const char **why) {
   (void)q; (void)releases; (void)want_payload; (void)next_va; (void)why; return 0;
 }
+// the membar knob patches a chain tail's descriptor at handover (TINYNV_QMD_MEMBAR), and a former tail's release is
+// cleared when its chain grows; the record this test judges holds encoder calls and batches, never descriptor bytes,
+// so both stand-ins only report success
+int tinynv_qmd_membar(tinynv_qmd_t *q, int membar) { (void)q; (void)membar; return 0; }
+int tinynv_qmd_release_clear(tinynv_qmd_t *q) { (void)q; return 0; }
 int tinynv_gsp_poll(tinynv_gpu_t *g) { (void)g; return 0; }
 void tinynv_note_host_write(const void *dst, size_t n, const char *what) { (void)dst; (void)n; (void)what; }
 void tinynv_note_host_region(const void *base, size_t n, const char *what) { (void)base; (void)n; (void)what; }
@@ -116,6 +121,9 @@ static tinynv_exec_t *fresh(void) {
   ex.region[1].shadow = cmd_shadow; ex.region[1].mem.va = 0x10000000ull; ex.region[1].size = sizeof cmd_shadow;
   ex.stage.dma.va = stage_buf; ex.stage.va = 0x20000000ull;
   ex.inline_upload = 1; ex.inline_pend_max = 16; ex.inline_pend_bytes_max = 8192;
+  // this driver's inline ceiling is a RUNTIME knob (TINYNV_INLINE_MAX env), not the submit.h per-call constant;
+  // an exec built by hand gets the same default an unset environment gets, or every arm below rides the bulk path
+  ex.inline_max = 4096;
   nev = 0; batch = 0; nplaced = 0; cur = &ex;
   return &ex;
 }
@@ -149,7 +157,9 @@ static int waited_before(int at, uint64_t value) {
 
 int main(void) {
   const uint64_t A = 0xA000, B = 0xB000, U = 0x5000;
-  uint32_t data[64] = {0};
+  // sized for the largest arm below (TINYNV_INLINE_MAX + 4 bytes): the large-upload arm memcpys the whole length
+  // from this buffer, and at this tree's 32,764-byte ceiling a 64-dword array put the read past the stack guard page
+  static uint32_t data[(TINYNV_INLINE_MAX + 4) / 4];
 
   { // mid-chain upload: the H4 shape
     tinynv_exec_t *ex = fresh();

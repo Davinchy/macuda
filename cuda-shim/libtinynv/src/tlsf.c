@@ -152,11 +152,11 @@ uint64_t tinynv_tlsf_alloc(tinynv_tlsf_t *a, uint64_t req_size, uint64_t align) 
   return TINYNV_TLSF_FAIL;
 }
 
-void tinynv_tlsf_release(tinynv_tlsf_t *a, uint64_t addr) {
+int tinynv_tlsf_release(tinynv_tlsf_t *a, uint64_t addr) {
   uint64_t at = addr - a->base;
   blk_t *b = a->head;
   while (b && b->start != at) b = b->next;
-  if (!b || b->free) return;
+  if (!b || b->free) return -1;
   a->used -= b->size;              // before the merge below changes what b->size means
   bucket_append(a, b);
   // merge with free neighbours so the space can be used by a larger request later
@@ -181,6 +181,15 @@ void tinynv_tlsf_release(tinynv_tlsf_t *a, uint64_t addr) {
     free(n);
     bucket_append(a, b);
   }
+  return 0;
+}
+
+// The size of the LIVE block starting exactly at `addr`, or 0 if there is no such block.
+uint64_t tinynv_tlsf_block_size(const tinynv_tlsf_t *a, uint64_t addr) {
+  uint64_t at = addr - a->base;
+  const blk_t *b = a->head;
+  while (b && b->start != at) b = b->next;
+  return b && !b->free ? b->size : 0;
 }
 
 uint64_t tinynv_tlsf_used(const tinynv_tlsf_t *a) { return a ? a->used : 0; }

@@ -64,3 +64,7 @@ void tinynv_sass_version(void);
 void tinynv_sass_version(void) { unreachable("tinynv_sass_version"); }
 void tinynv_vmap_free(void);
 void tinynv_vmap_free(void) { unreachable("tinynv_vmap_free"); }
+void tinynv_submit_ring_complete(void);
+void tinynv_submit_ring_complete(void) { unreachable("tinynv_submit_ring_complete"); }
+void tinynv_submit_ring_send(void);
+void tinynv_submit_ring_send(void) { unreachable("tinynv_submit_ring_send"); }
