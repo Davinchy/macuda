@@ -1981,6 +1981,8 @@ void tinynv_exec_unload(tinynv_mm_t *mm, tinynv_exec_module_t *m) {
   memset(m, 0, sizeof(*m));
 }
 
+// test_hw_namedbar's must-fail arm: nonzero overrides every launch's BARRIER_COUNT (1 reproduces the pre-fix grant)
+uint32_t tinynv_exec_test_barriers_force;
 // The whole of a launch as the caller sees it, timed as one thing. Everything else the summary reports is subtracted
 // from this, so if the parts do not add up the difference is real work nobody has named yet rather than a rounding.
 // One descriptor, as this driver builds them: the kernel's own numbers, the constant banks, the tail the measurement
@@ -1999,7 +2001,10 @@ static int build_qmd(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_ke
                                .shmem = (uint32_t)((0x400 + k->static_smem + dyn_smem + 127) & ~127u),
                                .slm_per_thread = ex->slm_per_thread,
                                .prog_size = (uint32_t)k->text_size,
-                               .sass_version = tinynv_sass_version(gsp->sm_version)};
+                               .sass_version = tinynv_sass_version(gsp->sm_version),
+                               .barriers = tinynv_exec_test_barriers_force ? tinynv_exec_test_barriers_force : k->num_barriers};
+  // the field is 5 bits (nv_regs.h BARRIER_COUNT 1137-1141): a kernel declaring more is refused by name, never truncated
+  if (prog.barriers > 31) return tinynv_fail("kernel %s declares %u barriers; the descriptor holds at most 31", k->name, prog.barriers);
   tinynv_qmd_launch_t l = {.program_addr = m->mem.va + m->layout.text_off};
   for (int i = 0; i < 3; i++) { l.grid[i] = grid[i]; l.block[i] = block[i]; }
 

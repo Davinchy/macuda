@@ -19,6 +19,7 @@
 #define EIATTR_CTA_PER_CLUSTER 0x3d
 #define EIATTR_EXPLICIT_CLUSTER 0x3e
 #define EIATTR_MAX_CLUSTER_RANK 0x3f
+#define EIATTR_NUM_BARRIERS 0x4c   // read from the CUTLASS FP8 cubin's own .nv.info (fmt 2, value 8) = cuobjdump's EIATTR_NUM_BARRIERS 0x8
 
 typedef tinynv_section_t sec_t;
 
@@ -73,6 +74,8 @@ static int parse_kernel_info(tinynv_kernel_desc_t *k, const uint8_t *p, const ui
       k->explicit_cluster = 1;
     } else if (attr == EIATTR_MAX_CLUSTER_RANK && plen >= 4) {
       k->max_cluster_rank = rd32(payload);
+    } else if (attr == EIATTR_NUM_BARRIERS) {
+      k->num_barriers = fmt == EIFMT_SVAL ? 0 : (fmt == 2 ? p[2] : val);   // a one-byte value (fmt 2) or a 16-bit one
     }
     p = payload + plen;
   }

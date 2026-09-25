@@ -576,5 +576,6 @@ int tinynv_exec_launch(tinynv_exec_t *ex, uint64_t qmd_va);
 
 // Enough local memory for a kernel that needs this much per thread, grown when a hungrier kernel turns up.
 int tinynv_exec_ensure_local_memory(tinynv_exec_t *ex, uint32_t per_thread);
+extern uint32_t tinynv_exec_test_barriers_force;   // test_hw_namedbar: nonzero overrides BARRIER_COUNT on every launch
 
 #endif

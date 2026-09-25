@@ -177,7 +177,10 @@ int tinynv_qmd_program(tinynv_qmd_t *q, const tinynv_qmd_program_t *p) {
   SET(q, INVALIDATE_SHADER_DATA_CACHE, inv_all);
   SET(q, API_VISIBLE_CALL_LIMIT, 1);
   SET(q, SAMPLER_INDEX, 1);
-  SET(q, BARRIER_COUNT, 1);
+  // THE BARRIERS THE PROGRAM DECLARES (B, 2026-09-24). This was a constant 1, the oracle's value for tinygrad's kernels,
+  // which never use a named barrier. The first kernel that did - CUTLASS's sm120 FP8 GEMM, EIATTR_NUM_BARRIERS 8, BAR.SYNC 7 -
+  // faulted every SM with "Illegal Instruction Parameter" (C8 194838; docs log 5764d199). 0 (no record) still grants 1.
+  SET(q, BARRIER_COUNT, p->barriers ? p->barriers : 1);
   if (tinynv_qmd_membar(q, p->membar)) return -1;
   SET(q, CONSTANT_BUFFER_INVALIDATE_0, inv_cb0);
   SET(q, MIN_SM_CONFIG_SHARED_MEM_SIZE, smem_cfg);

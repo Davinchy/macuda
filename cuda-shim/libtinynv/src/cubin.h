@@ -24,6 +24,9 @@ typedef struct {
   // for these codes, matched by position in a CUDA 13.0 build with __cluster_dims__ / __launch_bounds__(..., ..., 4).
   // All zero when the kernel sets none, which is CUDA's documented value for "not set at compile time".
   uint32_t explicit_cluster, cluster_dim[3], max_cluster_rank;
+  // EIATTR_NUM_BARRIERS: how many hardware barriers the kernel's code uses (barrier 0 plus named ones), 0 if the record is
+  // absent. The descriptor must grant at least this many; the C8 FP8 CUTLASS kernel declares 8 and syncs on barrier 7.
+  uint32_t num_barriers;
   int nparams;
   struct { uint32_t offset, size; } params[TINYNV_MAX_PARAMS]; // by ordinal, offset relative to param_base
 } tinynv_kernel_desc_t;

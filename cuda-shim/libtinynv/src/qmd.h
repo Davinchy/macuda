@@ -59,6 +59,7 @@ typedef struct {
   uint32_t slm_per_thread;   // local memory per thread, a property of the device rather than the kernel
   uint32_t prog_size;        // the kernel's code size, which bounds how much of it is worth prefetching
   uint32_t sass_version;     // tinynv_sass_version() of the device's sm_version
+  uint32_t barriers;         // hardware barriers the program needs (EIATTR_NUM_BARRIERS); 0 = not declared, granted 1
   uint32_t constbuf_size[TINYNV_QMD_CONSTBUFS]; // 0 for a bank the program does not use
   int constbuf_used[TINYNV_QMD_CONSTBUFS];
   // What the descriptor makes the engine do at the kernel's tail, both the oracle's choice unless a measurement mode
