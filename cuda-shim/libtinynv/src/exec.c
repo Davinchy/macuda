@@ -2002,6 +2002,9 @@ static int build_qmd(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_ke
   tinynv_gsp_t *gsp = &ex->g->gsp;
   tinynv_qmd_t q;
   memset(&q, 0, sizeof(q));
+  // Which descriptor generation this chip takes, by the same test the oracle makes: the compute class it answers to.
+  // Ampere and Ada take v3, Blackwell v5. memset left this at v5, which is right for exactly one of the three.
+  q.v3 = ex->g->dev.class_compute < TINYNV_CLASS_COMPUTE_BLACKWELL_A;
   tinynv_qmd_program_t prog = {.regs = k->regs,
                                // What the kernel declared plus what the caller asked for at the call site. The descriptor
                                // holds one number, so the two have to be added here: a kernel given only its static
@@ -2085,7 +2088,7 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
   ch->n++;
   memcpy(host, q.b, TINYNV_QMD_BYTES);
   memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
-  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
+  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, q.v3, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
   if (params_len) memcpy(host + slot + k->param_base, params, params_len);
   r->prev_qmd = q;
   r->prev_host = host;
@@ -2224,7 +2227,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
       tinynv_qmd_chain(&ex->chain[ex->nchain - 1].qmd, qmd_va, ex->chain_prefetch)) return -1;
 
   memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
-  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
+  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, q.v3, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
   if (params_len) memcpy(host + slot + k->param_base, params, params_len);
 
   // Held, not handed over: the next launch still has to be able to write its address into this descriptor. The bytes
@@ -2772,13 +2775,13 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   uint64_t va;
   tinynv_cmdbuf_t c;
   if (batch_begin(ex, &g->gsp.compute_q, 64, &c, &va)) return -1;
-  if (tinynv_cmd_set_object(&c, 1, TINYNV_CLASS_COMPUTE)) return -1;
+  if (tinynv_cmd_set_object(&c, 1, g->dev.class_compute)) return -1;
   if (tinynv_cmd_shader_window(&c, 0, TINYNV_LOCAL_WINDOW)) return -1;
   if (tinynv_cmd_shader_window(&c, 1, TINYNV_SHARED_WINDOW)) return -1;
   if (run(ex, &g->gsp.compute_q, &c, va)) return -1;
 
   if (batch_begin(ex, &g->gsp.copy_q, 40, &c, &va)) return -1;
-  if (tinynv_cmd_set_object(&c, 4, TINYNV_CLASS_DMA_COPY)) return -1;
+  if (tinynv_cmd_set_object(&c, 4, g->dev.class_dma_copy)) return -1;
   if (run(ex, &g->gsp.copy_q, &c, va)) return -1;
   // the engines must be bound before anything is built on them, and this happens once
   if (tinynv_exec_idle(ex)) return -1;

@@ -19,7 +19,7 @@ libtinynv.a         C userspace driver: firmware initialisation, memory manageme
         │
 TinyGPU.app        tinygrad's signed DriverKit extension and Unix-socket hardware interface
         │
-RTX 5090           GB202, 32 GB VRAM, connected through an AORUS AI BOX over Thunderbolt
+RTX 5090 / 3060    GB202 32 GB in an AORUS AI BOX, or GA106 12 GB in a Razer Core X V2, over Thunderbolt
 ```
 
 `libtinynv` is a C port of the userspace NVIDIA driver in [tinygrad](https://github.com/tinygrad/tinygrad), using NVIDIA's published `open-gpu-kernel-modules` definitions. It boots the GPU's signed GSP firmware, manages MMU page tables and submits kernels through hardware queues.
@@ -78,8 +78,8 @@ sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf
 
 | Component | Tested configuration or requirement |
 |---|---|
-| Mac | Apple Silicon; development and measurements use an M4 Max MacBook Pro on macOS 27.0 |
-| GPU | RTX 5090 in a Thunderbolt enclosure; measurements use an AORUS AI BOX |
+| Mac | Apple Silicon; development and measurements use an M4 Max (RTX 5090) and an M3 Max (RTX 3060), both on macOS 27.0 |
+| GPU | RTX 5090 (GB202, sm_120) or RTX 3060 (GA106, sm_86) in a Thunderbolt enclosure; measurements use an AORUS AI BOX and a Razer Core X V2. Give the enclosure its own power supply: an underpowered one drops the card mid-run, and the symptom is every register reading all ones, not a message about power |
 | Host toolchain | Xcode Command Line Tools or Xcode, CMake, Python 3 and Homebrew LLVM at `/opt/homebrew/opt/llvm` |
 | Hardware access | TinyGPU.app and its approved DriverKit extension, `org.tinygrad.tinygpu.driver2` |
 | GPU compiler | A container runtime with the configured CUDA image — Apple's `container` (macOS 26+) or Docker — or a Linux machine with CUDA 13 accessible over SSH |
@@ -87,9 +87,11 @@ sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf
 
 **Compiler options.** With `TINYCC_HOST` unset, `tinycc` uses `nvidia/cuda:13.0.3-devel-ubuntu24.04` through a local container runtime. `cuda-shim/build/container-runtime.sh` picks Apple's `container` when it is installed (macOS 26+, `brew install container`, a lightweight VM per container) and Docker otherwise; `CONTAINER_RUNTIME=<command>` forces one. Both take the same invocation. The container compiles device code only and requires no GPU access or NVIDIA container runtime. To use an SSH compiler host, set `TINYCC_HOST=user@linux-box` before installation or the build; use `TINYCC_KEY` if an explicit SSH identity is required. The published benchmark builds used the SSH path.
 
-**Fetched dependencies.** `setup.sh deps` obtains NVIDIA headers at commit `81fe4fb` (release 570.86.16), hash-pinned GSP firmware 570.144 and CUDA Toolkit headers. Toolkit headers come from the configured Linux host, the CUDA image through whichever container runtime is in use, or `CUDA_INCLUDE_SRC`. These dependencies are not committed to this repository. The header and firmware versions are intentionally different and have been validated together on the test GPU.
+**Fetched dependencies.** `setup.sh deps` obtains NVIDIA headers at commit `81fe4fb` (release 570.86.16), six hash-pinned GSP firmware images for 570.144 (Ampere boots from the VBIOS and adds `booter_load`, `booter_unload` and its own `bootloader` to Blackwell's `fmc` and `bootloader`) and CUDA Toolkit headers. Toolkit headers come from the configured Linux host, the CUDA image through whichever container runtime is in use, or `CUDA_INCLUDE_SRC`. These dependencies are not committed to this repository. The header and firmware versions are intentionally different and have been validated together on the test GPU.
 
 **Optional development dependencies.** Some offline reference tests and recovery tools use the tinygrad checkouts and Python environment described in [env.sh](env.sh). These are separate from the application build prerequisites.
+
+**Two architectures.** `TINYCC_ARCH=sm_86` selects the Ampere device compile (`sm_120a`, the default, is Blackwell); nothing else does. The driver tells the two apart from the chip itself: VBIOS falcon boot, QMD v3 descriptors, MMU v2 page tables and the Ampere engine classes on a GA10x, the FSP chain of trust, QMD v5 and MMU v3 on a GB20x. The 3060's own numbers and its recorded boot are in [docs/bench/ampere-3060-20260917.md](docs/bench/ampere-3060-20260917.md).
 
 ## Measured performance
 
@@ -142,6 +144,7 @@ Speculative throughput depends on prompt content and draft acceptance. Single-st
 Each stage can be run separately from the repository root:
 
 ```sh
+export TINYCC_ARCH=sm_86        # for an Ampere card; leave unset for Blackwell (sm_120a)
 sh setup.sh deps
 sh setup.sh llama
 sh setup.sh sd
@@ -154,6 +157,8 @@ sh setup.sh link
 
 **CUDA archive.** `cuda-shim/build/libggml-cuda.a` and the CUDA-enabled backend registry object are build outputs tied to the pinned llama.cpp source. The build uses `GGML_CUDA_FORCE_MMQ` and `GGML_CUDA_NO_VMM`; graph support is added explicitly above. `JOBS` controls compilation parallelism. For SSH builds, synchronise `llama.cpp/ggml/` to the location used by `TINYCC_GGML_LINUX` (default `ggml` on the remote host) before compiling. Docker builds mount the local tree directly.
 
+**One archive per architecture.** `libggml-cuda.<arch>.a` is kept per architecture and the plain `libggml-cuda.a` is a symlink to whichever the tree links against, so `ls -l` answers which one that is and a build for a second card cannot destroy the first card's. The shim's own kernels (`libtinycudart/copy1d.cu`, `copy2d.cu`, `libtinycublas/gemm.cu`) are committed as `<name>.sm_86.cubin` and `<name>.sm_120.cubin` with the same symlink convention.
+
 `TINYCC_REUSE_FATBIN=1` reuses device fatbins left in `/tmp` for a host-only rebuild. Use it only when the GPU source and device compilation settings are unchanged. The runtime's copy kernels and cuBLAS-compatible GEMM kernel ship as committed cubins; their source files record the compilation commands.
 
 **Application linking.** llama.cpp first builds as a CPU-only static tree in `build-null`. The link scripts add the CUDA backend, compatibility libraries and LLVM demangler. The resulting `*-null` binaries use the driver's null device until `TINYNV_SOCKET` selects a live TinyGPU server. The suffix does not mean they are restricted to offline execution.
@@ -162,7 +167,7 @@ sh setup.sh link
 
 ## Run and operate
 
-Hardware access follows one sequence: **read-only preflight → acquire the lock → run one GPU process → release the lock**, leaving firmware resident and the card idle. Concurrent clients can hang this setup. Use the supplied runners to coordinate access.
+Hardware access follows one sequence: **read-only preflight → acquire the lock → run one GPU process → release the lock**, leaving firmware resident and the card idle on a Blackwell card. On an Ampere card the driver leaves the card cold instead - GSP-RM told to unload and halted, then `booter_unload` tearing its write-protected region down - so the next open boots the recorded cold path and never resets a warm card (`TINYNV_UNLOAD=0` keeps the firmware resident; docs/bench/ampere-3060-20260917.md says why the reset path is not trusted there). Concurrent clients can hang this setup. Use the supplied runners to coordinate access.
 
 Power the laptop from its own adapter. The project observed Thunderbolt re-enumeration during heavy Metal workloads when the enclosure also supplied laptop power; the same workloads did not reproduce it with the separate adapter. Coordinate jobs that allocate more than approximately 20 GB of host or Apple-GPU memory with whoever owns the GPU lock.
 
@@ -179,7 +184,7 @@ sh tools/nv_shim_step.sh A simple models/Qwen3.8-27B-UD-Q4_K_M.gguf 96 'Explain 
 sh tools/nv_shim_step.sh A spec models/Qwen3.8-27B-UD-Q4_K_M.gguf models/MTP/mtp-Qwen3.8-27B-Q4_0.gguf 128 4
 ```
 
-The runner prints the actual driver settings and build ID, tracks abnormal exits and releases its lock. `BIN` selects an alternate binary directory; `DRY=1` uses the null device for host-path diagnostics, not output validation. `QUIESCE=1` requests a cold stop. The `tinynv-smi` tool in `cuda-shim/build/shim/nv/` reads published temperature, power and clock data without opening the GPU.
+The runner prints the actual driver settings and build ID, tracks abnormal exits and releases its lock. `BIN` selects an alternate binary directory; `DRY=1` uses the null device for host-path diagnostics, not output validation. `QUIESCE=1` requests a cold stop, and on the Ampere card in the Thunderbolt enclosure it is the protocol on every step. The driver also leaves the card cold itself and holds the PCIe link at Gen3 (see docs/handoff-2026-09-21.md: this enclosure does not hold Gen4, and the firmware's retrain to it is what cleared the card's configuration); the quiesce's reset retrains the link to Gen1 and the next boot brings it back to Gen3, so it costs its ten seconds and nothing else. The `tinynv-smi` tool in `cuda-shim/build/shim/nv/` reads published temperature, power and clock data without opening the GPU.
 
 ### Serve an OpenAI-compatible API
 

@@ -67,7 +67,14 @@ static int start_up(void) {
   dev.mmio.size = REGS;
   dev.vram_size = VRAM;
   dev.large_bar = 0;        // the card this driver runs on, so the page tables are reserved low
-  dev.mmu_ver = 3;
+  // BOTH GENERATIONS, because the memory manager is the same code for either and only the entry encoding differs.
+  // This was 3, so every check below described the tree a Blackwell card builds and none of them described the tree an
+  // Ampere card builds - which is where the allocator refused every mapping on a 3060 with "already mapped" about an
+  // address that was free.
+  {
+    const char *v = getenv("TINYNV_TEST_MMU_VER");
+    dev.mmu_ver = (v && *v == '2') ? 2 : 3;
+  }
   dev.pci = &stub_pci;
   return tinynv_mm_init(&mm, &dev);
 }

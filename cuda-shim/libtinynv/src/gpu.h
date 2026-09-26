@@ -36,6 +36,14 @@ int tinynv_gpu_init_sw(tinynv_gpu_t *g);
 // Start the firmware: the chain of trust, then waiting for GSP-RM to say it is up. This talks to the GPU.
 int tinynv_gpu_init_hw(tinynv_gpu_t *g);
 
+// Both halves, and on a live vbios-path card up to three attempts: a boot whose start-up notice never comes because
+// the card's configuration was cleared under the firmware is torn down (falcon reset, FWSEC-SB, booter_unload) and
+// made again from the software init on. What device_boot calls; the tests call the halves.
+int tinynv_gpu_boot_firmware(tinynv_gpu_t *g);
+
+// Leave the card the way NVIDIA's driver does: GSP-RM told, halted, and its region torn down. tinynv_gpu_close does
+// this first unless TINYNV_UNLOAD=0. Returns 0 when there was nothing to unload or it succeeded.
+int tinynv_gpu_unload(tinynv_gpu_t *g);
 void tinynv_gpu_close(tinynv_gpu_t *g);
 
 #endif

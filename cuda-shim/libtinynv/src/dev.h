@@ -12,7 +12,16 @@ typedef struct {
   char fw_name[16];     // the firmware directory the boot images come from
   int fmc_boot;         // Blackwell and later: boot through the FSP chain of trust rather than the VBIOS
   int mmu_ver;          // page table generation, 2 or 3
+  uint32_t class_gpfifo, class_compute, class_dma_copy; // the engine classes this architecture answers to
   int wpr2_was_up;      // firmware was already resident when we arrived, so the chip was reset
+  uint32_t wpr2_hi_now; // the region register as last read before the falcon boot: on arrival, or again after the reset
+  // What the card's config space said while it was known good, so the driver can put it back if it is cleared under a
+  // running firmware. Taken on a live card only: reading these is six operations the recorded boot never made.
+  int cfg_saved;
+  uint32_t pcie_cap;         // offset of the PCI Express capability in config space, 0 if not found (live cards only)
+  unsigned windows_restored; // how many times this open found its configuration cleared and put it back
+  double windows_restored_at; // when the last of those was, so a wait can give up sooner than its full timeout
+  uint32_t cfg_cmd, cfg_bars[6];
   int large_bar;        // the whole of video memory is cpu visible
   uint64_t vram_size;
 } tinynv_dev_t;
@@ -23,5 +32,13 @@ void tinynv_dev_quiesce(tinynv_dev_t *d);
 uint32_t tinynv_rd32(tinynv_dev_t *d, uint64_t off);
 void tinynv_wr32(tinynv_dev_t *d, uint64_t off, uint32_t v);
 int tinynv_wait_reg(tinynv_dev_t *d, uint64_t off, uint32_t mask, uint32_t want, int timeout_ms, const char *what);
+// Put the address windows and the command register back if they have been cleared under us. Returns 1 if it had to.
+int tinynv_dev_restore_decode(tinynv_dev_t *d);
+// Reset the function through the backend and bring it back cold: configuration restored from the snapshot taken at
+// open, boot firmware waited for, write-protected region confirmed down. What a boot that did not finish is undone with.
+int tinynv_dev_reset_cold(tinynv_dev_t *d);
+// The link as config space reports it: generation (1..5, 0 when unknown) and lane count. Cheap, and the one number
+// that says whether the card is on the link it was enumerated on or on the one it fell back to.
+void tinynv_dev_link(tinynv_dev_t *d, unsigned *gen, unsigned *width);
 
 #endif
