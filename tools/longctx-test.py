@@ -5,7 +5,7 @@ are in them are asked one at a time against a running llama-server, and the answ
     python tools/longctx-test.py --url http://127.0.0.1:8090 --label lfm-3060 --files tools/longctx-files.txt --budget 115000 --out logs/longctx-lfm-3060.json
 
 The prompt is the same preamble and the same files in the same order every time, cut at --budget tokens as the server
-tokenizes them, so every method and every side sees the same context. Each question is one request with cache_prompt:
+tokenizes them, so every method and every side sees the same context. Each question is one chat request with cache_prompt, thinking off where the template allows:
 the first pays for the whole context (its time to first token is the prefill), the rest pay for their own tokens only,
 which is what an agent's follow-up questions cost. Per question: prompt tokens, tokens processed, time to first token,
 generation tokens/s, wall time, and the answer verbatim. Nothing here judges; the judge reads the answers against the code.
@@ -38,7 +38,7 @@ def main():
     ap.add_argument("--label", default="run")
     ap.add_argument("--files", required=True, help="one path per line, in the order they fill the context")
     ap.add_argument("--budget", type=int, default=115000, help="tokens of source to include")
-    ap.add_argument("--max-answer", type=int, default=160)
+    ap.add_argument("--max-answer", type=int, default=1000)
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     url = a.url.rstrip("/")
@@ -67,25 +67,38 @@ def main():
     for p in placed: print(f"  {p['start']:7d} {p['tokens']:6d} {p['path']}{' (cut)' if p['cut'] else ''}", flush=True)
     rows = []; t_all = time.time()
     for i, q in enumerate(QUESTIONS, 1):
-        prompt = preamble + corpus + f"\n\n## Question {i}\n{q}\n\n## Answer\n"
-        total = ntok(url, prompt)
-        body = {"prompt": prompt, "n_predict": a.max_answer, "temperature": 0, "cache_prompt": True, "stream": True,
-                "stop": ["\n## Question", "\n\n## "]}
-        t0 = time.time(); ttft = None; text = ""; timings = {}
-        with post(url, "/completion", body) as r:
+        # The model's own chat template, through the OpenAI-style endpoint: the source is the user message and the question
+        # is its last paragraph, so the prefix up to the question is identical every time and the server's cache reuses it.
+        # Thinking is switched off where the template has the switch; where it does not, the server splits what the model
+        # thinks into reasoning_content and the judge reads content. max_tokens leaves room for either.
+        user = corpus + f"\n\n## Question {i}\n{q}\n"
+        total = ntok(url, preamble + user)
+        body = {"messages": [{"role": "system", "content": preamble.strip()}, {"role": "user", "content": user}],
+                "max_tokens": a.max_answer, "temperature": 0, "cache_prompt": True, "stream": True,
+                "chat_template_kwargs": {"enable_thinking": False}}
+        t0 = time.time(); ttft = None; text = ""; think = ""; timings = {}; finish = None
+        with post(url, "/v1/chat/completions", body) as r:
             for raw in r:
                 line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data: "): continue
+                if not line.startswith("data: ") or line == "data: [DONE]": continue
                 ev = json.loads(line[6:])
-                if ttft is None and ev.get("content"): ttft = time.time() - t0
-                text += ev.get("content", "")
+                for ch in ev.get("choices", []):
+                    d = ch.get("delta", {}) or {}
+                    if d.get("content"):
+                        if ttft is None: ttft = time.time() - t0
+                        text += d["content"]
+                    if d.get("reasoning_content"):
+                        if ttft is None: ttft = time.time() - t0
+                        think += d["reasoning_content"]
+                    if ch.get("finish_reason"): finish = ch["finish_reason"]
                 if ev.get("timings"): timings = ev["timings"]
         wall = time.time() - t0
         pn = timings.get("prompt_n", -1); pms = timings.get("prompt_ms", 0.0); gn = timings.get("predicted_n", -1); gms = timings.get("predicted_ms", 0.0)
         rows.append({"q": i, "question": q, "prompt_tokens": total, "processed": pn, "ttft_s": round(ttft or 0, 2),
                      "prompt_tps": round(pn / pms * 1000, 1) if pms else None, "gen_tokens": gn,
-                     "gen_tps": round(gn / gms * 1000, 2) if gms else None, "wall_s": round(wall, 2), "answer": text.strip()})
-        print(f"q{i:2d}: prompt {total:6d} processed {pn:6d} ttft {ttft or 0:7.1f}s gen {gn} @ {rows[-1]['gen_tps']} t/s wall {wall:7.1f}s", flush=True)
+                     "gen_tps": round(gn / gms * 1000, 2) if gms else None, "wall_s": round(wall, 2), "finish": finish,
+                     "answer": text.strip(), "thinking_chars": len(think), "thinking": think.strip()[:4000]})
+        print(f"q{i:2d}: prompt {total:6d} processed {pn:6d} ttft {ttft or 0:7.1f}s gen {gn} @ {rows[-1]['gen_tps']} t/s wall {wall:7.1f}s finish {finish} thinking {len(think)} chars", flush=True)
         print("     " + text.strip().replace("\n", "\n     ")[:600], flush=True)
     total_s = time.time() - t_all
     print(f"total wall time for {len(QUESTIONS)} questions: {total_s:.1f} s ({a.label}); prefill {rows[0]['ttft_s']} s for {rows[0]['processed']} tokens", flush=True)
@@ -93,6 +106,6 @@ def main():
         with open(a.out, "w") as f: json.dump({"label": a.label, "context_tokens": used, "files": placed, "questions": rows, "total_s": round(total_s, 2), "args": vars(a)}, f, indent=1)
         with open(a.out.rsplit(".", 1)[0] + ".answers.md", "w") as f:
             f.write(f"# {a.label}: {used} tokens of context, {total_s:.1f} s\n\n")
-            for r in rows: f.write(f"## Q{r['q']}: {r['question']}\n\n{r['answer']}\n\n(ttft {r['ttft_s']} s, {r['gen_tokens']} tokens at {r['gen_tps']} t/s, wall {r['wall_s']} s)\n\n")
+            for r in rows: f.write(f"## Q{r['q']}: {r['question']}\n\n{r['answer']}\n\n(ttft {r['ttft_s']} s, {r['gen_tokens']} tokens at {r['gen_tps']} t/s, wall {r['wall_s']} s, finish {r['finish']}, {r['thinking_chars']} chars of thinking)\n\n")
 
 if __name__ == "__main__": main()
