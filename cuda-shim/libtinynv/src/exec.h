@@ -190,7 +190,20 @@ typedef struct {
   // every write issued before it, so two batches going out together need one read rather than two.
   int defer_ring;
   tinynv_vmap_t cmd;     // command buffers, written here and read by the engine over the bus
-  tinynv_vmap_t stage;   // where host memory passes through on its way to the card and back
+  // Where host memory passes through on its way to the card and back. TWO, so the processor can fill one while the
+  // copy engine is still reading the other: with a single buffer every chunk had to drain the device before the next
+  // memcpy could start, and that serialisation was measured at 12% of the bulk upload path (0.853 s of 7.082 s on a
+  // 35B MoE prefill, 2026-09-20). stage[0] is the one everything other than the upload rotation uses.
+  tinynv_vmap_t stage[2];
+  // The timeline value a copy still reading that buffer will reach, or 0 if nothing is. Lives here rather than on the
+  // upload's stack because the NEXT call reuses the same two buffers and has to know what is still in flight in them.
+  uint64_t stage_pend[2];
+  int stage_single;   // TINYNV_STAGE_SINGLE=1 restores one buffer and a full drain per chunk, for measuring against
+  // How often claiming a staging buffer actually has to WAIT, split by who is asking: the upload rotation, and the
+  // four outside callers that all share buffer 0 (download, zero, the fill in tinynv.c, the kernel-download path).
+  // The question this answers is whether sharing one buffer between them costs anything now that uploads leave
+  // copies in flight, or whether they simply never collide.
+  uint64_t claim_up_n, claim_up_blocked, claim_ext_n, claim_ext_blocked;
   tinynv_vmap_t slm;     // shader local memory, which has to exist before any kernel that uses a stack
   uint64_t timeline;     // the last value asked for on any queue; what a caller means by "everything so far"
 
@@ -277,6 +290,10 @@ typedef struct {
   // How many uploads took each path. Without these, "the knob did nothing" and "the knob was never in effect" are the
   // same observation.
   uint64_t inline_n, inline_bytes, upload_ce_n, inline_batches_saved, inline_forced_n, inline_rode_flush_n;
+  // What the bulk upload path actually spends, and - the question everything else waits on - whether the compute
+  // engine was ever busy at the moment a bulk copy went out. If it never was, no channel topology can overlap them.
+  uint64_t up_calls, up_chunks, up_busy_n, up_idle_n, up_hist[8], up_load_chunks;
+  double up_memcpy_s, up_submit_s, up_wait_s;
   // Small uploads waiting to ride in the next batch rather than each taking a batch, a submit and an idle of their
   // own. Session A measured the round trip at ~50 us a copy and six copies a token; the bytes are copied out of the
   // caller's buffer here, so the caller may reuse it the moment the call returns and nothing has to reach the card
@@ -544,6 +561,9 @@ int tinynv_exec_reached(tinynv_exec_t *ex, uint64_t value);
 int tinynv_exec_idle(tinynv_exec_t *ex);
 int tinynv_exec_needs_wait(const tinynv_exec_t *ex);
 void tinynv_exec_set_internal(tinynv_exec_t *ex, int on);
+// Wait until nothing is reading staging buffer 0, so the processor may write it. Anything that fills the stage from
+// the host - a memset, a kernel that writes into it - has to call this first now that uploads leave copies in flight.
+int tinynv_exec_stage_claim(tinynv_exec_t *ex);
 uint64_t tinynv_exec_stage_va(const tinynv_exec_t *ex);
 void *tinynv_exec_stage_host(const tinynv_exec_t *ex);
 size_t tinynv_exec_stage_bytes(void);

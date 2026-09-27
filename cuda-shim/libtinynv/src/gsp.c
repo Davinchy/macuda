@@ -481,7 +481,7 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
 // answer rather than for an event.
 static uint32_t next_handle(tinynv_gsp_t *gsp) { return gsp->next_handle++; }
 
-static int rpc_call(tinynv_gpu_t *g, uint32_t func, const void *head, size_t head_len, void *params, size_t params_len,
+static int rpc_call(tinynv_gpu_t *g, uint32_t func, void *head, size_t head_len, void *params, size_t params_len,
                     const char *what) {
   // A previous call gave up on its reply. Clear the queue before asking anything else, because a reply carries the
   // function it answers and nothing that identifies the request: a late reply to one control is indistinguishable from
@@ -512,6 +512,11 @@ static int rpc_call(tinynv_gpu_t *g, uint32_t func, const void *head, size_t hea
   if (rpc_wait(g, func, 10.0, what, &reply, &reply_len)) return -1;
   // gsp-rm answers with the request echoed back and the parameters filled in, so take them from where they were sent
   if (params && params_len && reply_len >= head_len + params_len) memcpy(params, reply + head_len, params_len);
+  // The echoed header carries RM's OWN status, and it used to be freed here with the rest of the reply. That status is
+  // the only thing on the wire that says WHY a call was refused: the rpc envelope's result stays 0, because the rpc
+  // itself worked perfectly - it delivered a refusal. Six wrong guesses at a refused copy object were bought with this
+  // silence, and the answer had been arriving in this buffer the whole time.
+  if (reply_len >= head_len) memcpy(head, reply, head_len);
   free(reply);
   return 0;
 }
@@ -543,6 +548,12 @@ static int rm_alloc_as(tinynv_gpu_t *g, uint32_t client, uint32_t parent, uint32
                            "refuse this with a bare status and no reason", want, client);
   }
   if (rpc_call(g, TINYNV_MSG_FUNCTION_GSP_RM_ALLOC, &head, sizeof(head), params, params_len, "object allocation")) return -1;
+  // Said, not enforced. A nonzero status here has always been ignored, so some allocation on the boot path may well be
+  // returning one and working anyway; making it fatal today would break a boot that currently comes up, and finding
+  // that out costs a card window. So this reports and carries on, and the caller's own failure - if there is one - is
+  // still the thing that stops the run.
+  if (head.status)
+    fprintf(stderr, "tinynv: gsp-rm returned status %#x allocating class %#x under parent %#x\n", head.status, cls, parent);
   uint32_t made = cls == TINYNV_CLASS_ROOT ? client : head.hObject;
   // Recorded here because this is the only place an object comes into existence, and the record has to be complete
   // before any free is ever sent - a guest that dies mid-kernel sends nothing at all, so teardown needs it whether or
@@ -739,7 +750,12 @@ static int rm_control_as(tinynv_gpu_t *g, uint32_t client, uint32_t object, uint
   head.hObject = object;
   head.cmd = cmd;
   head.paramsSize = (uint32_t)params_len;
-  return rpc_call(g, TINYNV_MSG_FUNCTION_GSP_RM_CONTROL, &head, sizeof(head), params, params_len, "object control call");
+  if (rpc_call(g, TINYNV_MSG_FUNCTION_GSP_RM_CONTROL, &head, sizeof(head), params, params_len, "object control call"))
+    return -1;
+  g->gsp.last_ctrl_status = head.status;
+  if (head.status)  // reported, not enforced, for the reason given in rm_alloc_as
+    fprintf(stderr, "tinynv: gsp-rm returned status %#x for control %#x on object %#x\n", head.status, cmd, object);
+  return 0;
 }
 
 static int rm_control(tinynv_gpu_t *g, uint32_t object, uint32_t cmd, void *params, size_t params_len) {
@@ -1075,7 +1091,15 @@ static int fill_channel_state(tinynv_gpu_t *g, uint32_t client, tinynv_gpfifo_al
 
   // an ordinary client's channel also names where its error block and its progress block live
   if (client != TINYNV_RM_PRIV_ROOT && p->hObjectError) {
-    p->errorNotifierMem = (tinynv_memory_desc_t){.base = 0, .size = 0xecc, .addressSpace = 0};
+    // Truthful, and it has never been. addressSpace 0 is ADDR_UNKNOWN and the base was zero, while every other
+    // descriptor on these lines correctly says 2 (ADDR_FBMEM). RM asserts the error notifier lives in video memory
+    // (kchannelUpdateNotifierMem: NV_ASSERT_OR_RETURN(addressSpace == ADDR_FBMEM, NV_ERR_INVALID_STATE)) and so
+    // every GET_WORK_SUBMIT_TOKEN this driver has ever issued came back 0x40 - AFTER writing the token, which is the
+    // only reason the card works at all. hObjectError already holds the notifier's physical address.
+    // The real size is 48 bytes: three NvNotification entries of 16 (NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1),
+    // which is also what NVIDIA's own scrubber channel declares. 0xecc was invented.
+    p->errorNotifierMem = (tinynv_memory_desc_t){.base = p->hObjectError, .size = 48, .addressSpace = 2};
+    p->internalFlags |= (3u << 2);   // ERROR_NOTIFIER_TYPE = MEMORY (field 3:2), else RM sees UNKNOWN and asserts
     p->userdMem = (tinynv_memory_desc_t){.base = p->hUserdMemory[0] + p->userdOffset[0], .size = 0x400, .addressSpace = 2};
   }
   if (ramfc_out) *ramfc_out = ramfc;
@@ -1243,6 +1267,52 @@ int tinynv_gsp_open_client(tinynv_gpu_t *g) {
   grp.engineType = TINYNV_ENGINE_TYPE_GRAPHICS;
   if (rm_alloc_as(g, cl, gsp->user_device, 0, TINYNV_CLASS_CHANNEL_GROUP, &grp, sizeof(grp), &gsp->user_group)) return -1;
 
+  // TINYNV_CE_GROUP=<engine type>: ask GSP-RM for a SECOND channel group, on a copy engine of its own, and report
+  // what it says. Nothing is scheduled on it and nothing uses it - this allocates and stops, because the question
+  // it answers is worth 20 lines before anyone writes 120.
+  //
+  // WHY: every copy this driver issues goes out on gsp->copy_q, which lives in the graphics group above. The engine
+  // table says CE0 reports numPbdmas=1 with pbdmaIds [0,1] - the same PBDMA 0 that GR0 uses - and sits on runlist 0
+  // with it, so a copy and a kernel cannot be in flight at once. CE1 reports runlist 1 and PBDMAs [8,9], which GR0
+  // never touches. The expert stream measures 7.03 GiB/s against a 7.33 GiB/s PCIe 4.0 x4 ceiling, so it cannot be
+  // made faster - only overlapped, and only if it can leave on a runlist of its own.
+  //
+  // This is NOT the 2026-09-18 experiment. That one set RUNQUEUE_ONE on a channel whose engine reports one PBDMA,
+  // asking for a hardware lane that does not exist, and crashed two different ways (see the engine-table comment
+  // above). This asks for a different ENGINE, which genuinely has its own PBDMA and its own runlist.
+  {
+    const char *ce = getenv("TINYNV_CE_GROUP");
+    if (ce) {
+      uint32_t et = (uint32_t)strtoul(ce, NULL, 0), rl = 0xffffffffu;
+      for (uint32_t i = 0; i < gsp->nengines; i++) if (gsp->engines[i] == et) rl = gsp->runlists[i];
+      if (rl == 0xffffffffu) {
+        fprintf(stderr, "tinynv: CE group probe: no engine of type 0x%x in the table; not asking\n", et);
+      } else {
+        tinynv_channel_group_alloc_t g2;
+        memset(&g2, 0, sizeof(g2));
+        g2.engineType = et;
+        uint32_t h = 0;
+        int rc = rm_alloc_as(g, cl, gsp->user_device, 0, TINYNV_CLASS_CHANNEL_GROUP, &g2, sizeof(g2), &h);
+        fprintf(stderr, "tinynv: CE group probe: engineType 0x%x (runlist %u) -> rc %d, handle 0x%x\n", et, rl, rc, h);
+        if (!rc) {
+          gsp->ce_group = h; gsp->ce_runlist = rl; gsp->ce_engine = et;
+          tinynv_ctxshare_alloc_t cs;
+          memset(&cs, 0, sizeof(cs));
+          cs.hVASpace = gsp->user_vaspace;
+          // SYNC, not ASYNC - and this one flag was the whole refusal. RM allows an ASYNC subcontext only on GR or on a
+          // GRCE (kfifoValidateEngineAndSubctxType_GP102: "ASYNC Subcontext only supported on GR/GRCE"), and a CE counts
+          // as a GRCE only when it shares GR0's runlist AND a PBDMA (_kfifoIsValidCETag_GP102). This CE is on a runlist
+          // of its own - that separation is the entire point of allocating it - so it is not a GRCE and never can be.
+          // The flag was copied from the graphics group's share below, where it is correct. Here it made GSP-RM refuse
+          // the DMA_COPY object on an otherwise perfectly good channel, with a bare status and no reason.
+          cs.flags = TINYNV_CTXSHARE_FLAGS_SUBCONTEXT_SYNC;
+          if (rm_alloc_as(g, cl, h, 0, TINYNV_CLASS_CONTEXT_SHARE, &cs, sizeof(cs), &gsp->ce_ctxshare))
+            fprintf(stderr, "tinynv: CE group probe: context share FAILED\n");
+        }
+      }
+    }
+  }
+
   // The scheduler's timeslice for this group, when asked for.
   //
   // A's raw columns put the token boundary's remaining ~700 us in the card scheduling two channels against each
@@ -1329,18 +1399,49 @@ static int promote(tinynv_gpu_t *g, uint32_t client, uint32_t object, tinynv_vma
 
 // One channel work is submitted through: its ring, the block the hardware writes its progress into just above the ring,
 // and the object that says what kind of work it runs.
-static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32_t entries, int compute) {
+// group/runlist are parameters because a channel's ENGINE is decided by the group it is allocated in, and its
+// doorbell must name that engine's runlist. Everything used to assume the graphics group and gsp->channel_runlist.
+// The error notifier is FORTY-EIGHT BYTES of hardware: three NvNotification entries of 16
+// (NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1 - ERROR, WORK_SUBMIT_TOKEN, KEY_ROTATION_STATUS), which is what
+// NVIDIA's own scrubber channel declares and what this driver already tells GSP-RM in fill_channel_state.
+//
+// It is allocated at 48 MB anyway, a million times over, and that is not just waste: it comes from the same
+// bottom-up allocator that serves the 256 MB processor-visible window, so two channels put the cursor near 232 MB
+// and a third pushed it to 280 MB, past the window, which is what made the CE1 probe fail (2026-09-20).
+//
+// Shrinking it to a page was tried and REVERTED the same day, because it does not fail - it exposes something else:
+//   fill_channel_state failed: mapping 0x1020011000+0x1000: 0x1020011000 is already mapped
+// The boot-memory allocator and the general VA allocator hand out overlapping addresses, and the only reason that
+// has never been seen is that a 48 MB hole sat between them. That is a real defect in the address space, it is
+// worth fixing on its own terms, and it is not a side quest of a notifier resize. Until then the waste stays,
+// documented, rather than a landmine relocated.
+#define TINYNV_NOTIFIER_BYTES (48ull << 20)
+
+static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32_t entries, int compute,
+                     uint32_t group, uint32_t runlist, uint32_t ctxshare, uint32_t engine, uint64_t notifier_bytes) {
   tinynv_gsp_t *gsp = &g->gsp;
   const uint32_t cl = TINYNV_RM_USER_ROOT;
 
-  // where the engine reports faults, and in enough detail that it is large
-  if (tinynv_mm_alloc_buffer(&g->mm, 48ull << 20, 0, 0, 1, 0, 0, &q->notifier)) return -1;
+  // Where the engine reports faults. Nothing in this driver has ever read a byte of it, and its size is a parameter
+  // only so the cost is visible at the call sites - see TINYNV_NOTIFIER_BYTES for what it should be and why it
+  // is not that yet.
+  if (tinynv_mm_alloc_buffer(&g->mm, notifier_bytes, 0, 0, 1, 0, 0, &q->notifier))
+    return tinynv_fail("a queue's %llu MB error notifier could not be allocated - the reserve is exhausted, not RM "
+                       "refusing", (unsigned long long)(notifier_bytes >> 20));
 
   tinynv_gpfifo_alloc_t p;
   memset(&p, 0, sizeof(p));
   p.gpFifoOffset = gsp->fifo_mem.va + offset;
   p.gpFifoEntries = entries;
+  // A blocked semaphore acquire should end in a reported error, not a machine nobody can get back. Without this bit
+  // RM leaves PBDMA_ACQUIRE_TIMEOUT_FALSE and a mis-ordered acquire waits forever: the host spins at 100% CPU, the
+  // process has to be killed, and the card comes back only after a physical replug - which is exactly how the
+  // 2026-09-18 runqueue-split attempt ended. With it, the same mistake costs about two seconds and an RC error.
+  p.flags |= (1u << 27);   // NVOS04_FLAGS_CHANNEL_PBDMA_ACQUIRE_TIMEOUT 27:27 = TRUE
   // these handles are physical addresses: that is what the allocator hands back for memory the driver owns outright
+  if (q->notifier.ranges[0].paddr > 0xffffffffull)
+    return tinynv_fail("the error notifier is at %#llx, above what this field can carry in 32 bits",
+                       (unsigned long long)q->notifier.ranges[0].paddr);
   p.hObjectError = (uint32_t)q->notifier.ranges[0].paddr;
   p.hObjectBuffer = (uint32_t)gsp->fifo_mem.ranges[0].paddr;
   p.hUserdMemory[0] = (uint32_t)gsp->fifo_mem.ranges[0].paddr;
@@ -1356,8 +1457,15 @@ static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32
   // TINYNV_SPLIT_CTXSHARE=1 gives the copy channel its own, allocated with the same SUBCONTEXT_ASYNC flag. Off by
   // default and it is a guess, not a diagnosis: two channels in separate async subcontexts SHOULD be able to hold the
   // engine together where one subcontext cannot, but nothing here has measured that and no recording contains it.
-  p.hContextShare = gsp->user_ctxshare;
-  if (!compute && gsp->copy_ctxshare) p.hContextShare = gsp->copy_ctxshare;
+  // The context share MUST belong to the same channel group as the channel. Passing one from another group is
+  // rejected outright - which is how the first CE1 attempt failed on 2026-09-20: the group was granted, and then
+  // the channel in it was handed the graphics group's share.
+  // NVIDIA's kernel_channel.c (kchannelConstruct_IMPL, the per-runlist-CHRAM branch): if the channel names an
+  // engine it MUST equal the TSG's, otherwise the channel inherits the TSG's. Left at 0 the graphics path has
+  // always worked; a CE group needs it stated, because zero does not resolve to "unspecified" here.
+  if (engine) p.engineType = engine;
+  p.hContextShare = ctxshare ? ctxshare : gsp->user_ctxshare;
+  if (!ctxshare && !compute && gsp->copy_ctxshare) p.hContextShare = gsp->copy_ctxshare;
   // A different axis from the ctxshare guess above, from NVIDIA's own header rather than a hypothesis about our
   // code: alloc_channel.h's NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE (bit 4:4, GP10x+) "specifies which runqueue the
   // allocated channel will be executed on in a TSG. Channels on different runqueues within a TSG may be able to
@@ -1407,8 +1515,14 @@ static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32
       p.flags |= (1u << 4); // NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE_ONE, field 4:4
       fprintf(stderr, "libtinynv: the copy channel was put on runqueue ONE (was asked for)\n");
     } }
-  if (fill_channel_state(g, cl, &p, NULL, NULL)) return -1;
-  if (rm_alloc_as(g, cl, gsp->user_group, 0, g->dev.class_gpfifo, &p, sizeof(p), &q->channel)) return -1;
+  // The inner failure is printed rather than replaced: tinynv_fail writes into one buffer, so wrapping it here threw
+  // away the message that said what actually went wrong and left only the name of the caller.
+  if (fill_channel_state(g, cl, &p, NULL, NULL)) {
+    fprintf(stderr, "tinynv: fill_channel_state failed for group %#x: %s\n", group, tinynv_last_error());
+    return -1;
+  }
+  if (rm_alloc_as(g, cl, group, 0, g->dev.class_gpfifo, &p, sizeof(p), &q->channel))
+    return tinynv_fail("GSP-RM refused a GPFIFO channel in group %#x (engine %#x, runlist %u)", group, engine, runlist);
 
   if (compute) {
     if (rm_alloc_as(g, cl, q->channel, 0, g->dev.class_compute, NULL, 0, &q->object)) return -1;
@@ -1439,7 +1553,21 @@ static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32
     dbg.hAppClient = cl;
     dbg.hClass3dObject = q->object;
     if (rm_alloc_as(g, cl, gsp->user_device, 0, TINYNV_CLASS_DEBUGGER, &dbg, sizeof(dbg), &gsp->user_debugger)) return -1;
-  } else if (rm_alloc_as(g, cl, q->channel, 0, g->dev.class_dma_copy, NULL, 0, &q->object)) return -1;
+  } else {
+    // Only stated when the queue names an engine: the graphics-group copy channel has always allocated this object
+    // with NULL params and works, and changing that path is a risk with nothing to gain.
+    tinynv_dma_copy_alloc_t ce;
+    memset(&ce, 0, sizeof(ce));
+    ce.version = TINYNV_DMA_COPY_PARAMS_VERSION_1;
+    ce.engineType = engine;
+    // The copy class is the chip's own (dev.c chose it); TINYNV_CE_CLASS overrides it for an engine-named channel
+    // only: BLACKWELL_DMA_COPY_B (0xcab5) is what the graphics-group channel uses; _A is 0xc9b5. Which classes a
+    // given CE advertises is not documented anywhere we have, so it is a knob rather than an assumption.
+    uint32_t cls = g->dev.class_dma_copy;
+    if (engine) { const char *cs2 = getenv("TINYNV_CE_CLASS"); if (cs2) cls = (uint32_t)strtoul(cs2, NULL, 0); }
+    if (rm_alloc_as(g, cl, q->channel, 0, cls, engine ? &ce : NULL, engine ? sizeof(ce) : 0, &q->object))
+      return tinynv_fail("GSP-RM refused copy class %#x on the channel in group %#x (engine %#x)", cls, group, engine);
+  }
 
   // the token names this channel at the doorbell. gsp-rm fills in only the channel part; the runlist and, on this
   // architecture, an enable bit are the driver's to add.
@@ -1447,7 +1575,26 @@ static int new_queue(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t offset, uint32
   memset(&tok, 0, sizeof(tok));
   tok.workSubmitToken = 0xffffffffu;
   if (rm_control_as(g, cl, q->channel, TINYNV_CTRL_CMD_GET_WORK_SUBMIT_TOKEN, &tok, sizeof(tok))) return -1;
-  q->token = tok.workSubmitToken | (gsp->channel_runlist << 16) | (1u << 30);
+  // The sentinel surviving means RM never wrote a token, and OR-ing it produced a doorbell naming channel 0xfff on
+  // runlist 0x7f - which is not refused by anything, it is simply never fetched, so the ring stops and the host
+  // spins forever. Refusing here turns the worst failure this path has into a sentence.
+  if (tok.workSubmitToken == 0xffffffffu)
+    return tinynv_fail("gsp-rm did not fill in a work submit token for channel %#x (rm status %#x); the doorbell "
+                       "would be invented, and an invented doorbell is never rung by anything real", q->channel,
+                       gsp->last_ctrl_status);
+  if (gsp->last_ctrl_status)
+    fprintf(stderr, "tinynv: gsp-rm answered the work submit token control with status %#x but did fill the token "
+                    "in (%#x) - using it, and that is luck rather than contract\n",
+            gsp->last_ctrl_status, tok.workSubmitToken);
+  // GB202's doorbell is VECTOR 11:0 (the channel id), RUNLIST_ID 22:16 and RUNLIST_DOORBELL 30:30 (gb202/dev_vm.h).
+  // Take ONLY the channel id from RM and place the other two fields here, rather than OR-ing the whole word: it is
+  // not documented whether GSP hands back a bare chid or a complete doorbell, and an OR of two different runlist
+  // ids yields a third that belongs to neither.
+  { uint32_t rm_rl = (tok.workSubmitToken >> 16) & 0x7f;
+    if (rm_rl && rm_rl != runlist)
+      fprintf(stderr, "tinynv: gsp-rm put runlist %u in the token for a channel this driver placed on runlist %u - "
+                      "one of the two is wrong, and the doorbell can only be built from one of them\n", rm_rl, runlist); }
+  q->token = (tok.workSubmitToken & 0xfffu) | (runlist << 16) | (1u << 30);
   q->entries = entries;
   q->ring_va = gsp->fifo_mem.va + offset;
   // The control block sits immediately above the ring - that is what userdOffset told GSP-RM a moment ago - and GPPut is
@@ -1465,8 +1612,25 @@ int tinynv_gsp_init_queues(tinynv_gpu_t *g) {
   // reserve rather than wherever the physical allocator happens to be
   if (tinynv_mm_alloc_buffer(&g->mm, 3ull << 20, 0, 1, 0, 1, 0, &gsp->fifo_mem)) return -1;
 
-  if (new_queue(g, &gsp->compute_q, 0, 0x10000, 1)) return -1;
-  if (new_queue(g, &gsp->copy_q, 0x100000, 0x10000, 0)) return -1;
+  if (new_queue(g, &gsp->compute_q, 0, 0x10000, 1, gsp->user_group, gsp->channel_runlist, 0, 0, TINYNV_NOTIFIER_BYTES)) return -1;
+  if (new_queue(g, &gsp->copy_q, 0x100000, 0x10000, 0, gsp->user_group, gsp->channel_runlist, 0, 0, TINYNV_NOTIFIER_BYTES)) return -1;
+
+  // TINYNV_CE_GROUP: carry the probe one step further - a real CHANNEL in the copy-engine group, with its own
+  // DMA_COPY object, and the group scheduled. Still no traffic: this only answers whether the allocation path
+  // works end to end before anyone writes the routing and the cross-channel ordering that would use it.
+  if (gsp->ce_group) {
+    if (new_queue(g, &gsp->ce_copy_q, 0x200000, 0x10000, 0, gsp->ce_group, gsp->ce_runlist, gsp->ce_ctxshare,
+                  gsp->ce_engine, TINYNV_NOTIFIER_BYTES)) {
+      fprintf(stderr, "tinynv: CE channel probe: FAILED in group 0x%x: %s\n", gsp->ce_group, tinynv_last_error());
+    } else {
+      tinynv_gpfifo_schedule_t cesched;
+      memset(&cesched, 0, sizeof(cesched));
+      cesched.bEnable = 1;
+      int rc = rm_control_as(g, TINYNV_RM_USER_ROOT, gsp->ce_group, TINYNV_CTRL_CMD_GPFIFO_SCHEDULE, &cesched, sizeof(cesched));
+      fprintf(stderr, "tinynv: CE channel probe: channel 0x%x token 0x%x on runlist %u, schedule rc %d\n",
+              gsp->ce_copy_q.channel, gsp->ce_copy_q.token, gsp->ce_runlist, rc);
+    }
+  }
 
   tinynv_gpfifo_schedule_t sched;
   memset(&sched, 0, sizeof(sched));

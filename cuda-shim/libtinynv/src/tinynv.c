@@ -277,8 +277,11 @@ static int device_boot(tinynv_device_t d) {
   d->booted = 1; // from here the card is live and must be put down even if a later stage fails
   atexit(put_the_card_down);
   catch_the_ways_out();
+// Said out loud as well as recorded: tinynv_fail STORES its message and returns -1 without printing, so a failure
+// inside a boot stage used to leave this function with nothing on the terminal at all - and the first symptom was a
+// memcpy to NULL several thousand lines of log later, in a function that was only ever the victim.
 #define BOOT_STAGE(call) do { if (call) { d->boot_failed = 1; snprintf(d->boot_error, sizeof d->boot_error, "%s", tinynv_last_error()); \
-    return tinynv_fail("%s", d->boot_error); } } while (0)
+    fprintf(stderr, "libtinynv: boot stage failed: %s\n", d->boot_error); return tinynv_fail("%s", d->boot_error); } } while (0)
   BOOT_STAGE(tinynv_gpu_boot_firmware(&d->gpu));
   BOOT_STAGE(tinynv_gsp_init_objects(&d->gpu) || tinynv_gsp_init_channel(&d->gpu) || tinynv_gsp_init_gr_context(&d->gpu) ||
              tinynv_gsp_open_client(&d->gpu) || tinynv_gsp_init_queues(&d->gpu));
@@ -714,6 +717,9 @@ static tinynv_status_t download_by_kernel(tinynv_stream_t s, void *dst, uint64_t
     uint64_t blocks = (chunk + per_block - 1) / per_block;
     if (blocks > 0xffffffffull) return tinynv_fail("a %llu byte download needs %llu blocks", (unsigned long long)chunk,
                                                    (unsigned long long)blocks), TINYNV_ERR_INVALID;
+    // The kernel WRITES into the staging buffer, so anything still reading it has to be done first - an upload's
+    // copy can now outlive the call that issued it.
+    if (WITH_LOCK(tinynv_exec_stage_claim(&d->exec))) return TINYNV_ERR_DRIVER;
     // The driver's own launch, not the caller's: marked so the profile does not stamp it as the token's last kernel.
     tinynv_exec_set_internal(&d->exec, 1);
     tinynv_status_t rc = tinynv_launch(s, d->download_kernel, (unsigned)blocks, 1, 1, d->download_block, 1, 1, 0,
@@ -901,12 +907,14 @@ tinynv_status_t tinynv_memset(tinynv_stream_t s, tinynv_devptr_t dst, int v, siz
     // held across the whole fill: the staging buffer holds the pattern, so another caller copying through it between
     // chunks would write its own bytes into the rest of this one
     pthread_mutex_lock(&g_lock);
-    size_t chunk = ex->stage.size < n ? (size_t)ex->stage.size : n;
-    memset(ex->stage.dma.va, v, chunk);
+    size_t chunk = ex->stage[0].size < n ? (size_t)ex->stage[0].size : n;
+    // An upload may still have a copy reading this buffer: uploads no longer drain the device between chunks.
+    if (tinynv_exec_stage_claim(ex)) { pthread_mutex_unlock(&g_lock); return TINYNV_ERR_DRIVER; }
+    memset(ex->stage[0].dma.va, v, chunk);
     int bad = 0;
     for (size_t off = 0; off < n && !bad; off += chunk) {
       size_t m = n - off < chunk ? n - off : chunk;
-      bad = tinynv_exec_copy(ex, (uint64_t)dst + off, ex->stage.va, m);
+      bad = tinynv_exec_copy(ex, (uint64_t)dst + off, ex->stage[0].va, m);
     }
     pthread_mutex_unlock(&g_lock);
     return bad ? TINYNV_ERR_DRIVER : TINYNV_OK;

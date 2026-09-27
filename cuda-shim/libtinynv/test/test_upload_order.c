@@ -119,7 +119,9 @@ static tinynv_exec_t *fresh(void) {
   ex.sem.va = sem_base = 0x30000000ull;
   memset(sem_host, 0, sizeof sem_host); ex.sem.dma.view.ptr = (volatile uint32_t *)sem_host; ex.sem.dma.view.size = sizeof sem_host;
   ex.region[1].shadow = cmd_shadow; ex.region[1].mem.va = 0x10000000ull; ex.region[1].size = sizeof cmd_shadow;
-  ex.stage.dma.va = stage_buf; ex.stage.va = 0x20000000ull;
+  // two staging buffers, as the driver rotates them: the bulk-upload arm fills one while a copy still reads the other
+  ex.stage[0].dma.va = stage_buf; ex.stage[0].va = 0x20000000ull; ex.stage[0].size = sizeof stage_buf / 2;
+  ex.stage[1].dma.va = stage_buf + sizeof stage_buf / 2; ex.stage[1].va = 0x20000000ull + sizeof stage_buf / 2; ex.stage[1].size = sizeof stage_buf / 2;
   ex.inline_upload = 1; ex.inline_pend_max = 16; ex.inline_pend_bytes_max = 8192;
   // this driver's inline ceiling is a RUNTIME knob (TINYNV_INLINE_MAX env), not the submit.h per-call constant;
   // an exec built by hand gets the same default an unset environment gets, or every arm below rides the bulk path

@@ -441,6 +441,13 @@ TINYNV_AT(tinynv_copy_pdes_t, levels, 40);
 #define TINYNV_CLASS_GPFIFO_BLACKWELL   0xc96f
 #define TINYNV_CLASS_COMPUTE_BLACKWELL  0xcec0
 #define TINYNV_CLASS_DMA_COPY_BLACKWELL 0xcab5
+// NVB0B5_ALLOCATION_PARAMETERS (clb0b5sw.h): which copy engine this object drives. VERSION_1 makes engineType an
+// NV2080_ENGINE_TYPE ordinal - COPY0 is 0x9, COPY1 0xa, and so on. Passing NULL params defaults to CE0, which is
+// why the copy channel in the graphics group has always worked without them and why a channel on any OTHER copy
+// engine is refused: the default contradicts the channel's own engine.
+#define TINYNV_DMA_COPY_PARAMS_VERSION_1 1
+typedef struct { uint32_t version, engineType; } tinynv_dma_copy_alloc_t;
+TINYNV_SIZE(tinynv_dma_copy_alloc_t, 8);
 
 typedef struct { uint64_t base, size; uint32_t addressSpace, cacheAttrib; } tinynv_memory_desc_t;
 TINYNV_SIZE(tinynv_memory_desc_t, 24);
@@ -532,6 +539,7 @@ TINYNV_AT(tinynv_promote_ctx_t, promoteEntry, 48);
 
 #define TINYNV_VASPACE_FLAGS_ENABLE_PAGE_FAULTING 64
 #define TINYNV_VASPACE_FLAGS_IS_EXTERNALLY_OWNED 8
+#define TINYNV_CTXSHARE_FLAGS_SUBCONTEXT_SYNC  0
 #define TINYNV_CTXSHARE_FLAGS_SUBCONTEXT_ASYNC 1
 #define TINYNV_ENGINE_TYPE_GRAPHICS 1
 

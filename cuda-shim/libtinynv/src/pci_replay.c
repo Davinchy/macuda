@@ -46,6 +46,15 @@ typedef struct {
   size_t consumed, skipped, skipped_writes, divergences;
   size_t ops_done;  // distinct recorded operations finished, as against `consumed`, which counts each serving
   size_t ngaps, gap_ops;
+  // Writes DECLARED to differ from the recording, each with its reason, before the boot begins. A write at one of
+  // these lines whose bytes disagree is counted here instead of as a divergence - and reported, never hidden: the
+  // summary names every declaration and whether it fired, and a declaration that did not fire is itself a failure,
+  // because a difference that stopped happening means the driver changed back or the trace did. This exists for the
+  // case a re-recording cannot settle: the recording came from an oracle that carries the very bug the write corrects.
+  int expect_line[8];
+  const char *expect_why[8];
+  unsigned char expect_hit[8];
+  size_t nexpect, expected_diffs;
   size_t forgiven_readbacks; // of the forgiven reads, how many were the only read-back of a write
   int forgiven[64], forgiven_res[64];
   uint64_t forgiven_off[64];
@@ -345,9 +354,22 @@ static void rp_write(tinynv_mmio_t *m, uint64_t off, const void *src, size_t n, 
                      (unsigned long long)(m->off + off)); return; }
   uint64_t h = fnv1a(src, n);
   if (op->len != n) diverge(r, "line %d: recorded write is %llu bytes, we wrote %zu", op->line, (unsigned long long)op->len, n);
-  else if (op->hash != h) diverge(r, "line %d: %s:%d at %#llx differs (recorded %#llx, ours %#llx)", op->line,
-                                  kind == OP_MEMW ? "mem" : "bar", m->bar, (unsigned long long)(m->off + off),
-                                  (unsigned long long)op->hash, (unsigned long long)h);
+  else if (op->hash != h) {
+    // a declared difference at exactly this line, same length: counted apart from the divergences, and said out loud
+    // under TINYNV_REPLAY_ALL like any other difference would be
+    for (size_t i = 0; i < r->nexpect; i++)
+      if (r->expect_line[i] == op->line) {
+        r->expect_hit[i] = 1;
+        r->expected_diffs++;
+        if (getenv("TINYNV_REPLAY_ALL"))
+          fprintf(stderr, "tinynv: declared difference at line %d (%s): recorded %#llx, ours %#llx\n", op->line,
+                  r->expect_why[i], (unsigned long long)op->hash, (unsigned long long)h);
+        return;
+      }
+    diverge(r, "line %d: %s:%d at %#llx differs (recorded %#llx, ours %#llx)", op->line,
+            kind == OP_MEMW ? "mem" : "bar", m->bar, (unsigned long long)(m->off + off),
+            (unsigned long long)op->hash, (unsigned long long)h);
+  }
 }
 
 static uint32_t rp_mem_rd32(tinynv_mmio_t *m, uint64_t off) {
@@ -471,7 +493,12 @@ void tinynv_replay_stats(tinynv_pci_t *p, tinynv_replay_stats_t *s) {
                                .skipped_writes = r->skipped_writes, .divergences = r->divergences,
                                .cursor = r->cursor, .ngaps = r->ngaps, .gap_ops = r->gap_ops, .nforgiven = r->nforgiven,
                                .forgiven_readbacks = r->forgiven_readbacks, .submission_recorded = r->submission_recorded,
-                               .first = r->first_divergence};
+                               .first = r->first_divergence, .nexpect = r->nexpect, .expected_diffs = r->expected_diffs};
+  for (size_t i = 0; i < r->nexpect; i++) {
+    s->expect_line[i] = r->expect_line[i];
+    s->expect_why[i] = r->expect_why[i];
+    s->expect_hit[i] = r->expect_hit[i];
+  }
   for (size_t i = 0; i < r->nforgiven && i < sizeof(s->forgiven) / sizeof(*s->forgiven); i++) {
     s->forgiven[i] = r->forgiven[i];
     s->forgiven_res[i] = r->forgiven_res[i];
@@ -504,6 +531,22 @@ int tinynv_replay_gap(tinynv_pci_t *p, int first, int last, const char *why) {
   r->served = 0;
   audit(r, "declaring a gap");
   return 0;
+}
+
+int tinynv_replay_expect_write(tinynv_pci_t *p, int line, const char *why) {
+  replay_t *r = p->ctx;
+  if (r->nexpect >= sizeof(r->expect_line) / sizeof(*r->expect_line)) return -1;
+  // the line must name a WRITE in this trace, or the declaration is about some other recording and must not be
+  // carried as if it applied here
+  for (size_t i = 0; i < r->nops; i++)
+    if (r->ops[i].line == line && is_write(r->ops[i].kind)) {
+      r->expect_line[r->nexpect] = line;
+      r->expect_why[r->nexpect] = why;
+      r->expect_hit[r->nexpect] = 0;
+      r->nexpect++;
+      return 0;
+    }
+  return 1;   // not an operation of this trace: the caller says so and does not hold the declaration against the run
 }
 
 // Walks the trace on its own, checking that every recorded read's bytes are present in the blob and hash as recorded.

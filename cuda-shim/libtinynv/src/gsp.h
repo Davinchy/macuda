@@ -249,6 +249,14 @@ typedef struct {
   // the object tree inside GSP-RM that everything later hangs off
   uint32_t next_handle, priv_root, device, subdevice, vaspace;
   uint32_t nengines, engines[TINYNV_FIFO_DEVICE_ENTRIES], runlists[TINYNV_FIFO_DEVICE_ENTRIES];
+  // A second channel group on a COPY engine of its own (TINYNV_CE_GROUP). The copy channel in the graphics group
+  // shares CE0's PBDMA with GR0 and cannot overlap a kernel; CE1 reports its own runlist and its own PBDMA pair.
+  // Allocated and scheduled but not yet routed to - see gsp.c.
+  uint32_t ce_group, ce_ctxshare, ce_runlist, ce_engine;
+  // RM's own status from the last control call. rm_control_as reports but does not enforce it, so a caller that
+  // actually depends on a control having worked has to look here.
+  uint32_t last_ctrl_status;
+  tinynv_queue_t ce_copy_q;
   uint64_t gr_size, patch_size; // how big the graphics context and its patch buffer must be, per the firmware
   uint64_t reserved_va;   // the range whose page tables gsp-rm was given
   int reserved_levels;

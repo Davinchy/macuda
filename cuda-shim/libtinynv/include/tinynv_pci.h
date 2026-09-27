@@ -136,7 +136,18 @@ typedef struct {
   unsigned char forgiven_is_bar_query[64]; // 1 when the forgiven operation was "where is this window", not a read
   size_t nforgiven;
   const char *first;  // the first divergence, which is the one worth reading
+  // Writes declared, before the boot, to differ from the recording for a stated reason (tinynv_replay_expect_write):
+  // how many were declared, how many recorded operations fired one, and each declaration with whether it fired. A
+  // declared difference is reported apart from the divergences, never folded into them; one that did not fire is stale.
+  size_t nexpect, expected_diffs;
+  int expect_line[8];
+  const char *expect_why[8];
+  unsigned char expect_hit[8];
 } tinynv_replay_stats_t;
+// Declare, before booting, that the write at recorded `line` will differ from the recording, and why. 0 = declared;
+// 1 = that line is not a write in this trace (the declaration belongs to another recording; not held against this run);
+// -1 = no room. The reason is kept by pointer and must outlive the replay.
+int tinynv_replay_expect_write(tinynv_pci_t *p, int line, const char *why);
 // The books always balance: cursor == ops_done + skipped + gap_ops. The backend checks that itself on every move, and a
 // failure is a divergence, so a future path that advances the cursor outside the accounting is caught where it happens.
 void tinynv_replay_stats(tinynv_pci_t *p, tinynv_replay_stats_t *s);

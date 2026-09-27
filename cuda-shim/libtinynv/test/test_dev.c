@@ -99,6 +99,28 @@ int main(int argc, char **argv) {
 
   tinynv_pci_t pci;
   if (tinynv_pci_open_replay(argv[1], &pci)) { fprintf(stderr, "replay: %s\n", tinynv_last_error()); return 1; }
+  // THE TWO WRITES THIS DRIVER MAKES DIFFERENTLY FROM THE RECORDING, ON PURPOSE. The recording is of the oracle's boot
+  // (tinygrad's NV driver through the wire proxy), and the oracle carries a bug: its channel allocation describes the
+  // error notifier as {base 0, size 0xecc, addressSpace UNKNOWN}, which GSP-RM refuses - every work-submit-token
+  // control ever issued answered NV_ERR_INVALID_STATE, after filling the token in, which is the only reason the card
+  // ever worked ("luck rather than contract", a few lines up in any log). This driver now describes the notifier as
+  // the 48 bytes of FB memory it is, sets ERROR_NOTIFIER_TYPE_MEMORY, and asks for the PBDMA acquire timeout so a
+  // blocked acquire RC-errors in seconds instead of spinning until a cable is pulled - hardware-validated 2026-09-20.
+  // A re-recording cannot settle this: it would only show two implementations agreeing on the oracle's descriptor.
+  // So the two parameter blocks (the compute channel's and the copy channel's) are DECLARED to differ, by trace line,
+  // and the run must still reproduce every other operation exactly. Reported below, and stale if either stops firing.
+  static const char *why_notifier = "channel-alloc params: the error notifier is described as FB memory with its real "
+                                    "size, and the PBDMA acquire timeout is asked for; the recording carries the oracle's bug";
+  int declared[3] = {450516, 454026, 0}, declared_here[3] = {0, 0, 0}, ndeclared = 2;
+  // the must-fail arm of the mechanism itself: TINYNV_EXPECT_MUTANT=<line> declares a write the driver reproduces
+  // EXACTLY, so the "declared but did not fire" check has to trip - a check that has not been seen to fail is not one
+  { const char *mu = getenv("TINYNV_EXPECT_MUTANT"); if (mu && atoi(mu) > 0) declared[ndeclared++] = atoi(mu); }
+  for (int i = 0; i < ndeclared; i++) {
+    int e = tinynv_replay_expect_write(&pci, declared[i], why_notifier);
+    declared_here[i] = e == 0;
+    if (e < 0) { printf("  FAIL: no room to declare the expected write difference at line %d\n", declared[i]); }
+    else if (e > 0) printf("  declared write difference at line %d is not a write in this trace (another recording); not held against this run\n", declared[i]);
+  }
 
   tinynv_gpu_t g;
   int rc = tinynv_gpu_open(&g, &pci);
@@ -241,6 +263,17 @@ int main(int argc, char **argv) {
   if (s.divergences) printf("  first divergence: %s\n", s.first);
   if (s.skipped_writes) printf("  %zu recorded writes were never issued\n", s.skipped_writes);
   printf("declared gaps: %zu covering %zu operations (unported stages, reported not hidden)\n", s.ngaps, s.gap_ops);
+  // the declared write differences: each named, each with whether it fired. One that was declared for THIS trace and
+  // did not fire is a failure in its own right - the driver went back to the recording's bytes, or the trace changed.
+  printf("declared write differences: %zu declared, %zu operations differed as declared (reported, not folded into the divergences)\n",
+         s.nexpect, s.expected_diffs);
+  for (size_t i = 0; i < s.nexpect; i++) {
+    printf("    line %d: %s - %s\n", s.expect_line[i], s.expect_hit[i] ? "FIRED" : "DID NOT FIRE", s.expect_why[i]);
+    CHECK(s.expect_hit[i], "the declared difference at line %d did not occur: the driver matches the recording there again, "
+                           "or the trace is not the one the declaration was made for - either way the declaration is stale",
+          s.expect_line[i]);
+  }
+  (void)declared_here;
   printf("work submission: %s\n", s.submission_recorded
          ? "recorded, so this trace is evidence about launching as well as booting"
          : "NOT in this recording - the ring, the write pointer and the doorbell bypass the recorder on a remote device,"

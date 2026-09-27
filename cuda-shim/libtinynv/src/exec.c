@@ -1811,6 +1811,21 @@ unsigned tinynv_exec_short_chain(const char *e) {
   return (unsigned)n;
 }
 
+// Wait until nothing is still reading staging buffer s, so the processor may write into it. With one buffer this was
+// implicit - every chunk drained the whole device - and with two it is the only thing keeping a memcpy from landing
+// on top of a transfer that is still in flight. Cheap when nothing is pending, which is the common case.
+static int stage_claim(tinynv_exec_t *ex, int s) {
+  if (!ex->stage_pend[s]) return 0;
+  if (tinynv_exec_wait(ex, ex->stage_pend[s], 30.0)) return -1;
+  ex->stage_pend[s] = 0;
+  return 0;
+}
+int tinynv_exec_stage_claim(tinynv_exec_t *ex) {
+  ex->claim_ext_n++;
+  if (ex->stage_pend[0]) ex->claim_ext_blocked++;
+  return stage_claim(ex, 0);
+}
+
 int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size_t n) {
   const uint8_t *p = src;
   // Small, whole dwords, aligned: everything else goes to the engine built for moving bytes. The 20480-byte copy of
@@ -1863,11 +1878,47 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
   }
   ex->upload_ce_n++;
   ex->needs_wait = 1;
-  for (size_t off = 0; off < n; off += STAGE_BYTES) {
+  // Checked at init, so reaching here NULL means the exec state was overwritten after it - which is worth saying in
+  // those words, because the segfault it replaces points at this memcpy and hides the fact that the pointer is the
+  // victim rather than the culprit. Eight probe runs died here and the backtrace never said which.
+  if (!ex->stage[0].dma.va)
+    return tinynv_fail("the copy staging buffer's host mapping is NULL at upload time on exec %p (gpu va %#llx) - "
+                       "compare the exec pointer with the one that reported the buffer ready at startup: the same "
+                       "pointer means the state was overwritten, a different one means this device was never set up",
+                       (void *)ex, (unsigned long long)ex->stage[0].va);
+  ex->up_calls++;
+  { unsigned b = 0; for (size_t t = n; t >= (1u << 16) && b < 7; t >>= 2) b++; ex->up_hist[b]++; }
+  unsigned chunk_i = 0;
+  for (size_t off = 0; off < n; off += STAGE_BYTES, chunk_i++) {
     size_t chunk = n - off < STAGE_BYTES ? n - off : STAGE_BYTES;
-    memcpy(ex->stage.dma.va, p + off, chunk);
-    if (tinynv_exec_copy(ex, dst_va + off, ex->stage.va, chunk)) return -1;
-    if (tinynv_exec_idle(ex)) return -1;   // the next chunk overwrites what this copy is reading
+    int sb = chunk_i & 1;
+    // Asked BEFORE the clock starts, so the read does not land in the memcpy figure. This is the measurement the
+    // whole second-copy-channel question turns on: a copy can only be overlapped with compute that is actually in
+    // flight, and the loop below then idles the entire device anyway. If this is always "idle", there is nothing to
+    // overlap and a channel on its own runlist cannot help.
+    // Weight loading is counted apart. Before the first kernel is ever submitted the compute engine is idle by
+    // definition, and a 7.6 GB model load is some 475 chunks - enough to drown the few hundred that matter.
+    if (!ex->q_last[0]) ex->up_load_chunks++;
+    else if (ex->q_last[0] > sem_read_slot(ex, 0)) ex->up_busy_n++;
+    else ex->up_idle_n++;
+    ex->up_chunks++;
+    // Wait only for the copy that last read THIS buffer - two chunks back - instead of draining the device. That
+    // one-line difference is the whole point: the previous chunk's transfer stays in flight across this memcpy.
+    double t2 = now();
+    if (ex->stage_single) sb = 0;   // TINYNV_STAGE_SINGLE=1: the old one-buffer, drain-every-chunk behaviour, kept
+    ex->claim_up_n++;
+    if (ex->stage_pend[sb]) ex->claim_up_blocked++;
+    if (stage_claim(ex, sb)) return -1;
+    double t0 = now();
+    memcpy(ex->stage[sb].dma.va, p + off, chunk);
+    double t1 = now();
+    if (tinynv_exec_copy(ex, dst_va + off, ex->stage[sb].va, chunk)) return -1;
+    // What this copy will have reached when it is done reading the buffer. q_last[1] is the copy queue's slot, set
+    // by the run() that tinynv_exec_copy just performed.
+    ex->stage_pend[sb] = ex->q_last[1];
+    // the arm this replaced: nothing may be in flight when the chunk ends, so the next memcpy is unconditionally safe
+    if (ex->stage_single) { if (tinynv_exec_idle(ex)) return -1; ex->stage_pend[sb] = 0; }
+    ex->up_memcpy_s += t1 - t0; ex->up_submit_s += now() - t1; ex->up_wait_s += t0 - t2;
   }
   return 0;
 }
@@ -1879,8 +1930,8 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
 // tinynv_exec_flush.
 void tinynv_exec_set_internal(tinynv_exec_t *ex, int on) { ex->internal_work = on; }
 
-uint64_t tinynv_exec_stage_va(const tinynv_exec_t *ex) { return ex->stage.va; }
-void *tinynv_exec_stage_host(const tinynv_exec_t *ex) { return ex->stage.dma.va; }
+uint64_t tinynv_exec_stage_va(const tinynv_exec_t *ex) { return ex->stage[0].va; }
+void *tinynv_exec_stage_host(const tinynv_exec_t *ex) { return ex->stage[0].dma.va; }
 size_t tinynv_exec_stage_bytes(void) { return STAGE_BYTES; }
 
 int tinynv_exec_download(tinynv_exec_t *ex, void *dst, uint64_t src_va, size_t n) {
@@ -1890,11 +1941,12 @@ int tinynv_exec_download(tinynv_exec_t *ex, void *dst, uint64_t src_va, size_t n
     // Let the compute drain before the copy is issued, so the copy's acquire is already satisfied when the channel is
     // first looked at and it is never switched out waiting. See tinynv_exec_download_sync_first.
     if (ex->download_sync_first && tinynv_exec_idle(ex)) return -1;
-    if (tinynv_exec_copy(ex, ex->stage.va, src_va + off, chunk)) return -1;
+    if (tinynv_exec_copy(ex, ex->stage[0].va, src_va + off, chunk)) return -1;
     if (tinynv_exec_idle(ex)) return -1;   // reading a result is one of the few places that has to wait
+    ex->stage_pend[0] = 0;                 // the idle above covers anything that was reading it
     // Recorded before the write, not after, so a fault inside this very memcpy still leaves the span behind.
     tinynv_note_host_write(p + off, chunk, "download: stage -> caller");
-    memcpy(p + off, ex->stage.dma.va, chunk);
+    memcpy(p + off, ex->stage[0].dma.va, chunk);
   }
   return 0;
 }
@@ -1906,11 +1958,12 @@ int tinynv_exec_download(tinynv_exec_t *ex, void *dst, uint64_t src_va, size_t n
 // allocation that flag is a no-op that looks like a guarantee.
 int tinynv_exec_zero(tinynv_exec_t *ex, uint64_t va, uint64_t bytes) {
   if (!bytes) return 0;
-  uint64_t chunk = ex->stage.size < bytes ? ex->stage.size : bytes;
-  memset(ex->stage.dma.va, 0, (size_t)chunk);
+  uint64_t chunk = ex->stage[0].size < bytes ? ex->stage[0].size : bytes;
+  if (stage_claim(ex, 0)) return -1;   // an upload's copy may still be reading this buffer
+  memset(ex->stage[0].dma.va, 0, (size_t)chunk);
   for (uint64_t off = 0; off < bytes; off += chunk) {
     uint64_t n = bytes - off < chunk ? bytes - off : chunk;
-    if (tinynv_exec_copy(ex, va + off, ex->stage.va, n)) return -1;
+    if (tinynv_exec_copy(ex, va + off, ex->stage[0].va, n)) return -1;
   }
   return tinynv_exec_idle(ex);   // the pattern lives in the staging buffer; nobody may refill it until this is done
 }
@@ -2636,6 +2689,7 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   // default is in doubt.
   const char *why_dma = NULL;
   ex->arena_dma = tinynv_exec_arena_dma(getenv("TINYNV_ARENA_DMA"), ex->arena_vram, &why_dma);
+  { const char *e = getenv("TINYNV_STAGE_SINGLE"); ex->stage_single = e && *e && *e != '0'; }
   // The host-memory case is decided inside that call rather than corrected after it, so there is one place that knows
   // when delivery is off and why. It used to be decided twice - set from the environment here, then cleared again
   // below with a message - and two places deciding one thing is how the reason and the value come apart.
@@ -2756,8 +2810,20 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
                             r == AR_DESC ? "descriptor region (host memory)" : "command region (host memory)");
   }
 
-  if (tinynv_mm_alloc_buffer(&g->mm, STAGE_BYTES, 1, 1, 1, 0, 0, &ex->stage)) return -1;
-  tinynv_note_host_region(ex->stage.dma.va, (size_t)ex->stage.dma.size, "copy staging buffer");
+  for (int i = 0; i < 2; i++)
+    if (tinynv_mm_alloc_buffer(&g->mm, STAGE_BYTES, 1, 1, 1, 0, 0, &ex->stage[i])) return -1;
+  // The allocator reports failure by returning, so a NULL host mapping here is a SUCCESSFUL allocation that came back
+  // without one - a different fault, and one that used to travel all the way to a memcpy to address zero in
+  // tinynv_exec_upload. Said here, where the cause still is.
+  if (!ex->stage[0].dma.va || !ex->stage[1].dma.va)
+    return tinynv_fail("a copy staging buffer was allocated (gpu va %#llx, %llu bytes) but came back with no host "
+                       "mapping, so nothing can be staged through it",
+                       (unsigned long long)ex->stage[0].va, (unsigned long long)ex->stage[0].size);
+  fprintf(stderr, "libtinynv: two copy staging buffers ready on exec %p: gpu va %#llx and %#llx, %llu bytes each\n",
+          (void *)ex, (unsigned long long)ex->stage[0].va, (unsigned long long)ex->stage[1].va,
+          (unsigned long long)ex->stage[0].size);
+  for (int i = 0; i < 2; i++)
+    tinynv_note_host_region(ex->stage[i].dma.va, (size_t)ex->stage[i].dma.size, "copy staging buffer");
   // Laid out at the descriptor region's own offsets, so a dirty span copies to the place it came from and no mapping
   // arithmetic exists anywhere to get wrong. One allocation whose base does not move for the life of the device, which
   // is also what lets phase 2 bind an aperture to it once rather than renegotiating whenever it grows.
@@ -2862,6 +2928,27 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
             (unsigned long long)ex->inline_n, (unsigned long long)ex->inline_bytes,
             (unsigned long long)ex->upload_ce_n, ex->inline_pend_max, ex->inline_pend_bytes_max, (unsigned long long)ex->inline_batches_saved,
             (unsigned long long)ex->inline_rode_flush_n, (unsigned long long)ex->inline_forced_n);
+  if (ex->up_calls) {
+    static const char *const edge[8] = {"<64K", "<256K", "<1M", "<4M", "<16M", "<64M", "<256M", ">=256M"};
+    fprintf(stderr, "libtinynv: bulk uploads: %llu calls in %llu chunks. The compute engine was BUSY for %llu of "
+                    "them and IDLE for %llu (%.1f%% busy), with %llu more during weight load (compute idle by "
+                    "definition, not counted).\n           A copy can only be overlapped with compute that is in "
+                    "flight, so the busy share is the ceiling on what a second copy channel could ever "
+                    "win.\n           Spent: %.3f s host memcpy, %.3f s build+submit, %.3f s waiting for the card "
+                    "(%.3f s total).\n           Call sizes:",
+            (unsigned long long)ex->up_calls, (unsigned long long)ex->up_chunks, (unsigned long long)ex->up_busy_n,
+            (unsigned long long)ex->up_idle_n,
+            (ex->up_busy_n + ex->up_idle_n) ? 100.0 * (double)ex->up_busy_n / (double)(ex->up_busy_n + ex->up_idle_n) : 0.0,
+            (unsigned long long)ex->up_load_chunks,
+            ex->up_memcpy_s, ex->up_submit_s, ex->up_wait_s,
+            ex->up_memcpy_s + ex->up_submit_s + ex->up_wait_s);
+    for (int i = 0; i < 8; i++) if (ex->up_hist[i]) fprintf(stderr, " %s=%llu", edge[i], (unsigned long long)ex->up_hist[i]);
+    fprintf(stderr, "\n           Staging buffers: the upload rotation waited on %llu of %llu claims; the four "
+                    "callers that share buffer 0\n           (download, zero, fill, kernel-download) waited on %llu "
+                    "of %llu. A high second number is the cost of sharing.\n",
+            (unsigned long long)ex->claim_up_blocked, (unsigned long long)ex->claim_up_n,
+            (unsigned long long)ex->claim_ext_blocked, (unsigned long long)ex->claim_ext_n);
+  }
 
   if (ex->profile && ex->prof_n[PROF_LAUNCH]) {
     uint64_t L = ex->prof_n[PROF_LAUNCH];
@@ -2981,7 +3068,7 @@ void tinynv_exec_fini(tinynv_exec_t *ex) {
                     "libtinynv: itself as well as the driver, so read the shares rather than the absolute total.\n");
   }
   tinynv_vmap_free(&ex->g->mm, &ex->slm);
-  tinynv_vmap_free(&ex->g->mm, &ex->stage);
+  for (int i = 0; i < 2; i++) tinynv_vmap_free(&ex->g->mm, &ex->stage[i]);
   if (ex->mirror.size) tinynv_vmap_free(&ex->g->mm, &ex->mirror);
   for (int r = 0; r < 2; r++) {
     if (ex->region[r].mem.size) tinynv_vmap_free(&ex->g->mm, &ex->region[r].mem);
