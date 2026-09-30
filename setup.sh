@@ -10,6 +10,12 @@
 # Environment: LLAMA_SRC / SD_SRC name a local clone to copy from instead of GitHub; JOBS caps the parallel build (default:
 # all cores). The device compile needs nvcc, which is Linux-only: set TINYCC_HOST / TINYCC_KEY to use a Linux box over ssh,
 # or leave them unset and it runs in a CUDA container on this Mac (see cuda-shim/build/tinycc, and install.sh).
+# ARCH picks the card the shim, CUDA and link steps build for: sm_120a (the default: Blackwell, the RTX 50 series) keeps
+# today's layout exactly - build/shim, build/bin, libggml-cuda.a. Any other (sm_89 for Ada, the RTX 40 series; sm_86 for
+# Ampere) builds beside it, never over it: build/shim-<arch>, libggml-cuda.<arch>.a, build/bin-<arch>, with that
+# family's committed copy and GEMM kernels inside. Run those binaries with BIN=cuda-shim/build/bin-<arch> (tools/
+# nv_shim_step.sh) or BIN=cuda-shim/build/bin-<arch>/llama-server-null (tools/serve.sh).
+#   ARCH=sm_89 sh setup.sh shim && ARCH=sm_89 sh setup.sh cuda && ARCH=sm_89 sh setup.sh link
 set -eu
 R=$(cd "$(dirname "$0")" && pwd); cd "$R"
 LLAMA_URL=https://github.com/ggml-org/llama.cpp.git
@@ -18,6 +24,14 @@ LLAMA_FIX=2f539596c6e9a977e91b6bc6344650422c6bc3b0    # 2f53959 (#28882): ggml-c
 SD_URL=https://github.com/leejet/stable-diffusion.cpp.git
 SD_COMMIT=59c23bce0d82be3a922023ab811194f05b3e2faa      # 59c23bc
 JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
+ARCH=${ARCH:-sm_120a}
+case "$ARCH" in
+  sm_120a) SUF=""; CUBIN_ARCH="" ;;                          # the tree's own default: nothing moves
+  sm_8[0-9]) SUF="-$ARCH"; CUBIN_ARCH=sm_86 ;;               # Ampere and Ada: sm_89 runs the sm_86 kernels as they are
+  sm_12[0-9]*) SUF="-$ARCH"; CUBIN_ARCH=sm_120 ;;
+  *) echo "ARCH=$ARCH: no committed copy/GEMM kernels for that family (have sm_86 and sm_120)"; exit 2 ;;
+esac
+export ARCH
 step=${1:-all}
 
 deps() {
@@ -62,10 +76,16 @@ sd() {
   cmake --build stable-diffusion.cpp/build-null -j"$JOBS" --target sd-cli > stable-diffusion.cpp/build-null/build.log 2>&1 || { tail -30 stable-diffusion.cpp/build-null/build.log; exit 1; }
   echo "stable-diffusion.cpp/build-null built"
 }
-shim() { ( cd cuda-shim && rm -rf build/shim/nv && make -s ) && echo "shim built: libtinynv build id $(strings cuda-shim/build/shim/nv/libtinynv.a | grep -oE '^[0-9a-f]{7}(-dirty)?$|^nogit(-dirty)?$' | head -1)"; }
+shim() { ( cd cuda-shim && rm -rf "build/shim$SUF/nv" && make -s BUILD="build/shim$SUF" ${CUBIN_ARCH:+CUBIN_ARCH=$CUBIN_ARCH} ) && echo "shim built${SUF:+ for $ARCH} (build/shim$SUF): libtinynv build id $(strings "cuda-shim/build/shim$SUF/nv/libtinynv.a" | grep -oE '^[0-9a-f]{7}(-dirty)?$|^nogit(-dirty)?$' | head -1)"; }
 # The archive AND the registry object that has to be linked beside it. One without the other links nothing, so they
 # are built by one step rather than left to be remembered separately.
-cuda() { sh cuda-shim/build/build-ggml-cuda.sh && sh cuda-shim/build/build-backend-reg.sh; }
+# build-ggml-cuda.sh points libggml-cuda.a at whatever it built last; a second card's build puts it back, so the default
+# tree still links its own archive afterwards.
+cuda() {
+  prev=$(readlink cuda-shim/build/libggml-cuda.a 2>/dev/null || true)
+  sh cuda-shim/build/build-ggml-cuda.sh && sh cuda-shim/build/build-backend-reg.sh
+  if [ -n "$SUF" ] && [ -n "$prev" ]; then ln -sfn "$prev" cuda-shim/build/libggml-cuda.a; fi
+}
 # One link, with its failure kept: the output is filtered for display, but the status decides. $4, when given, is the
 # CMake tree whose link line is replayed (stable-diffusion.cpp's rather than llama.cpp's).
 link_one() {
@@ -79,18 +99,23 @@ link_one() {
   fi
 }
 link() {
-  test -f cuda-shim/build/libggml-cuda.a || { echo "no cuda-shim/build/libggml-cuda.a: build it with  sh setup.sh cuda  (nvcc in a container here, or on TINYCC_HOST)"; exit 1; }
+  if [ -n "$SUF" ]; then
+    export GGML_ARCHIVE="$R/cuda-shim/build/libggml-cuda.$ARCH.a" SHIM_DIR="$R/cuda-shim/build/shim$SUF"
+    test -f "$GGML_ARCHIVE" || { echo "no $GGML_ARCHIVE: build it with  ARCH=$ARCH sh setup.sh cuda"; exit 1; }
+    test -f "$SHIM_DIR/nv/libtinynv.a" || { echo "no $SHIM_DIR: build it with  ARCH=$ARCH sh setup.sh shim"; exit 1; }
+  fi
+  test -f cuda-shim/build/libggml-cuda.a || [ -n "$SUF" ] || { echo "no cuda-shim/build/libggml-cuda.a: build it with  sh setup.sh cuda  (nvcc in a container here, or on TINYCC_HOST)"; exit 1; }
   # Built here too, not only in the cuda step: it is cheap, it is the object every link below needs, and a tree that
   # has the archive but not this one used to fail seven times over and still report success.
   test -f cuda-shim/build/ggml-backend-reg.cuda.o || sh cuda-shim/build/build-backend-reg.sh
   cd cuda-shim
   for t in 'tests test-backend-ops' 'examples/simple llama-simple' 'examples/speculative-simple llama-speculative-simple' 'tools/server llama-server' 'tools/mtmd llama-mtmd-cli' 'tools/llama-bench llama-bench'; do
-    d=${t%% *}; n=${t##* }; link_one "$d" "$n" "$R/cuda-shim/build/bin/$n-null"
+    d=${t%% *}; n=${t##* }; link_one "$d" "$n" "$R/cuda-shim/build/bin$SUF/$n-null"
   done
   if [ -f "$R/stable-diffusion.cpp/build-null/examples/cli/CMakeFiles/sd-cli.dir/link.txt" ]; then
-    link_one examples/cli sd-cli "$R/cuda-shim/build/bin/sd-cli-null" "$R/stable-diffusion.cpp/build-null"
+    link_one examples/cli sd-cli "$R/cuda-shim/build/bin$SUF/sd-cli-null" "$R/stable-diffusion.cpp/build-null"
   fi
-  ls -1 build/bin
+  ls -1 "build/bin$SUF"
 }
 case "$step" in
   all)   deps; llama; sd; shim; cuda; link ;;

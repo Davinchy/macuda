@@ -6,6 +6,8 @@
 #   sh install.sh check     report only — installs nothing, builds nothing, touches nothing
 #   sh install.sh build     skip the prerequisite checks and build (a second run, after check passed once)
 #   YES=1 sh install.sh     do not ask; assume yes to every install prompt
+#   ARCH=sm_89 sh install.sh build   build for an RTX 40 (Ada) card instead, beside the default Blackwell tree; the
+#                           binaries land in cuda-shim/build/bin-sm_89 (see setup.sh for ARCH)
 #
 # WHAT THIS DOES NOT DO, because it cannot: approve the DriverKit system extension (macOS asks you, in System Settings),
 # plug the card in, or replug it when it wedges. Those are yours. Everything else is here.
@@ -159,7 +161,9 @@ if [ -z "${TINYCC_HOST:-}" ]; then
   RT=$(sh cuda-shim/build/container-runtime.sh)
   "$RT" image inspect "$CUDA_IMAGE" > /dev/null 2>&1 || { echo "   pulling $CUDA_IMAGE with $RT (~4 GB, once)"; "$RT" image pull "$CUDA_IMAGE"; }
 fi
-sh cuda-shim/build/build-ggml-cuda.sh
+# through setup.sh, not build-ggml-cuda.sh directly: with ARCH set to a second card it builds beside the default tree
+# and leaves libggml-cuda.a pointing where it was
+sh setup.sh cuda
 echo "== 6/6 linking the binaries against the shim"
 sh setup.sh link
 
