@@ -18,6 +18,11 @@ SYSROOT  := -isysroot $(SDK)
 CUDA_INC ?= $(ROOT)/cuda-13/include
 CFLAGS   := $(SYSROOT) -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -fPIC -I$(ROOT)/include -I$(ROOT)/libtinycudart
 BUILD    := build/shim
+# Which architecture's committed kernels ride inside the libraries: empty takes the plain names (symlinks to this tree's
+# default, sm_120), sm_86 takes the Ampere set, which Ada also runs (sm_89 executes sm_86 code). setup.sh sets both this
+# and BUILD from ARCH, so a second card's libraries build beside the first card's instead of over them.
+CUBIN_ARCH ?=
+CUBIN_SUF  := $(if $(CUBIN_ARCH),.$(CUBIN_ARCH))
 # libtinynv is built into OUR build dir, never into libtinynv/build/, which Session B builds in concurrently
 NV_BUILD := $(ROOT)/$(BUILD)/nv
 NV_LIB   := $(NV_BUILD)/libtinynv.a
@@ -33,15 +38,15 @@ $(NV_LIB): FORCE
 $(CUDART): $(BUILD)/cudart.o $(BUILD)/fatbin.o $(BUILD)/hostpool.o $(BUILD)/cudart_api.o $(BUILD)/graph.o $(BUILD)/demangle.o $(BUILD)/copy2d_cubin.o $(BUILD)/copy1d_cubin.o $(BUILD)/keepalive_cubin.o
 	ar rcs $@ $^
 # the strided-copy kernel travels inside the runtime the same way (libtinycudart/copy2d.cu, built by the remote nvcc)
-$(BUILD)/copy2d_cubin.c: libtinycudart/copy2d.cubin
+$(BUILD)/copy2d_cubin.c: libtinycudart/copy2d$(CUBIN_SUF).cubin
 	@mkdir -p $(@D)
-	cd libtinycudart && xxd -i copy2d.cubin > $(ROOT)/$@
+	cd libtinycudart && xxd -i -n copy2d_cubin copy2d$(CUBIN_SUF).cubin > $(ROOT)/$@
 $(BUILD)/copy2d_cubin.o: $(BUILD)/copy2d_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 # the 1-D copy kernel the driver launches for downloads when TINYNV_DOWNLOAD_VIA_COMPUTE=1 (libtinycudart/copy1d.cu)
-$(BUILD)/copy1d_cubin.c: libtinycudart/copy1d.cubin
+$(BUILD)/copy1d_cubin.c: libtinycudart/copy1d$(CUBIN_SUF).cubin
 	@mkdir -p $(@D)
-	cd libtinycudart && xxd -i copy1d.cubin > $(ROOT)/$@
+	cd libtinycudart && xxd -i -n copy1d_cubin copy1d$(CUBIN_SUF).cubin > $(ROOT)/$@
 $(BUILD)/copy1d_cubin.o: $(BUILD)/copy1d_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 # the keep-alive kernel the driver launches after a synchronisation when TINYNV_KEEPALIVE=1 (libtinycudart/keepalive.cu)
@@ -69,9 +74,9 @@ $(BUILD)/cublas.o: libtinycublas/cublas.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -I$(CUDA_INC) -c $< -o $@
 # the GEMM cubin travels inside the library, so a linked binary needs no files at run time
-$(BUILD)/gemm_cubin.c: libtinycublas/gemm.cubin
+$(BUILD)/gemm_cubin.c: libtinycublas/gemm$(CUBIN_SUF).cubin
 	@mkdir -p $(@D)
-	cd libtinycublas && xxd -i gemm.cubin > $(ROOT)/$@
+	cd libtinycublas && xxd -i -n gemm_cubin gemm$(CUBIN_SUF).cubin > $(ROOT)/$@
 $(BUILD)/gemm_cubin.o: $(BUILD)/gemm_cubin.c
 	$(CC) $(CFLAGS) -c $< -o $@
 

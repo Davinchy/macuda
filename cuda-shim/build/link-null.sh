@@ -11,7 +11,10 @@ R=${EGPU_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}; L=${L:-$R/llama.cpp/build-
 # the macOS SDK to link against, chosen by a link test (this script's own copy of sdk.sh, whichever tree S names)
 SDKROOT=$(sh "$(dirname "$0")/sdk.sh") || exit 1
 tdir="$1"; name="$2"; out="$3"; linktxt="$L/$tdir/CMakeFiles/$name.dir/link.txt"; test -f "$linktxt" || { echo "no link line at $linktxt (build the target first)"; exit 1; }
-extra="$G/ggml-backend-reg.cuda.o $G/libggml-cuda.a $S/build/shim/libtinycudart.a $S/build/shim/libtinycublas.a $S/build/shim/nv/libtinynv.a /opt/homebrew/opt/llvm/lib/libLLVMDemangle.a"
+# GGML_ARCHIVE and SHIM_DIR name one architecture's ggml-cuda archive and shim libraries explicitly (setup.sh sets them
+# from ARCH); unset, the plain libggml-cuda.a symlink and build/shim are used, as before.
+GA=${GGML_ARCHIVE:-$G/libggml-cuda.a}; SD=${SHIM_DIR:-$S/build/shim}
+extra="$G/ggml-backend-reg.cuda.o $GA $SD/libtinycudart.a $SD/libtinycublas.a $SD/nv/libtinynv.a /opt/homebrew/opt/llvm/lib/libLLVMDemangle.a"
 # The link line is CMake's, recorded when llama.cpp was configured - which means it carries the EXACT Homebrew Cellar
 # paths of the machine that configured it. On this machine openssl@3 is 3.6.2 and the recorded line wants 3.6.4, so four
 # of the five targets failed with "no such file or directory: .../3.6.4/lib/libcrypto.dylib" and the fifth, which does

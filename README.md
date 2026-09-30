@@ -79,7 +79,7 @@ sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf
 | Component | Tested configuration or requirement |
 |---|---|
 | Mac | Apple Silicon; development and measurements use an M4 Max (RTX 5090) and an M3 Max (RTX 3060), both on macOS 27.0 |
-| GPU | RTX 5090 (GB202, sm_120) or RTX 3060 (GA106, sm_86) in a Thunderbolt enclosure; measurements use an AORUS AI BOX and a Razer Core X V2. Give the enclosure its own power supply: an underpowered one drops the card mid-run, and the symptom is every register reading all ones, not a message about power |
+| GPU | RTX 5090 (GB202, sm_120), RTX 4090 (AD102, sm_89) or RTX 3060 (GA106, sm_86) in a Thunderbolt enclosure; measurements use an AORUS AI BOX and a Razer Core X V2. Give the enclosure its own power supply: an underpowered one drops the card mid-run, and the symptom is every register reading all ones, not a message about power |
 | Host toolchain | Xcode Command Line Tools or Xcode, CMake, Python 3 and Homebrew LLVM at `/opt/homebrew/opt/llvm` |
 | Hardware access | TinyGPU.app and its approved DriverKit extension, `org.tinygrad.tinygpu.driver2` |
 | GPU compiler | A container runtime with the configured CUDA image — Apple's `container` (macOS 26+) or Docker — or a Linux machine with CUDA 13 accessible over SSH |
@@ -91,7 +91,7 @@ sh tools/nv_shim_step.sh A bench models/Qwen3.8-27B-UD-Q4_K_M.gguf
 
 **Optional development dependencies.** Some offline reference tests and recovery tools use the tinygrad checkouts and Python environment described in [env.sh](env.sh). These are separate from the application build prerequisites.
 
-**Two architectures.** `TINYCC_ARCH=sm_86` selects the Ampere device compile (`sm_120a`, the default, is Blackwell); nothing else does. The driver tells the two apart from the chip itself: VBIOS falcon boot, QMD v3 descriptors, MMU v2 page tables and the Ampere engine classes on a GA10x, the FSP chain of trust, QMD v5 and MMU v3 on a GB20x. The 3060's own numbers and its recorded boot are in [docs/bench/ampere-3060-20260917.md](docs/bench/ampere-3060-20260917.md).
+**Three architectures.** `ARCH=sm_86` selects the Ampere build and `ARCH=sm_89` the Ada one (`sm_120a`, the default, is Blackwell); nothing else does. Ada boots Ampere's VBIOS path with its own `ad102` images and one extra step NVIDIA's driver takes on that chip: a scrubber ucode on SEC2 before `booter_load`, skipped when its handoff says it already ran (`kgspExecuteScrubberIfNeeded_AD102`). The driver tells the two apart from the chip itself: VBIOS falcon boot, QMD v3 descriptors, MMU v2 page tables and the Ampere engine classes on a GA10x, the FSP chain of trust, QMD v5 and MMU v3 on a GB20x. The 3060's own numbers and its recorded boot are in [docs/bench/ampere-3060-20260917.md](docs/bench/ampere-3060-20260917.md).
 
 ## Measured performance
 
@@ -144,7 +144,7 @@ Speculative throughput depends on prompt content and draft acceptance. Single-st
 Each stage can be run separately from the repository root:
 
 ```sh
-export TINYCC_ARCH=sm_86        # for an Ampere card; leave unset for Blackwell (sm_120a)
+export ARCH=sm_89               # an Ada card (RTX 40); sm_86 for Ampere; leave unset for Blackwell (sm_120a)
 sh setup.sh deps
 sh setup.sh llama
 sh setup.sh sd
@@ -157,7 +157,7 @@ sh setup.sh link
 
 **CUDA archive.** `cuda-shim/build/libggml-cuda.a` and the CUDA-enabled backend registry object are build outputs tied to the pinned llama.cpp source. The build uses `GGML_CUDA_FORCE_MMQ` and `GGML_CUDA_NO_VMM`; graph support is added explicitly above. `JOBS` controls compilation parallelism. For SSH builds, synchronise `llama.cpp/ggml/` to the location used by `TINYCC_GGML_LINUX` (default `ggml` on the remote host) before compiling. Docker builds mount the local tree directly.
 
-**One archive per architecture.** `libggml-cuda.<arch>.a` is kept per architecture and the plain `libggml-cuda.a` is a symlink to whichever the tree links against, so `ls -l` answers which one that is and a build for a second card cannot destroy the first card's. The shim's own kernels (`libtinycudart/copy1d.cu`, `copy2d.cu`, `libtinycublas/gemm.cu`) are committed as `<name>.sm_86.cubin` and `<name>.sm_120.cubin` with the same symlink convention.
+**One archive per architecture.** `libggml-cuda.<arch>.a` is kept per architecture and the plain `libggml-cuda.a` is a symlink to whichever the tree links against, so `ls -l` answers which one that is and a build for a second card cannot destroy the first card's. The shim's own kernels (`libtinycudart/copy1d.cu`, `copy2d.cu`, `libtinycublas/gemm.cu`) are committed as `<name>.sm_86.cubin` and `<name>.sm_120.cubin` with the same symlink convention. `ARCH` drives all three build steps: left at `sm_120a` the layout is exactly the above (`build/shim`, `build/bin`); any other value builds beside it - `build/shim-<arch>` with that family's committed kernels embedded (`sm_86` for Ampere and Ada, since sm_89 runs sm_86 code), `libggml-cuda.<arch>.a`, and `build/bin-<arch>` - and leaves the `libggml-cuda.a` symlink where it was. Run those with `BIN=cuda-shim/build/bin-<arch>` (`tools/nv_shim_step.sh`) or `BIN=cuda-shim/build/bin-<arch>/llama-server-null` (`tools/serve.sh`). `build-ggml-cuda.sh` reads `ARCH`, not an exported `TINYCC_ARCH`, which it sets itself.
 
 `TINYCC_REUSE_FATBIN=1` reuses device fatbins left in `/tmp` for a host-only rebuild. Use it only when the GPU source and device compilation settings are unchanged. The runtime's copy kernels and cuBLAS-compatible GEMM kernel ship as committed cubins; their source files record the compilation commands.
 
