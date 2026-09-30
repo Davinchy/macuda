@@ -24,6 +24,15 @@ static const char *FMC_SHA = "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd5
 // the two booters SEC2 runs on the vbios path, from linux-firmware at the commit tools/fetch_firmware.sh pins
 static const char *BOOTER_LOAD_SHA_GA102 = "4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b";
 static const char *BOOTER_UNLOAD_SHA_GA102 = "8e63db5b78d7d3e349f20a2d11099c3d7109081393cb09ffc0a28133324ae009";
+// Ada's own images, same commit, different signatures: an Ada card refuses Ampere's booters and needs a scrubber
+static const char *hs_sha(const char *fw, const char *which, const char *sha_ga102) {
+  if (!strcmp(fw, "ga102")) return sha_ga102;
+  if (strcmp(fw, "ad102")) return NULL;
+  if (!strcmp(which, "booter_load")) return "8b293e19b637c5e22c87a2428d1c71bb13e0904e8a88ac6b3c6c1f2679c6e37a";
+  if (!strcmp(which, "booter_unload")) return "975b85a14ded8e430d30f000c3c1afdd55c15dee04f35ff9dfd876acd7e67186";
+  if (!strcmp(which, "scrubber")) return "c397358e5c4258dab070966589c7b172eb00771fd15d0bb74b8e22f327c1909b";
+  return NULL;
+}
 
 #define FSP_MAX_MSG 0x400
 
@@ -185,11 +194,11 @@ static int flcn_parse_booter(tinynv_gpu_t *g, const char *which, const char *sha
   memset(out, 0, sizeof *out);
   *image_out = NULL;
   // hash-pinned exactly as the fmc is, and for the same reason: this is code the gpu's secure boot executes
-  if (strcmp(g->dev.fw_name, "ga102"))
-    return tinynv_fail("no %s hash is pinned for %s, so its image cannot be trusted", which, g->dev.fw_name);
+  const char *sha = hs_sha(g->dev.fw_name, which, sha_ga102);
+  if (!sha) return tinynv_fail("no %s hash is pinned for %s, so its image cannot be trusted", which, g->dev.fw_name);
   char name[64];
   snprintf(name, sizeof name, "%s-" TINYNV_FW_VER ".bin", which);
-  if (tinynv_fw_load(g->dev.fw_name, name, sha_ga102, &out->fw)) return -1;
+  if (tinynv_fw_load(g->dev.fw_name, name, sha, &out->fw)) return -1;
 
   const uint8_t *b = out->fw.data;
   size_t n = out->fw.size;
@@ -255,6 +264,9 @@ static int flcn_vbios_init_sw(tinynv_gpu_t *g) {
   // to the firmware in 4K units and the firmware fills it; the driver only says where.
   f->frts_offset = g->dev.vram_size - 0x100000 - 0x100000;
   if (tinynv_vbios_fwsec_frts(g, f->frts_offset, &f->fwsec)) return -1;
+  // Ada runs a scrubber on SEC2 between the riscv reset and booter_load (kgspBootstrap_TU102 -> the AD102 HAL); its
+  // image has the booter's shape, so the same reader serves it
+  if (!strcmp(g->dev.fw_name, "ad102") && flcn_prep_booter(g, "scrubber", NULL, &f->scrubber)) return -1;
   return flcn_prep_booter(g, "booter_load", BOOTER_LOAD_SHA_GA102, &f->booter);
 }
 
@@ -385,6 +397,23 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
   tinynv_wr32(d, NV_PGSP_FALCON_MAILBOX0, (uint32_t)gsp->libos_args_sysmem);
   tinynv_wr32(d, NV_PGSP_FALCON_MAILBOX1, (uint32_t)(gsp->libos_args_sysmem >> 32));
 
+  // Ada: the scrubber, unless its handoff says it already ran (kgspExecuteScrubberIfNeeded_AD102). Engine id 1, ucode id
+  // 13 and a signature at data offset 0 are what the image's own metadata declares (booter_load's reads 1, 3, 0x10).
+  if (f->scrubber.image.size) {
+    uint32_t h = tinynv_rd32(d, 0x001180fc) >> 29;   // NV_PGC6_BSI_VPR_SECURE_SCRATCH_15_SCRUBBER_HANDOFF, 31:29
+    if (h < 3) {
+      if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
+      if (flcn_execute_hs(g, f->sec2, f->scrubber.image.paddr, f->scrubber.code_off, f->scrubber.data_off,
+                          0, f->scrubber.code_off, f->scrubber.code_sz, 0, 0, f->scrubber.data_sz,
+                          0x0, 1, 13, NULL, NULL)) return -1;
+      uint32_t h2 = tinynv_rd32(d, 0x001180fc) >> 29;
+      fprintf(stderr, "libtinynv: ada scrubber ran on sec2: handoff %u -> %u%s\n", h, h2, h2 >= 3 ? "" : " (NOT DONE)");
+      if (h2 < 3) return tinynv_fail("the ada scrubber halted without setting its handoff (%u)", h2);
+    } else {
+      fprintf(stderr, "libtinynv: ada scrubber already ran (handoff %u), skipped\n", h);
+    }
+  }
+
   // booter_load on SEC2, carrying the wpr metadata. engine id 1 and ucode id 3 are what this image declares itself to
   // be; the boot rom refuses it under any other pair.
   if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
@@ -445,6 +474,7 @@ void tinynv_flcn_fini(tinynv_gpu_t *g) {
   tinynv_flcn_t *f = &g->flcn;
   tinynv_vbios_fwsec_free(g, &f->fwsec);
   flcn_free_booter(g, &f->booter);
+  flcn_free_booter(g, &f->scrubber);
   tinynv_fw_free(&f->unload.fw);
   if (f->boot_args.size) tinynv_free_boot_mem(&g->mm, &f->boot_args);
   if (f->fmc_image.size) tinynv_free_boot_mem(&g->mm, &f->fmc_image);

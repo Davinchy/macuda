@@ -42,6 +42,7 @@ typedef struct {
   uint64_t frts_offset;         // where fwsec is asked to place the write-protected region
   tinynv_booter_t booter;       // booter_load, held for the life of the process as the oracle holds it
   tinynv_booter_t unload;       // booter_unload's offsets and firmware; its bytes go into booter_load's slot at unload
+  tinynv_booter_t scrubber;     // Ada only: the SEC2 ucode that scrubs video memory before booter_load (kgspExecuteScrubberIfNeeded_AD102)
   int unload_staged;            // both unload images have been written into the boot's slots
   int unloaded;                 // the unload ran and the region is down: the next open finds a cold card
 } tinynv_flcn_t;

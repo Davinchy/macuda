@@ -26,7 +26,11 @@ set -- \
   "ga102 gsp-570.144.bin         a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f" \
   "ga102 booter_load-570.144.bin 4497e3eff7e95c774b8a569d17b27c08c9650158d10b229d2be81cdcad9a085b" \
   "ga102 booter_unload-570.144.bin 8e63db5b78d7d3e349f20a2d11099c3d7109081393cb09ffc0a28133324ae009" \
-  "ga102 bootloader-570.144.bin  82428f532240727e95bb3083fbaaba9b2cc7b937314323f2d546ce7245f27fad"
+  "ga102 bootloader-570.144.bin  82428f532240727e95bb3083fbaaba9b2cc7b937314323f2d546ce7245f27fad" \
+  "ad102 booter_load-570.144.bin 8b293e19b637c5e22c87a2428d1c71bb13e0904e8a88ac6b3c6c1f2679c6e37a" \
+  "ad102 booter_unload-570.144.bin 975b85a14ded8e430d30f000c3c1afdd55c15dee04f35ff9dfd876acd7e67186" \
+  "ad102 bootloader-570.144.bin  65ab2e6b6e0fca95365c4deac79a34582abcfeb15b6ae234138f22e7183118a8" \
+  "ad102 scrubber-570.144.bin    c397358e5c4258dab070966589c7b172eb00771fd15d0bb74b8e22f327c1909b"
 
 sha_of() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1 || sha256sum "$1" | cut -d' ' -f1; }
 
