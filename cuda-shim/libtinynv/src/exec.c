@@ -2852,6 +2852,19 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
   // the engines must be bound before anything is built on them, and this happens once
   if (tinynv_exec_idle(ex)) return -1;
 
+  // MAKE VIDEO MEMORY MATCH last_delivered, which is calloc'd: the delta delivery skips every byte the shadow agrees
+  // with it on, so it assumes the descriptor region starts zeroed. A cold power-on scrubs video memory and that holds.
+  // An open after an unload (TINYNV_UNLOAD=1 on a chain-of-trust card, 2026-09-30) finds the previous run's descriptors
+  // still there: the skipped zero bytes stayed stale, the copy engine faulted, and at the SAME launch (976) every time,
+  // because the two runs built identical chains. One copy of zeroes at open, once.
+  if (ex->arena_dma && ex->region[AR_DESC].last_delivered) {
+    uint64_t n = ex->region[AR_DESC].size < ex->mirror.size ? ex->region[AR_DESC].size : ex->mirror.size;
+    memset(ex->mirror.dma.va, 0, (size_t)n);
+    if (tinynv_exec_copy(ex, ex->region[AR_DESC].mem.va, ex->mirror.va, n) || tinynv_exec_idle(ex)) return -1;
+    fprintf(stderr, "libtinynv: descriptor region zeroed at open (%llu MB), so the delta baseline is true on a warm card\n",
+            (unsigned long long)(n >> 20));
+  }
+
   ex->ready = 1;
   return 0;
 }
