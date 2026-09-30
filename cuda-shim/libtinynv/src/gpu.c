@@ -5,6 +5,7 @@
 // before GSP-RM has placed its metadata would send the FSP a message pointing at nothing.
 #include "gpu.h"
 #include "internal.h"
+#include "nv_regs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,8 +87,28 @@ int tinynv_gpu_boot_firmware(tinynv_gpu_t *g) {
 int tinynv_gpu_unload(tinynv_gpu_t *g) {
   if (!g->gsp.up) return 0;         // nothing came up, so there is nothing to tell
   if (!g->dev.pci->live) return 0;  // a recording ends where it ends
-  if (g->dev.fmc_boot) return 0;    // the chain-of-trust path has no booter_unload; its reset-on-open has always worked
   const char *knob = getenv("TINYNV_UNLOAD");
+  // The chain-of-trust path has no booter_unload, and its reset-on-open works on the 5090 in the AORUS box, so it stays
+  // resident by default. It does NOT work on GB203 (RTX PRO 4000 SFF) in a Razer Core X (2026-09-30): after the reset
+  // GSP_INIT_DONE comes back NV_ERR_TIMEOUT with WPR2 cleared - the 3060's failure above. TINYNV_UNLOAD=1, said
+  // explicitly, unloads it as NVIDIA's kgspUnloadRm + kgspTeardown_GH100 do: the notice, the suspended mailbox, then
+  // the RISC-V halt that lets ACR and the FMC finish their shutdown and take WPR2 down, so the next open is cold.
+  if (g->dev.fmc_boot) {
+    if (!knob || strcmp(knob, "1")) return 0;
+    if (tinynv_gsp_unload(g)) {
+      fprintf(stderr, "libtinynv: the unload did not complete: %s. The next open will reset the card\n", tinynv_last_error());
+      return -1;
+    }
+    double t0 = tinynv_now_s();
+    uint32_t cpuctl;
+    while (!NV_GET(cpuctl = tinynv_rd32(&g->dev, g->flcn.falcon + NV_PRISCV_RISCV_CPUCTL), NV_PRISCV_RISCV_CPUCTL, HALTED) &&
+           tinynv_now_s() - t0 < 5.0) {}
+    uint32_t wpr2 = tinynv_rd32(&g->dev, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+    fprintf(stderr, "libtinynv: chain-of-trust unload: riscv %s after %.2f s (cpuctl %#x), WPR2 %s\n",
+            NV_GET(cpuctl, NV_PRISCV_RISCV_CPUCTL, HALTED) ? "halted" : "NOT halted", tinynv_now_s() - t0, cpuctl,
+            wpr2 ? "STILL UP - the next open will reset the card" : "down - the next open is cold");
+    return 0;
+  }
   if (knob && !strcmp(knob, "0")) {
     fprintf(stderr, "libtinynv: TINYNV_UNLOAD=0: gsp-rm is left resident, and the next open will reset the card first\n");
     return 0;
