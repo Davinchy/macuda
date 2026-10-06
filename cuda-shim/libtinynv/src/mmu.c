@@ -9,6 +9,7 @@
 // bump allocator while nothing has been freed — which is the whole of the boot sequence — so replay against a recorded
 // boot verifies them as equivalent. When freeing starts to matter this has to grow a free list, and the recording will
 // say so by diverging on an address.
+#include <time.h>
 #include "mmu.h"
 #include "internal.h"
 #include <stdlib.h>
@@ -69,6 +70,91 @@ uint64_t tinynv_mm_palloc(tinynv_mm_t *mm, uint64_t size, uint64_t align, int ze
   return paddr;
 }
 
+// VA LEDGER. A fault names an address and nothing about what it was. This keeps the last VAL_N ranges the address
+// allocator handed out (with a tag for who asked: a kernel image, a cudaMalloc, the driver's own arenas) and marks each
+// one when it is given back, so the post-mortem can say "inside live range X", "inside range Y, FREED n allocations ago"
+// or "in no range ever handed out", which are three different bugs.
+#define VAL_N 16384
+typedef struct { uint64_t va, size, seq, freed_seq; double t_alloc, t_free; char tag[56]; } val_entry_t;
+static val_entry_t val_ring[VAL_N];
+static uint64_t val_total, val_frees;
+static char val_cur_tag[56] = "driver";
+static double val_t0;
+
+static double val_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+  if (!val_t0) val_t0 = t;
+  return t - val_t0;
+}
+
+void tinynv_va_tag_set(const char *tag) { snprintf(val_cur_tag, sizeof(val_cur_tag), "%s", tag && *tag ? tag : "driver"); }
+
+static void val_record(uint64_t va, uint64_t size) {
+  val_entry_t *e = &val_ring[val_total % VAL_N];
+  memset(e, 0, sizeof(*e));
+  e->va = va; e->size = size; e->seq = ++val_total; e->t_alloc = val_now();
+  snprintf(e->tag, sizeof(e->tag), "%s", val_cur_tag);
+}
+
+void tinynv_va_ledger_free(uint64_t va, uint64_t size) {
+  uint64_t n = val_total < VAL_N ? val_total : VAL_N;
+  for (uint64_t k = 0; k < n; k++) {
+    val_entry_t *e = &val_ring[(val_total - 1 - k) % VAL_N];
+    if (e->va == va && !e->freed_seq) {
+      e->freed_seq = ++val_frees; e->t_free = val_now();
+      (void)size;
+      return;
+    }
+  }
+}
+
+int tinynv_va_ledger_tag(uint64_t va, char *out, size_t n) {
+  uint64_t cnt = val_total < VAL_N ? val_total : VAL_N;
+  for (uint64_t k = 0; k < cnt; k++) {
+    const val_entry_t *e = &val_ring[(val_total - 1 - k) % VAL_N];
+    if (va >= e->va && va < e->va + e->size && !e->freed_seq) { snprintf(out, n, "%s", e->tag); return 1; }
+  }
+  return 0;
+}
+
+void tinynv_va_ledger_describe(uint64_t fva) {
+  uint64_t n = val_total < VAL_N ? val_total : VAL_N;
+  fprintf(stderr, "tinynv: VA LEDGER: fault address %#llx; %llu allocations recorded (%llu kept), %llu freed, now t=%.2f s\n",
+          (unsigned long long)fva, (unsigned long long)val_total, (unsigned long long)n, (unsigned long long)val_frees,
+          val_now());
+  int inside = 0;
+  const val_entry_t *below = NULL, *above = NULL;
+  for (uint64_t k = 0; k < n; k++) {
+    const val_entry_t *e = &val_ring[(val_total - 1 - k) % VAL_N];
+    if (fva >= e->va && fva < e->va + e->size) {
+      inside++;
+      fprintf(stderr, "tinynv:   INSIDE #%llu [%#llx, %#llx) %llu bytes, \"%s\", allocated t=%.2f s, %s (fault is +%#llx into it)\n",
+              (unsigned long long)e->seq, (unsigned long long)e->va, (unsigned long long)(e->va + e->size),
+              (unsigned long long)e->size, e->tag, e->t_alloc,
+              e->freed_seq ? "FREED" : "still live",
+              (unsigned long long)(fva - e->va));
+      if (e->freed_seq)
+        fprintf(stderr, "tinynv:     freed t=%.2f s (%.2f s after it was allocated), %llu allocations ago\n", e->t_free,
+                e->t_free - e->t_alloc, (unsigned long long)(val_total - e->seq));
+    } else {
+      if (e->va + e->size <= fva && (!below || e->va + e->size > below->va + below->size)) below = e;
+      if (e->va > fva && (!above || e->va < above->va)) above = e;
+    }
+  }
+  if (!inside) fprintf(stderr, "tinynv:   in NO recorded range - nothing was ever handed out here (within the %llu kept)\n",
+                       (unsigned long long)n);
+  if (below)
+    fprintf(stderr, "tinynv:   nearest range below: #%llu [%#llx, %#llx) \"%s\" %s, fault is %#llx bytes past its end\n",
+            (unsigned long long)below->seq, (unsigned long long)below->va, (unsigned long long)(below->va + below->size),
+            below->tag, below->freed_seq ? "FREED" : "live", (unsigned long long)(fva - below->va - below->size));
+  if (above)
+    fprintf(stderr, "tinynv:   nearest range above: #%llu [%#llx, %#llx) \"%s\" %s, starts %#llx bytes after the fault\n",
+            (unsigned long long)above->seq, (unsigned long long)above->va, (unsigned long long)(above->va + above->size),
+            above->tag, above->freed_seq ? "FREED" : "live", (unsigned long long)(above->va - fva));
+}
+
 uint64_t tinynv_mm_alloc_va(tinynv_mm_t *mm, uint64_t size, uint64_t align) {
   if (refuse_if_wedged(mm)) return TINYNV_BAD_ADDR;
   // the oracle aligns to the largest power of two that fits inside the size, not the smallest that contains it, so a
@@ -78,6 +164,7 @@ uint64_t tinynv_mm_alloc_va(tinynv_mm_t *mm, uint64_t size, uint64_t align) {
   uint64_t va = tinynv_tlsf_alloc(mm->va, sz, align > want ? align : want);
   if (va == TINYNV_TLSF_FAIL) return tinynv_fail("no virtual address range of %llu bytes is free", (unsigned long long)sz)
                                      ? TINYNV_BAD_ADDR : TINYNV_BAD_ADDR;
+  val_record(va, sz);
   return va;
 }
 

@@ -613,6 +613,9 @@ tinynv_status_t tinynv_malloc(tinynv_device_t d, size_t n, tinynv_devptr_t *out)
     tinynv_alloc_t *a = &d->allocs[d->nallocs];
     // Video memory, not host memory, and not visible from here: this is where a model's weights go. The allocator hands
     // back a virtual address whose alignment the page tables guarantee, which is far more than the 256 promised above.
+    char tg[56];
+    snprintf(tg, sizeof(tg), "cudaMalloc %zu bytes", n);
+    tinynv_va_tag_set(tg);
     // SLACK PAST THE END. The address allocator packs buffers with nothing mapped between them, and a kernel that reads one
     // element past the end of its buffer then touches a page that is not there. Real CUDA never shows that: it hands out
     // buffers from heaps of 2 MB pages, so a read just past the end lands in the allocation's own padding. Caught by the
@@ -620,7 +623,9 @@ tinynv_status_t tinynv_malloc(tinynv_device_t d, size_t n, tinynv_devptr_t *out)
     // later. TINYNV_ALLOC_SLACK_KB sets the pad (default 64, 0 = off).
     static long slack_kb = -1;
     if (slack_kb < 0) { const char *se = getenv("TINYNV_ALLOC_SLACK_KB"); slack_kb = se && *se ? atol(se) : 64; if (slack_kb < 0) slack_kb = 0; }
-    if (tinynv_mm_alloc_buffer(&d->gpu.mm, (n ? n : 1) + (size_t)slack_kb * 1024, 0, 0, 0, 1, 0, &a->map)) {
+    int mrc = tinynv_mm_alloc_buffer(&d->gpu.mm, (n ? n : 1) + (size_t)slack_kb * 1024, 0, 0, 0, 1, 0, &a->map);
+    tinynv_va_tag_set(NULL);
+    if (mrc) {
       pthread_mutex_unlock(&g_lock);
       return TINYNV_ERR_OOM;
     }

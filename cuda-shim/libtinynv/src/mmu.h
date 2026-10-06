@@ -139,6 +139,11 @@ typedef struct {
 int tinynv_mm_init(tinynv_mm_t *mm, tinynv_dev_t *dev);
 uint64_t tinynv_mm_palloc(tinynv_mm_t *mm, uint64_t size, uint64_t align, int zero, tinynv_region_kind_t kind);
 uint64_t tinynv_mm_alloc_va(tinynv_mm_t *mm, uint64_t size, uint64_t align);
+// VA LEDGER (post-mortem only): every range handed out and given back, so a faulting address can be named.
+void tinynv_va_tag_set(const char *tag);
+void tinynv_va_ledger_free(uint64_t va, uint64_t size);
+void tinynv_va_ledger_describe(uint64_t va);
+int tinynv_va_ledger_tag(uint64_t va, char *out, size_t n); // 1 if va is inside a recorded range, with its tag
 
 // Allocate boot memory and optionally fill it. `sysmem` is 1 for host memory, 0 for video memory, and -1 to let the size
 // of the window decide, which is what the boot path asks for.

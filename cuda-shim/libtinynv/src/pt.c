@@ -451,6 +451,7 @@ void tinynv_vmap_free(tinynv_mm_t *mm, tinynv_vmap_t *m) {
     memset(m, 0, sizeof(*m));
     return;
   }
+  tinynv_va_ledger_free(m->va, m->size);
   tinynv_tlsf_release(mm->va, m->va);
 
   if (m->in_sysmem) mm->dev->pci->dma_free(mm->dev->pci, &m->dma);

@@ -311,6 +311,120 @@ int tinynv_exec_reached(tinynv_exec_t *ex, uint64_t value) {
   return sem_reached(ex, value);
 }
 
+// POST-MORTEM, taken at a fault and never on the way: what is ACTUALLY in video memory where the engine reads its
+// descriptors, against what the driver built (shadow) and what it believes is resident (last_delivered).
+//
+// The older check below reads the host mirror, which is only the copy engine's source: in delta mode the changes reach
+// video memory as inline patches in the pushbuffer and the mirror is never updated, so it differs from what the engine
+// read by construction. That makes "HAS CHANGED" there uninformative. This reads the memory the engine reads.
+//
+//   vram != shadow       delivery lost or reordered a write (or a flush still being built - its span is skipped)
+//   vram != last_delivered   the delta baseline is a lie: a skipped byte that was never actually resident
+//   shadow != last_delivered  expected only for the span being built
+// and any 8-byte value within 2 MB of the faulting address is listed with its offset, which names the descriptor
+// (and so the launch) that carried the bad pointer.
+// Reads [off, off+n) of the descriptor region from video memory, a physical range at a time (the region is built from
+// 2 MB chunks that need not be adjacent, so one read from ranges[0] is only right for the first chunk).
+static void rd_desc_region(tinynv_exec_t *ex, const tinynv_exec_region_t *rg, uint64_t off, uint8_t *dst, uint64_t n) {
+  uint64_t base = 0;
+  for (int i = 0; i < rg->mem.nranges && n; i++) {
+    uint64_t sz = rg->mem.ranges[i].size;
+    if (off < base + sz) {
+      uint64_t take = base + sz - off < n ? base + sz - off : n;
+      nv_rd_block(&ex->g->dev.vram, rg->mem.ranges[i].paddr + (off - base), dst, (size_t)take);
+      dst += take; off += take; n -= take;
+    }
+    base += sz;
+  }
+}
+
+static void postmortem_desc(tinynv_exec_t *ex, uint64_t head_off) {
+  if (ex->g->gsp.fault_have) tinynv_va_ledger_describe(ex->g->gsp.fault_va);
+  tinynv_exec_region_t *rg = &ex->region[AR_DESC];
+  if (!ex->arena_vram || !rg->shadow || !rg->mem.ranges) return;
+  const char *e = getenv("TINYNV_POSTMORTEM_KB");
+  uint64_t cap = (uint64_t)(e && *e ? atoi(e) : 1024) << 10;
+  // the window starts at the head of the oldest unfinished compute batch: that chain is what the engine was running
+  uint64_t lo = head_off & ~3ull;
+  if (lo >= rg->size) lo = 0;
+  if (cap > rg->size - lo) cap = rg->size - lo;
+  if (!cap) return;
+  uint8_t *vr = malloc((size_t)cap);
+  if (!vr) return;
+  double t0 = now();
+  rd_desc_region(ex, rg, lo, vr, cap);
+  double dt = now() - t0;
+  // A card that has stopped answering reads back all ones; comparing that to the shadow says nothing, so say so and scan
+  // the shadow instead (delta delivery or not, it is what the driver built and sent)
+  int vram_dead = ((const uint32_t *)vr)[0] == 0xffffffffu && ((const uint32_t *)vr)[cap / 8] == 0xffffffffu &&
+                  ((const uint32_t *)vr)[cap / 4 - 1] == 0xffffffffu;
+  if (vram_dead) {
+    fprintf(stderr, "tinynv: POST-MORTEM: the read-back from video memory returned all ones (the card is not answering), "
+            "so the shadow is scanned instead\n");
+    memcpy(vr, rg->shadow + lo, (size_t)cap);
+  }
+  const uint32_t *V = (const uint32_t *)vr, *S = (const uint32_t *)(rg->shadow + lo);
+  const uint32_t *L = rg->last_delivered ? (const uint32_t *)(rg->last_delivered + lo) : NULL;
+  uint64_t dlo = rg->dirty_lo, dhi = rg->dirty_hi;
+  unsigned n_vs = 0, n_vl = 0, n_sl = 0, shown = 0;
+  fprintf(stderr, "tinynv: POST-MORTEM: descriptor region %#llx..%#llx (from the head of the oldest unfinished compute "
+          "batch) read back from video memory in %.2f s (span being built, %#llx..%#llx, skipped)\n",
+          (unsigned long long)lo, (unsigned long long)(lo + cap), dt, (unsigned long long)dlo, (unsigned long long)dhi);
+  for (uint64_t i = 0; i < cap / 4; i++) {
+    uint64_t off = lo + i * 4;
+    if (off >= dlo && off < dhi) continue;
+    int vs = V[i] != S[i], vl = L && V[i] != L[i], sl = L && S[i] != L[i];
+    n_vs += vs; n_vl += vl; n_sl += sl;
+    if ((vs || vl) && shown < 12) {
+      fprintf(stderr, "tinynv:   +%#08llx  vram %#010x  shadow %#010x  last_delivered %#010x\n",
+              (unsigned long long)off, V[i], S[i], L ? L[i] : 0u);
+      shown++;
+    }
+  }
+  fprintf(stderr, "tinynv:   dwords differing: vram!=shadow %u, vram!=last_delivered %u, shadow!=last_delivered %u\n",
+          n_vs, n_vl, n_sl);
+  if (ex->g->gsp.fault_have) {
+    uint64_t fva = ex->g->gsp.fault_va;
+    unsigned hits = 0;
+    // any 8-byte value that could be a pointer to the faulting page or near it, with the offset of the launch it came from
+    for (uint64_t off = 0; off + 8 <= cap && hits < 24; off += 4) {
+      uint64_t v;
+      memcpy(&v, vr + off, 8);
+      if (v >= 0x1000000000ull && v + 0x200000 >= fva && v <= fva + 0x200000) {
+        fprintf(stderr, "tinynv:   descriptor +%#llx (%+lld from the chain head) holds %#llx, %+lld bytes from the faulting address %#llx\n",
+                (unsigned long long)(lo + off), (long long)(lo + off) - (long long)head_off, (unsigned long long)v,
+                (long long)(v - fva), (unsigned long long)fva);
+        // which kernel's launch carried it: the program address sits in the same descriptor, so look for a value that
+        // lands in a kernel image the ledger knows
+        char tg[56];
+        for (uint64_t o2 = off > 1024 ? off - 1024 : 0; o2 + 8 <= cap && o2 < off + 1024; o2 += 4) {
+          uint64_t w;
+          memcpy(&w, vr + o2, 8);
+          if (w >= 0x1000000000ull && tinynv_va_ledger_tag(w, tg, sizeof(tg)) && !strncmp(tg, "image ", 6)) {
+            fprintf(stderr, "tinynv:     nearby descriptor value %#llx is inside %s (%+lld bytes away)\n",
+                    (unsigned long long)w, tg, (long long)o2 - (long long)off);
+            break;
+          }
+        }
+        hits++;
+      }
+    }
+    if (!hits) fprintf(stderr, "tinynv:   no 8-byte value in %llu KB of descriptors from the chain head is within 2 MB of the faulting address %#llx\n",
+                       (unsigned long long)(cap >> 10), (unsigned long long)fva);
+  }
+  static const char *pn[] = {"none", "delta", "delta-skip", "inline", "copy"};
+  uint64_t tot = ex->frec_n;
+  fprintf(stderr, "tinynv: last descriptor flushes, newest first (path, span, launches, patches, upto, lap, flags: 1=delta fell back, 2=after a standstill):\n");
+  for (unsigned k = 0; k < 16 && k < tot && k < 64; k++) {
+    unsigned ix = (unsigned)((tot - 1 - k) % 64);
+    fprintf(stderr, "tinynv:   #%llu %-10s %#llx..%#llx  n=%u patches=%u upto=%llu lap=%llu flags=%u\n",
+            (unsigned long long)ex->frec[ix].seq, pn[ex->frec[ix].path < 5 ? ex->frec[ix].path : 0],
+            (unsigned long long)ex->frec[ix].lo, (unsigned long long)ex->frec[ix].hi, ex->frec[ix].n, ex->frec[ix].ns,
+            (unsigned long long)ex->frec[ix].upto, (unsigned long long)ex->frec[ix].wraps, ex->frec[ix].flags);
+  }
+  free(vr);
+}
+
 int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
   // A pending keep-alive is let go before a wait that needs the compute queue past it (the driver's own later work,
   // which never happens on a decode); a wait that needs no more than what came before it leaves the spin alone.
@@ -602,6 +716,7 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
         fprintf(stderr, "tinynv:   (%llu later submissions not recorded - the trail holds the oldest outstanding, which "
                 "is the one that matters)\n", (unsigned long long)ex->ndropped);
       int shown = 0;
+      uint64_t pm_head = 0;
       for (int i = 0; i < ex->ntrail; i++) {
         size_t at = (size_t)i;
         if (ex->trail[at].upto <= v) continue;   // already done
@@ -632,6 +747,7 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
                   (unsigned long long)ex->trail[at].slot);
         if (ex->trail[at].head_va) {
           uint64_t off = ex->trail[at].head_va - ex->region[AR_DESC].mem.va;
+          if (!pm_head && !ex->trail[at].copy) pm_head = off;
           if (off + TINYNV_QMD_BYTES <= ex->region[AR_DESC].size) {
             // Read it from where the engine reads it. Checking the shadow was checking the copy that is never wrong
             // against itself, which is why every stall reported an intact descriptor while the engine was looking at
@@ -651,6 +767,7 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
         shown++;
       }
       if (!shown) fprintf(stderr, "tinynv:   none - everything submitted has finished, so what is missing was never submitted\n");
+      postmortem_desc(ex, pm_head);
       return tinynv_fail("the engines did not reach %llu within %.1fs (compute is at %llu, copy at %llu): %s%s%s",
                          (unsigned long long)value, seconds, (unsigned long long)v, (unsigned long long)vcopy,
                          what, where, ring);
@@ -1280,6 +1397,8 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // last_delivered can be brought up to date at the end regardless of which path actually did the delivering.
   uint64_t delta_lo = ex->region[AR_DESC].dirty_lo, delta_hi = ex->region[AR_DESC].dirty_hi;
   int delta_handled = 0;
+  int fpath = 0;           // how this flush's descriptors were delivered, for the post-mortem ring: 1 delta, 2 delta-skip, 3 inline, 4 copy
+  unsigned fflags = 0;
   // This flush's patches and their footprint, hoisted out of the block below because the actual write happens after
   // batch_begin() further down - see the comment there for why it moved. The spans themselves live in ex->delta_span.
   unsigned delta_pend_n = 0;
@@ -1422,11 +1541,13 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
         ex->delta_skip_n++;
       }
       delta_handled = 1;
+      fpath = ns ? 1 : 2;
     } else {
       // The flush's genuine change is bigger than the budget (a chain shape that does not match what was here last
       // lap, or a real bulk change) - fall through to the existing full-span paths below, unchanged. Conservative on
       // purpose: this is never worse than today's behaviour, only sometimes not as good as it could be.
       ex->delta_full_n++;
+      fflags |= 1;
     }
   }
   if (!delta_handled && ex->hybrid_delivery && ex->arena_dma &&
@@ -1438,6 +1559,7 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
     tinynv_arena_mark(&ex->region[AR_DESC], lo, lo + len, chain_upto);
     ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
     ex->hybrid_n++;
+    fpath = 3;
   }
   if (!delta_handled && ex->arena_dma && ex->region[AR_DESC].dirty_hi > ex->region[AR_DESC].dirty_lo) {
     uint64_t lo = ex->region[AR_DESC].dirty_lo, len = ex->region[AR_DESC].dirty_hi - lo;
@@ -1453,6 +1575,7 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
     // it costs a full round trip and drains whatever writes are queued ahead of it, which is why halving the count is
     // worth more than the microseconds suggest. Every flush in delivery mode was paying for two.
     ex->defer_ring = 1;
+    fpath = 4;
     int rc = tinynv_exec_copy(ex, ex->region[AR_DESC].mem.va + lo, ex->mirror.va + lo, len);
     ex->defer_ring = 0;
     if (rc) return -1;
@@ -1466,6 +1589,13 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // resident, a future skip could omit an update that had to reach video memory.
   if (ex->region[AR_DESC].last_delivered && delta_hi > delta_lo)
     memcpy(ex->region[AR_DESC].last_delivered + delta_lo, ex->region[AR_DESC].shadow + delta_lo, delta_hi - delta_lo);
+  {
+    unsigned fk = (unsigned)(ex->frec_n % 64);
+    ex->frec_n++;
+    ex->frec[fk].seq = ex->frec_n; ex->frec[fk].lo = delta_lo; ex->frec[fk].hi = delta_hi; ex->frec[fk].upto = chain_upto;
+    ex->frec[fk].wraps = ex->wraps[AR_DESC]; ex->frec[fk].n = (uint32_t)n; ex->frec[fk].ns = delta_pend_n;
+    ex->frec[fk].path = (uint32_t)fpath; ex->frec[fk].flags = fflags | (ex->after_stall ? 2u : 0u);
+  }
 
   uint64_t va;
   tinynv_cmdbuf_t c;
@@ -2012,7 +2142,14 @@ int tinynv_exec_load(tinynv_exec_t *ex, const tinynv_cubin_t *cb, const char *ke
   memset(out, 0, sizeof(*out));
   if (tinynv_cubin_image(cb, kernel, 1, &out->layout)) return -1;
   uint64_t bytes = ((out->layout.len + 0xfff) & ~0xfffull) + IMAGE_GUARD;
-  if (tinynv_mm_alloc_buffer(&ex->g->mm, bytes, 0, 0, 0, 1, 0, &out->mem)) { tinynv_image_free(&out->layout); return -1; }
+  {
+    char tg[56];
+    snprintf(tg, sizeof(tg), "image %.48s", kernel);
+    tinynv_va_tag_set(tg);
+  }
+  int img_rc = tinynv_mm_alloc_buffer(&ex->g->mm, bytes, 0, 0, 0, 1, 0, &out->mem);
+  tinynv_va_tag_set(NULL);
+  if (img_rc) { tinynv_image_free(&out->layout); return -1; }
   if (tinynv_image_relocate(&out->layout, out->mem.va) ||
       tinynv_exec_upload(ex, out->mem.va, out->layout.bytes, out->layout.len) ||
       // the tail, including the guard page: the prefetcher reads past the end of a kernel, and what it finds should be

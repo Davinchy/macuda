@@ -334,6 +334,9 @@ typedef struct {
   // own previous-token self. See tinynv_exec_run.
   int delta_rewind;
   uint64_t delta_rewind_n;
+  // The last 64 descriptor flushes, kept for the post-mortem: how each was delivered and where. Written once per flush.
+  struct { uint64_t seq, lo, hi, upto, wraps; uint32_t n, ns, path, flags; } frec[64];
+  uint64_t frec_n;
   // Launch every descriptor from the command stream and link none of them, so nothing orders one kernel against the
   // next. THIS PRODUCES WRONG ANSWERS for any real workload - dependent kernels run side by side - and exists for one
   // measurement: whether the submission path can sustain a launch a microsecond when nothing waits on anything. The
