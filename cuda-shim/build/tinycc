@@ -31,7 +31,7 @@ GMAC=${TINYCC_GGML_MAC:-$R/llama.cpp/ggml}
 # where the ggml tree is seen from the device side: a path on the Linux box, or the bind mount inside the container.
 # The -I rewriting below keys off this, so it has to be set before the argument loop either way.
 if [ "$BACKEND" = docker ]; then GLIN=/ggml; else GLIN=${TINYCC_GGML_LINUX:-ggml}
-  SSH="ssh ${KEY:+-i $KEY} -o BatchMode=yes -o ControlMaster=auto -o ControlPath=$ROOT/.cache/cc-%C -o ControlPersist=300"
+  SSH="ssh ${KEY:+-i $KEY} -o BatchMode=yes -o ControlMaster=auto -o ControlPath=${TINYCC_CTL_DIR:-/tmp}/tinycc-%C -o ControlPersist=300"
 fi
 src=""; out=""; hostI=""; devI=""; defs=""; std="-std=c++17"
 while [ $# -gt 0 ]; do case "$1" in
@@ -58,7 +58,7 @@ elif [ "$BACKEND" = docker ]; then
   mv "/tmp/tinycc-fatbin/tinycc_$base.fatbin" "$fat"
 else
 $SSH "$HOST" "export PATH=/usr/local/cuda/bin:\$PATH; nvcc $NVCC_ARGS $devI $defs -o /tmp/tinycc_$base.fatbin '$GLIN/$rel'"
-scp -q ${KEY:+-i "$KEY"} -o "ControlPath=$ROOT/.cache/cc-%C" "$HOST:/tmp/tinycc_$base.fatbin" "$fat"
+scp -q ${KEY:+-i "$KEY"} -o "ControlPath=${TINYCC_CTL_DIR:-/tmp}/tinycc-%C" "$HOST:/tmp/tinycc_$base.fatbin" "$fat"
 fi
 # 2) host compile on the Mac, embed the fatbin. Optimised: until 2026-09-19 this line carried no -O at all, so every ggml-cuda
 # dispatcher ran at -O0 - the per-kernel profile put the caller's cost above the runtime layer at 2.38 us a launch and the
