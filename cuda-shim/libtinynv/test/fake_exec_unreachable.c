@@ -32,6 +32,12 @@ void tinynv_mm_map_range_fresh(void);
 void tinynv_mm_map_range_fresh(void) { unreachable("tinynv_mm_map_range_fresh"); }
 void tinynv_mm_range_is_mapped(void);
 void tinynv_mm_range_is_mapped(void) { unreachable("tinynv_mm_range_is_mapped"); }
+void tinynv_va_ledger_describe(void);
+void tinynv_va_ledger_describe(void) { unreachable("tinynv_va_ledger_describe"); }
+void tinynv_va_ledger_tag(void);
+void tinynv_va_ledger_tag(void) { unreachable("tinynv_va_ledger_tag"); }
+void tinynv_va_tag_set(void);
+void tinynv_va_tag_set(void) { unreachable("tinynv_va_tag_set"); }
 void tinynv_mm_reserve_cpu_region(void);
 void tinynv_mm_reserve_cpu_region(void) { unreachable("tinynv_mm_reserve_cpu_region"); }
 void tinynv_mm_stage(void);
