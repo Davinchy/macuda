@@ -325,17 +325,32 @@ int tinynv_exec_reached(tinynv_exec_t *ex, uint64_t value) {
 // (and so the launch) that carried the bad pointer.
 // Reads [off, off+n) of the descriptor region from video memory, a physical range at a time (the region is built from
 // 2 MB chunks that need not be adjacent, so one read from ranges[0] is only right for the first chunk).
-static void rd_desc_region(tinynv_exec_t *ex, const tinynv_exec_region_t *rg, uint64_t off, uint8_t *dst, uint64_t n) {
-  uint64_t base = 0;
-  for (int i = 0; i < rg->mem.nranges && n; i++) {
-    uint64_t sz = rg->mem.ranges[i].size;
-    if (off < base + sz) {
-      uint64_t take = base + sz - off < n ? base + sz - off : n;
-      nv_rd_block(&ex->g->dev.vram, rg->mem.ranges[i].paddr + (off - base), dst, (size_t)take);
-      dst += take; off += take; n -= take;
+//
+// Only through the processor's window onto video memory (BAR1, 256 MB on a small-BAR card), and the region need not be
+// inside it: with descriptors delivered by the copy engine (the default) it is allocated without processor access and
+// can sit anywhere. A read past the window is not a read of the region - the remote backend answers all ones, which
+// used to be reported as a card that had stopped answering. So every range is checked first, and the answer is 0 when
+// the whole span is readable and -1, having read nothing, when any of it lies outside; *outside gets the first such
+// physical address.
+static int rd_desc_region(tinynv_exec_t *ex, const tinynv_exec_region_t *rg, uint64_t off, uint8_t *dst, uint64_t n,
+                          uint64_t *outside) {
+  uint64_t win = ex->g->dev.vram.size;
+  for (int pass = 0; pass < 2; pass++) {
+    uint64_t base = 0, o = off, left = n;
+    uint8_t *d = dst;
+    for (int i = 0; i < rg->mem.nranges && left; i++) {
+      uint64_t sz = rg->mem.ranges[i].size;
+      if (o < base + sz) {
+        uint64_t take = base + sz - o < left ? base + sz - o : left;
+        uint64_t pa = rg->mem.ranges[i].paddr + (o - base);
+        if (pass == 0 && (pa > win || take > win - pa)) { *outside = pa; return -1; }
+        if (pass == 1) nv_rd_block(&ex->g->dev.vram, pa, d, (size_t)take);
+        d += take; o += take; left -= take;
+      }
+      base += sz;
     }
-    base += sz;
   }
+  return 0;
 }
 
 static void postmortem_desc(tinynv_exec_t *ex, uint64_t head_off) {
@@ -352,11 +367,19 @@ static void postmortem_desc(tinynv_exec_t *ex, uint64_t head_off) {
   uint8_t *vr = malloc((size_t)cap);
   if (!vr) return;
   double t0 = now();
-  rd_desc_region(ex, rg, lo, vr, cap);
+  uint64_t outside = 0;
+  int unreadable = rd_desc_region(ex, rg, lo, vr, cap, &outside) != 0;
   double dt = now() - t0;
+  if (unreadable) {
+    fprintf(stderr, "tinynv: POST-MORTEM: the descriptor region at physical %#llx lies outside the processor's %llu MB window "
+            "onto video memory, so it cannot be read back from here and the shadow is scanned instead (what the driver "
+            "built and sent, not what the engine read)\n", (unsigned long long)outside,
+            (unsigned long long)(ex->g->dev.vram.size >> 20));
+    memcpy(vr, rg->shadow + lo, (size_t)cap);
+  }
   // A card that has stopped answering reads back all ones; comparing that to the shadow says nothing, so say so and scan
   // the shadow instead (delta delivery or not, it is what the driver built and sent)
-  int vram_dead = ((const uint32_t *)vr)[0] == 0xffffffffu && ((const uint32_t *)vr)[cap / 8] == 0xffffffffu &&
+  int vram_dead = !unreadable && ((const uint32_t *)vr)[0] == 0xffffffffu && ((const uint32_t *)vr)[cap / 8] == 0xffffffffu &&
                   ((const uint32_t *)vr)[cap / 4 - 1] == 0xffffffffu;
   if (vram_dead) {
     fprintf(stderr, "tinynv: POST-MORTEM: the read-back from video memory returned all ones (the card is not answering), "

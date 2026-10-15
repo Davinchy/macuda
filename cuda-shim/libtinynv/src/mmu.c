@@ -104,7 +104,6 @@ void tinynv_va_ledger_free(uint64_t va, uint64_t size) {
     val_entry_t *e = &val_ring[(val_total - 1 - k) % VAL_N];
     if (e->va == va && !e->freed_seq) {
       e->freed_seq = ++val_frees; e->t_free = val_now();
-      (void)size;
       return;
     }
   }
