@@ -1,0 +1,23 @@
+committed gemm.cubin vs the rebuilt sm_120 cubin (nvcc 13.0), per kernel: REG, SHARED, and the SASS text hashed with addresses stripped
+tinyblas_bw_read  committed [REG 30 SHARED 0] 1a561bf604057074  new [REG 30 SHARED 0] 1a561bf604057074  SAME  
+tinyblas_bw_write  committed [REG 34 SHARED 0] 6c2600541e28298c  new [REG 34 SHARED 0] 6c2600541e28298c  SAME  
+tinyblas_gemm_bf16_tc2_nn  NEW [REG 128 SHARED 47104] 9ef7e0565c2fe0c9  HMMA.16816.F32.BF16 
+tinyblas_gemm_bf16_tc2_nt  NEW [REG 128 SHARED 44032] cc3346417b3625b6  HMMA.16816.F32.BF16 
+tinyblas_gemm_bf16_tc2s_nn  NEW [REG 105 SHARED 24576] f5faffe823c265ad  HMMA.16816.F32.BF16 
+tinyblas_gemm_bf16_tc2s_nt  NEW [REG 89 SHARED 23552] 12a221dd03ac328e  HMMA.16816.F32.BF16 
+tinyblas_gemm_bf16_tc2s_tn  NEW [REG 92 SHARED 25600] 85afde33ea210a8c  HMMA.16816.F32.BF16 
+tinyblas_gemm_bf16_tc2s_tt  NEW [REG 103 SHARED 24576] d549d82d3c19b922  HMMA.16816.F32.BF16 
+tinyblas_gemm_bf16_tc2_tn  NEW [REG 124 SHARED 50176] 66dcddbf6dc61bf1  HMMA.16816.F32.BF16 
+tinyblas_gemm_bf16_tc2_tt  NEW [REG 128 SHARED 47104] 04532f4bf0826206  HMMA.16816.F32.BF16 
+tinyblas_gemm_f16_tc2_nn  committed [REG 116 SHARED 47104] 4cf492cf9034e139  new [REG 116 SHARED 47104] 4cf492cf9034e139  SAME  HMMA.16816.F32 
+tinyblas_gemm_f16_tc2_nt  committed [REG 114 SHARED 44032] 37a0708ce2d9f1d3  new [REG 114 SHARED 44032] 37a0708ce2d9f1d3  SAME  HMMA.16816.F32 
+tinyblas_gemm_f16_tc2s_nn  committed [REG 80 SHARED 24576] e4c8c269ed23b1f7  new [REG 80 SHARED 24576] e4c8c269ed23b1f7  SAME  HMMA.16816.F32 
+tinyblas_gemm_f16_tc2s_nt  committed [REG 75 SHARED 23552] de387438c509ed77  new [REG 75 SHARED 23552] de387438c509ed77  SAME  HMMA.16816.F32 
+tinyblas_gemm_f16_tc2s_tn  committed [REG 76 SHARED 25600] d6fe8a98152d68eb  new [REG 76 SHARED 25600] d6fe8a98152d68eb  SAME  HMMA.16816.F32 
+tinyblas_gemm_f16_tc2s_tt  committed [REG 80 SHARED 24576] 2e2c94832f3f6230  new [REG 80 SHARED 24576] 2e2c94832f3f6230  SAME  HMMA.16816.F32 
+tinyblas_gemm_f16_tc2_tn  committed [REG 110 SHARED 50176] 0847b1602ff33715  new [REG 110 SHARED 50176] 0847b1602ff33715  SAME  HMMA.16816.F32 
+tinyblas_gemm_f16_tc2_tt  committed [REG 116 SHARED 47104] d277981d8022bf9d  new [REG 116 SHARED 47104] d277981d8022bf9d  SAME  HMMA.16816.F32 
+tinyblas_gemm_f16_tc  committed [REG 252 SHARED 30720] 31a731077eeba9e3  new [REG 252 SHARED 30720] 31a731077eeba9e3  SAME  HMMA.16816.F32 
+tinyblas_gemm_f32  committed [REG 40 SHARED 0] 258f7f88ef27a6bb  new [REG 40 SHARED 0] 258f7f88ef27a6bb  SAME  
+tinyblas_gemm_f32_tc  committed [REG 254 SHARED 38912] ab227544ddfed685  new [REG 254 SHARED 38912] ab227544ddfed685  SAME  HMMA.1684.F32.TF32 
+tinyblas_trsm_rupn_f32  committed [REG 40 SHARED 0] 8d136c714b34e42c  new [REG 40 SHARED 0] 8d136c714b34e42c  SAME  

@@ -1,0 +1,17 @@
+=== Wed Sep 23 02:17:11 PDT 2026 worktree cuda-shim-bsplitk, cublas.c sha 58be78487f26, gemm.cubin sha256 4ee3b384e349b89b
+link_smoke rc=0
+13 row(s), 0 failure(s)
+stats_grid_check: 7/7 rows held
+   ok:   both arms ran to the end (rc 0 and 0, plan rows included)
+   ok:   ON: split-K announces itself on entry
+   ok:   ON: k/v -> tc2k grid (4,1,16)
+   ok:   ON: q/o and down -> tc2k grid (32,1,8), twice
+   ok:   ON: gate/up unchanged -> tc2s grid (172,1,1)
+   ok:   ON: diffusion mix unchanged -> tc2s grid (20,4,1)
+   ok:   ON: exactly 3 tc2k launches
+   ok:   OFF: no tc2k launch and no entry print
+   ok:   OFF: k/v -> tc2s grid (4,1,1)
+   ok:   OFF: q/o and down -> tc2s grid (32,1,1), twice
+   ok:   OFF: diffusion mix -> tc2s grid (20,4,1)
+splitk_check: 0 failure(s)
+splitk_check rc=0

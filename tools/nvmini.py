@@ -1,0 +1,51 @@
+# Minimal NV register access through the TinyGPU server, without booting anything. Mirrors NVDev._early_ip_init's includes.
+import os, time, socket, tinygrad.runtime.autogen.nv_regs
+from tinygrad.runtime.autogen import pci
+from tinygrad.runtime.support.system import APLRemotePCIDevice, System
+from tinygrad.runtime.support.nv.nvdev import NVReg
+
+class MiniNVDev:
+  def __init__(self, timeout=20, map_bar0=True):
+    # ANY NVIDIA display device, not just the 5090 family. This scanned for 0x2b00 alone, so every recovery tool built
+    # on this class - nv_e3_flr.py, nv_temp.py, nv_e2_regs.py, nv_quiesce.sh - raised IndexError on a 3060 that was on
+    # the bus and needed resetting. The families are the ones PCIIface itself lists; EGPU_GPU_DEVID pins one.
+    # POINT AT THE RUNNING SERVER. Without APL_REMOTE_SOCK, tinygrad's APLRemotePCIDevice calls ensure_app(), which
+    # pkills the TinyGPU server, re-downloads the app and reinstalls it - because the check it makes is for its own
+    # downloaded zip, which a machine that installed the app by hand does not have. So every recovery tool built on this
+    # class killed the server it was about to talk through, on a card that was already wedged. A custom socket means a
+    # custom server, and ensure_app() is skipped entirely.
+    os.environ.setdefault("APL_REMOTE_SOCK", os.path.join(os.environ.get("TMPDIR", "/tmp"), "tinygpu.sock"))
+    fams = (0x2200, 0x2400, 0x2500, 0x2600, 0x2700, 0x2800, 0x2b00, 0x2c00, 0x2d00, 0x2f00)
+    want = os.environ.get("EGPU_GPU_DEVID", "")
+    if want: fams = (int(want, 16) & 0xff00,)
+    devs = System.pci_scan_bus(0x10de, ((0xff00, fams),), 0x03)
+    if not devs: raise RuntimeError("no NVIDIA display device on the PCI bus: nothing to open")
+    self.pd = APLRemotePCIDevice("NV", devs[0]); self.pd.sock.settimeout(timeout)
+    self.mmio = self.pd.map_bar(0, fmt='I') if map_bar0 else None
+    for name, arch in (("nv_ref", ""), ("dev_fb", "tu102"), ("dev_gc6_island", "ga102"), ("dev_therm", "gb202")): self.include(name, arch)
+  def include(self, name, arch):
+    for k, v in getattr(getattr(tinygrad.runtime.autogen.nv_regs, name), arch or 'regs').items():
+      self.__dict__[k] = NVReg(self, *v) if isinstance(v, tuple) else v
+  def reg(self, name): return self.__dict__[name]
+  def rreg(self, addr): return self.mmio[addr // 4]
+  def wreg(self, addr, value): self.mmio[addr // 4] = value
+  def remap_bar0(self): self.mmio = self.pd.map_bar(0, fmt='I')
+  # config helpers
+  def cfg(self, off, size=4): return self.pd.read_config(off, size)
+  def cfgw(self, off, val, size=4): self.pd.write_config(off, val, size)
+  def command(self): return self.cfg(pci.PCI_COMMAND, 2)
+  def snapshot_cfg(self): return {off: self.cfg(off) for off in (0x00, 0x04, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x3c)}
+  def gfw_booted(self):
+    # Where the boot firmware says it has finished differs by architecture: Blackwell in the THERM I2CS scratch (ip.py:286),
+    # Ampere/Ada in the AON secure scratch group 5 (ip.py:96) - and on those the THERM word never reads 0xff, so this
+    # reported "GFW not booted after 30 s" about every healthy 3060 the quiesce ever touched (2026-09-21).
+    if self.NV_PMC_BOOT_42.read_bitfields()['architecture'] < 0x1a:
+      return (self.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05[0].read() & 0xff) == 0xff
+    return self.NV_THERM_I2CS_SCRATCH.read() == 0xff
+  def gfw_scratch(self): return self.NV_THERM_I2CS_SCRATCH.read()
+  def state(self):
+    b0, b42 = self.NV_PMC_BOOT_0.read(), self.NV_PMC_BOOT_42.read_bitfields()
+    wpr2 = self.NV_PFB_PRI_MMU_WPR2_ADDR_HI.read()
+    return dict(boot0=f"0x{b0:08x}", arch=f"0x{b42['architecture']:02x}", impl=b42['implementation'], mmio_all_ones=(b0 == 0xffffffff),
+                wpr2_addr_hi=f"0x{wpr2:08x}", gsp_resident=(wpr2 != 0), gfw_booted=self.gfw_booted(), therm_scratch=f"0x{self.gfw_scratch():08x}")
+  def close(self): self.pd.sock.close()

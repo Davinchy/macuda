@@ -1,0 +1,22 @@
+# The files that fill the long-context test's window, in this order; the last one that fits is cut. The questions'
+# answers are in gpu.c, fw_layout.h, dev.c, vbios.c, nv_structs.h and gsp.c - spread from the start to about 110k tokens.
+cuda-shim/libtinynv/src/gpu.c
+cuda-shim/libtinynv/src/fw_layout.h
+cuda-shim/libtinynv/src/dev.h
+cuda-shim/libtinynv/src/dev.c
+cuda-shim/libtinynv/src/mmu.c
+cuda-shim/libtinynv/src/flcn.c
+cuda-shim/libtinynv/src/vbios.c
+cuda-shim/libtinynv/src/pt.c
+cuda-shim/libtinynv/src/submit.c
+cuda-shim/libtinynv/src/nv_structs.h
+cuda-shim/libtinynv/src/gsp.h
+cuda-shim/libtinynv/src/gsp.c
+cuda-shim/libtinynv/src/tinynv.c
+cuda-shim/libtinynv/src/exec.c
+cuda-shim/libtinynv/src/pci_replay.c
+cuda-shim/libtinynv/src/qmd.c
+cuda-shim/libtinynv/src/arena.c
+cuda-shim/libtinynv/src/cubin.c
+cuda-shim/libtinynv/src/image.c
+cuda-shim/libtinynv/src/fw.c

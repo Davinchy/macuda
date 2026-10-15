@@ -1,0 +1,11 @@
+bench_bf16: NVIDIA GeForce RTX 3090, sm_86, 82 SMs; cubin gemm_sm86_v2.cubin. Kernel choice as the shim's host code makes it for the 5090 (170 SMs).
+  m  2048 n 256 k  2048 x72 Q, O (2 x 36)                                 scalar    4.167 ms ( 0.52 TF/s, err 3.8e-06)  bf16 tc2s   0.058 ms ( 37.3 TF/s, err 0.0e+00)  cuBLAS   0.044 ms ( 48.3 TF/s)  CONTROL f16-on-bf16 err 7.6e+00 REFUSED (as it must)
+      gate mutants: all-NaN err inf, one NaN err inf - both REFUSED (as they must)
+  m   256 n 256 k  2048 x72 K, V (2 x 36)                                 scalar    0.670 ms ( 0.40 TF/s, err 1.0e-06)  bf16 tc2s   0.041 ms (  6.6 TF/s, err 2.5e-06)  cuBLAS   0.018 ms ( 14.8 TF/s)  CONTROL f16-on-bf16 err 8.0e+00 REFUSED (as it must)
+      gate mutants: all-NaN err inf, one NaN err inf - both REFUSED (as they must)
+  m 11008 n 256 k  2048 x70 gate, up (2 x 35; the last layer's FFN runs on 1 token) scalar   22.449 ms ( 0.51 TF/s, err 3.6e-06)  bf16 tc2s   0.367 ms ( 31.4 TF/s, err 0.0e+00)  cuBLAS   0.315 ms ( 36.6 TF/s)  CONTROL f16-on-bf16 err 7.8e+00 REFUSED (as it must)
+      gate mutants: all-NaN err inf, one NaN err inf - both REFUSED (as they must)
+  m  2048 n 256 k 11008 x35 down (35)                                     scalar   22.650 ms ( 0.51 TF/s, err 5.5e-06)  bf16 tc2s   0.297 ms ( 38.9 TF/s, err 1.8e-05)  cuBLAS   0.224 ms ( 51.5 TF/s)  CONTROL f16-on-bf16 err 8.2e+00 REFUSED (as it must)
+      gate mutants: all-NaN err inf, one NaN err inf - both REFUSED (as they must)
+bench_bf16: the bf16 GEMMs of one pp256 on the 36-layer model, on this card: scalar 2712.5 ms, bf16 tc2 43.2 ms, cuBLAS 34.4 ms (scalar / tc2 = 62.9x, tc2 / cuBLAS = 1.25x)
+bench_bf16: every result within tolerance of cuBLAS, and the control refused

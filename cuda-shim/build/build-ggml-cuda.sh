@@ -1,0 +1,51 @@
+#!/bin/sh
+# Compile ALL of ggml's CUDA backend (top-level TUs + template-instances) through tinycc (device on the Linux box, host on
+# the Mac) with the shim's final build configuration, in parallel, and archive to libggml-cuda.a.
+#   JOBS=8 sh build/build-ggml-cuda.sh            # everything, for sm_120a (ggml's own CMake ships 120a-real on Blackwell)
+#   ONLY="mmq-instance-nvfp4 mmq-instance-mxfp4" sh build/build-ggml-cuda.sh   # a subset, into the existing objects
+set -u
+R=${EGPU_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}; G=$R/llama.cpp/ggml
+export TINYCC=$R/cuda-shim/build/tinycc OBJ=$R/cuda-shim/build/obj-${ARCH:-sm_120a} LOGD=$R/cuda-shim/build/logs-${ARCH:-sm_120a}
+JOBS=${JOBS:-8}
+# the architecture is passed to tinycc EXPLICITLY: the FP4 MMQ instances use Blackwell's block-scaled tensor-core MMA,
+# which ptxas only accepts for the architecture-specific target, and an inherited environment variable proved too easy to lose
+export TINYCC_ARCH=${ARCH:-sm_120a}
+ONLY=${ONLY:-}
+if [ -z "$ONLY" ]; then rm -rf "$OBJ" "$LOGD"; fi; mkdir -p "$OBJ" "$LOGD"
+# resolved once here rather than by each of the 188 tinycc invocations, each of which would otherwise link a probe
+export TINYCC_SYSROOT=${TINYCC_SYSROOT:-$(sh "$R/cuda-shim/build/sdk.sh")}
+export INC="-I$G/include -I$G/src -I$G/src/ggml-cuda"
+# docs/03-cuda-shim-plan.md §1: quantized matmul forced onto MMQ (cuBLAS only for residual GEMMs) and no virtual
+# memory management. Graphs were compiled OUT until 2026-09-19 for a good reason - ggml wraps cudaStreamBeginCapture
+# in CUDA_CHECK, so a capture the runtime layer refused would abort rather than fall back - and they are IN now
+# because the runtime layer answers the graph API and the build was gated on it.
+# DEFS_EXTRA adds to these; TINYCC_HOST_OPT sets
+# the host optimisation level (tinycc, -O2 by default since 2026-09-19); TINYCC_REUSE_FATBIN=1 with the fatbins in /tmp
+# rebuilds the host halves alone, without the Linux box.
+# GGML_CUDA_USE_GRAPHS is IN THE DEFAULT because the shipped archive is a graphs build (+4% MoE, gated 2026-09-19) -
+# it used to arrive only through DEFS_EXTRA, so a fresh clone running `sh setup.sh cuda` silently built without graphs
+# and lost that, with nothing to say why. GGML_CUDA_FORCE_MMQ is kept for the feature string but is a NO-OP on
+# Blackwell: ggml_cuda_should_use_mmq returns true at turing_mma_available(cc) (mmq.cu:320), above the #ifdef.
+export DEFS="-DGGML_CUDA_FORCE_MMQ -DGGML_CUDA_NO_VMM -DGGML_CUDA_USE_GRAPHS -DNDEBUG ${DEFS_EXTRA:-}"
+FA=""; for k in F16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16; do for v in F16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16; do FA="$FA -DGGML_CUDA_FA_${k}_${v}=1"; done; done
+export FA
+ls "$G"/src/ggml-cuda/*.cu "$G"/src/ggml-cuda/template-instances/*.cu > "$LOGD/tus.txt"
+if [ -n "$ONLY" ]; then for b in $ONLY; do grep "/$b\.cu$" "$LOGD/tus.txt"; done > "$LOGD/tus.only"; mv "$LOGD/tus.only" "$LOGD/tus.txt"; fi
+total=$(wc -l < "$LOGD/tus.txt" | tr -d ' ')
+echo "compiling $total TUs for $TINYCC_ARCH with $JOBS jobs: $DEFS"
+start=$(date +%s)
+xargs -n1 -P"$JOBS" sh "$R/cuda-shim/build/cc-one.sh" < "$LOGD/tus.txt" | tee "$LOGD/results.txt" | grep --line-buffered FAIL
+ok=$(grep -c '^ok' "$LOGD/results.txt"); fail=$(grep -c '^FAIL' "$LOGD/results.txt")
+echo "compiled $ok/$total ggml-cuda TUs in $(( $(date +%s) - start )) s; failed: $(grep '^FAIL' "$LOGD/results.txt" | cut -d' ' -f2 | tr '\n' ' ')"
+if [ "$ok" -gt 0 ]; then
+  # ONE ARCHIVE PER ARCHITECTURE, and the plain name is a symlink to whichever one the tree links against. This used to
+  # be a single libggml-cuda.a, so building for a second card silently destroyed the first card's archive - an hour of
+  # compiling, gone, and nothing to say which arch the surviving file held. Now `ls -l` answers that.
+  A="$R/cuda-shim/build/libggml-cuda.$TINYCC_ARCH.a"
+  rm -f "$A"
+  /opt/homebrew/opt/llvm/bin/llvm-ar rcs "$A" "$OBJ"/*.o && {
+    ln -sfn "libggml-cuda.$TINYCC_ARCH.a" "$R/cuda-shim/build/libggml-cuda.a"
+    echo "archived libggml-cuda.$TINYCC_ARCH.a = $(stat -f%z "$A") bytes ($(ls "$OBJ"/*.o | wc -l | tr -d ' ') objects); libggml-cuda.a now points at it"
+  }
+fi
+[ "$fail" -eq 0 ]

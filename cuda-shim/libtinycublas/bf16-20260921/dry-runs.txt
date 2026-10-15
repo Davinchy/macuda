@@ -1,0 +1,70 @@
+# DRY=1 (null device, no lock) runs of the slot's exact wrapper lines, 2026-09-21 20:04-20:24 PDT, Mac, no card step.
+# Launches are counted from the null device's own 'tinynv: would launch <kernel>' line, ONE per launch. (A first version of
+# this file counted every kernel name in the log; under TINYCUDART_TRACE=1 each launch also prints a [trace] line, so its bench
+# and ops counts were doubled. Recounted here; the shim's own STATS table, where present, agrees.)
+# binaries: build/bin-bf16v2 (in cuda-shim-bcensus) = this branch at 81b9826 relinked into llama.cpp ad6c668 by
+#   cd cuda-shim-bcensus && env S=$(pwd) sh build/link-null.sh <tools/llama-bench llama-bench | examples/simple llama-simple | tests test-backend-ops> build/bin-bf16v2/<name>-null
+# and cuda-shim/build/bin = the validated set. The wrapper prints 'build id unknown' and its WARNING for BOTH (neither branch is
+# in its list); the binary's identity is the [tinycudart] libtinynv build line and these sha256s:
+4d5a74de1907460bdc288af79f36000ea1267c5a121755d86bfebe555b8a3ff2  cuda-shim-bcensus/build/bin-bf16v2/llama-bench-null
+b15208ce3840b5cbb6c42a5711cdfc101b24f77cee684e85fbb55bb69e83cc1e  cuda-shim-bcensus/build/bin-bf16v2/llama-simple-null
+bd2f4fc3d1677592dfe4a0b573b0af86995d4496cfd139b6828de55e6e41efa1  cuda-shim-bcensus/build/bin-bf16v2/test-backend-ops-null
+ddd22c2894705953d8a546c761c662f46b50e752d4596bc6f110f830bd20322a  cuda-shim/build/bin/llama-bench-null
+4285f72a03e75f537c5fabd11b0e9da2c5fb9213f89d59bef83bd855032c0c1b  cuda-shim/build/bin/llama-simple-null
+59dbcd7ccba4184eb7931f3635e1696b28478148002f069c4e16b79265a12d65  cuda-shim/build/bin/test-backend-ops-null
+
+## bench (the pre-gate): DRY=1 TINYCUDART_TRACE=1 BIN=<bin> sh tools/nv_shim_step.sh B bench <2-layer shapes gguf> 8
+[tinycudart] libtinynv build 81b9826  launches:  44 tinyblas_gemm_bf16_tc2s_tn 
+[tinycudart] libtinynv build b67f2d8-dirty  launches:  44 tinyblas_gemm_f32 
+
+## simple, default 13-token prompt: never reaches cuBLAS (ggml runs 13 tokens through mul_mat_vec)
+[tinycudart] libtinynv build 81b9826  text 102 bytes sha 96578f4925ce  tinyblas launches: 0
+[tinycudart] libtinynv build b67f2d8-dirty  text 102 bytes sha 96578f4925ce  tinyblas launches: 0
+
+## simple, the pinned 106-token prompt: DRY=1 TINYCUDART_STATS=1 BIN=<bin> sh tools/nv_shim_step.sh B simple <2-layer shapes gguf> 32 "$(cat correctness-prompt.txt)"
+[tinycudart] libtinynv build 81b9826  text 562 bytes sha b60bb8fbfc6b  launches:  11 tinyblas_gemm_bf16_tc2s_tn 
+   STATS row: [tinycudart] 11 0.0 ms 1.8 us/launch tinyblas_gemm_bf16_tc2s_tn
+[tinycudart] libtinynv build b67f2d8-dirty  text 562 bytes sha b60bb8fbfc6b  launches:  11 tinyblas_gemm_f32 
+   STATS row: [tinycudart] 11 0.0 ms 2.0 us/launch tinyblas_gemm_f32
+(the same pair without STATS, 20:06-20:07, logs 200639/200713, read the same texts and counts)
+comparator: sh cmp_texts.sh <validated text> <v2 text> -> IDENTICAL: 562 bytes, sha b60bb8fbfc6b
+ rc 0
+control, one byte changed past the prompt -> DIFFER: logs/shim-simple-20260921-202414.txt <the text with byte 558 changed> differ: char 558, line 1
+ rc 1
+
+## ops: DRY=1 BIN=<bin> sh tools/nv_shim_step.sh B ops MUL_MAT <regex>
+[tinycudart] libtinynv build 81b9826 (no trace)  bf16 cases 151  f16 cases 0  launches:  330 tinyblas_gemm_bf16_tc2s_tn 1201 tinyblas_gemm_f32 
+[tinycudart] libtinynv build 81b9826 (TRACE=1)  bf16 cases 0  f16 cases 281  launches: 1471 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  713 tinyblas_gemm_f16_tc2s_tn 
+[tinycudart] libtinynv build b67f2d8-dirty (TRACE=1)  bf16 cases 0  f16 cases 281  launches: 1471 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  713 tinyblas_gemm_f16_tc2s_tn 
+(200807 is type_a=bf16 with this branch; 201612 / 201648 are type_a=f16 with this branch / the validated set. Every case fails on
+ the null device, which computes nothing: that is the ops gate seen failing; the dry run proves the wiring and the routing only.)
+
+## K0, the control arm D asked for (review ROOT bd71c41): base main 715b281 built clean in this worktree (detached, rm -rf build/shim,
+## make all) and relinked into llama.cpp ad6c668 exactly as V, with the same ggml archive (cuda-shim/build/libggml-cuda.a, 2026-09-13):
+##   git checkout --detach 715b281 && rm -rf build/shim && make all && env S=$(pwd) sh build/link-null.sh <target> <name> build/bin-k0/<name>-null
+4e558585b055a1c77159c302fafab20298dc0f22ab946c7b56046afb4ff6728c  cuda-shim-bcensus/build/bin-k0/llama-bench-null
+2944c48ee502bf4a56c0b309482f26d603eafad90007fe23522000a07d3cec82  cuda-shim-bcensus/build/bin-k0/llama-simple-null
+a88ef3a7a487168cb35596741058013977007b332285a90a4c0be28482dbb4e7  cuda-shim-bcensus/build/bin-k0/test-backend-ops-null
+shim-bench-20260921-203657.log: [tinycudart] libtinynv build 715b281  launches:  44 tinyblas_gemm_f32 
+shim-simple-20260921-203700.log: [tinycudart] libtinynv build 715b281  launches:  11 tinyblas_gemm_f32 
+shim-ops-20260921-203702.log: [tinycudart] libtinynv build 715b281  launches: 1542 tinyblas_gemm_f32 
+shim-ops-20260921-203707.log: [tinycudart] libtinynv build 715b281  launches: 1419 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  765 tinyblas_gemm_f16_tc2s_tn 
+   STATS row: [tinycudart] 11 0.0 ms 2.0 us/launch tinyblas_gemm_f32
+comparator: sh cmp_texts.sh <K0 text 203700> <v2 text 202336> -> IDENTICAL: 562 bytes, sha b60bb8fbfc6b
+ rc 0
+
+## THE f16 KERNEL SPLIT IS NOT STABLE ACROSS NULL RUNS, in either binary, so it is not a pre-gate. Same command (ops MUL_MAT type_a=f16):
+  201612  libtinynv build 81b9826  TRACE=1  1471 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  713 tinyblas_gemm_f16_tc2s_tn 
+  201648  libtinynv build b67f2d8-dirty  TRACE=1  1471 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  713 tinyblas_gemm_f16_tc2s_tn 
+  203707  libtinynv build 715b281  TRACE=0  1419 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  765 tinyblas_gemm_f16_tc2s_tn 
+  203936  libtinynv build 715b281  TRACE=1  1471 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  713 tinyblas_gemm_f16_tc2s_tn 
+  203939  libtinynv build 81b9826  TRACE=1  1419 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  765 tinyblas_gemm_f16_tc2s_tn 
+  204015  libtinynv build 715b281  TRACE=0  1419 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  765 tinyblas_gemm_f16_tc2s_tn 
+  204018  libtinynv build 81b9826  TRACE=0  1419 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  765 tinyblas_gemm_f16_tc2s_tn 
+  204053  libtinynv build 715b281  TRACE=1  1471 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  713 tinyblas_gemm_f16_tc2s_tn 
+  204056  libtinynv build 81b9826  TRACE=1  1419 tinyblas_gemm_f16_tc  2 tinyblas_gemm_f16_tc2_tn  765 tinyblas_gemm_f16_tc2s_tn 
+  Two stable modes, 1471/2/713 and 1419/2/765. 27 cases flip between tinyblas_gemm_f16_tc2s_tn and the legacy tinyblas_gemm_f16_tc
+  (for example MUL_MAT(type_a=f16,type_b=f16,m=16,n=1,k=256,bs=[1,1],...): 2 f16_tc in 203936, 2 tc2s_tn in 204015). The mode
+  follows neither the binary nor TRACE alone. launch_gemm_tc's tc2 test includes the A/B base alignment, and on the null device the
+  device memory is host memory. That is the likely cause, but it is NOT TRACED. So the f16 steps are read case by case (pass/fail),
+  never by kernel counts. Both are main's f16 kernels (tc2s's store predicate aside), and v2's f16 routing code is 715b281's.

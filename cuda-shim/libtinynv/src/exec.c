@@ -1,0 +1,3091 @@
+// See exec.h. This is the thinnest layer that turns encoded bytes into work a GPU actually does.
+//
+// It was deliberately synchronous - every batch submitted and then waited on - because the first question about a driver
+// that has never run a kernel is whether the kernel ran, not how fast. That question is answered: an 8B model runs and
+// produces correct text. The answer cost 600 waits per decoded token, each one a round trip to the card for work that
+// nothing was waiting on, and that was most of the decode time.
+//
+// So work is submitted without the caller waiting, and that is now the default. It was not always: the first async
+// submission took the card off the bus on Session A's exotic-kernel op set, and a driver that drops a card is worse
+// than a slow one, so it spent a day being asked for by name while the three bugs behind that drop were found - a copy
+// engine releasing a semaphore the engine had not reached (9db55a5), one semaphore slot written by two engines
+// (de14f96), and whole chains overlapping because nothing ordered one against the next (588ba25). What flipped this
+// default is not the speed, it is that the async path has since carried both target models through op-verify, a
+// five-hundred token decode, byte-identical greedy runs and every hardware session, while the synchronous path was
+// only ever the one that answered the first question. Synchronous remains, whole and tested, as TINYNV_SYNC=1: a
+// driver whose fast path is new should keep its slow one reachable in one word. Three things make async safe, and all
+// three are load-bearing:
+//
+//   The scratch an engine reads from is not reused until it has finished with it. The arena is only reset when it runs
+//   out of room, and resetting waits for everything outstanding first - so a wrap costs one wait per few thousand
+//   batches instead of one per batch.
+//
+//   Work on one queue is ordered against work on the other by a semaphore acquire in the command stream, not by the
+//   host. Compute and copy run independently, so a copy submitted after a kernel could otherwise read what the kernel
+//   had not yet written. The recorded oracle orders its queues exactly this way.
+//
+//   Anything that reads a result, or takes away memory the engine might still be reading, waits first. There are few
+//   such places and they are named at each call.
+#include "exec.h"
+#include "internal.h"
+#include "nv_structs.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define SEM_BYTES   0x1000
+// Where each queue's slot lives in that allocation. Far enough apart that two engines writing at once are not writing
+// the same cache line, which is not required for correctness here but costs nothing to avoid.
+#define SEM_SLOT(i) ((uint64_t)(i) * 128)
+// Two scratch slots for the engine's own clock, used only under the profile. A timestamped release writes the payload
+// and then the clock eight bytes after it, so each needs sixteen bytes; they sit well clear of the queue slots.
+//
+// They exist because the residual this driver has left against the vendor is invisible to host-side profiling. The host
+// spends about a microsecond a launch and the wall clock allows four and a half, so three quarters of a launch is the
+// engine either working or waiting, and only the engine can say which. TS_DONE is written when a batch finishes;
+// TS_START at the head of the first batch after the host stood still. The difference is the card idle across a
+// synchronisation - the refill - which is the one bucket large enough to hold what is missing.
+#define SEM_TS_START 384
+// A second head stamp, taken BEFORE the batch's cross-queue acquire. The pair brackets the acquire exactly: one clock
+// when the engine reaches this batch, one when it is allowed to proceed. See batch_begin.
+#define SEM_TS_PRE   512
+// When the copy engine last finished something. Read at the moment the host's wait returns, which is before the next
+// batch's descriptor delivery, so what it holds then is the copy the token ENDED with - the logits coming back.
+#define SEM_TS_COPY  640
+// When the compute engine went idle at the end of a chained batch, written by a host release that waits for idle, into
+// an address nothing else touches. Not read from the timeline's own report: see tinynv_exec_flush.
+#define SEM_TS_TAIL  768
+// Profile-only stamps for a resident token's chains: sixteen bytes each from 1024, one per chain (64 at most).
+#define SEM_TS_CHAIN(k) (1024 + 16 * (uint64_t)(k))
+// When the copy engine BEGAN a transfer, as against when it finished. Stamped as the batch's first method after its
+// acquire, so the pair brackets the transfer itself and separates "late to start" from "slow to run".
+#define SEM_TS_CSTART 896
+// Command buffers and descriptors both. Large on purpose: the arena wrapping is the only thing that stalls now, so
+// its size is how many batches run between stalls - a few thousand here, against roughly six hundred launches a token.
+#define CMD_BYTES   0x400000
+// What the command buffer region gets of it; the rest is descriptors and their constant buffers.
+#define CMD_REGION_BYTES 0x80000
+// Megabytes of descriptor region when the copy engine delivers it and the window no longer bounds its size.
+#define DESC_MB_DEFAULT 64
+#define STAGE_BYTES (16u << 20)  // host memory copies pass through, a chunk at a time
+
+// Phases, named so a reader of the summary does not have to hold an order in their head.
+// WAIT and BLOCKED were added because the profile could not answer the question it was built for.
+//
+// On the 35B mixture the host spends 1.05 us a launch against a wall-clock budget of 4.6, so it is idle three quarters
+// of the time - which means submission cost cannot be what separates us from the vendor driver on that model, and every
+// lever aimed at submission would have missed. The time is somewhere the profile did not look, and the only bucket big
+// enough is the host standing still at a synchronisation: llama.cpp asks for one about nineteen times a token.
+//
+// WAIT is every call; BLOCKED is only the ones that actually had to wait for the engine. The difference matters,
+// because a wait that was already satisfied costs nothing and a wait that was not is the GPU and the host taking turns
+// instead of overlapping.
+enum { PROF_LAUNCH, PROF_FLUSH, PROF_PUSH, PROF_SUBMIT, PROF_POLL, PROF_RING, PROF_WAIT, PROF_BLOCKED, PROF_N };
+static const char *const PROF_NAME[8] = {"a launch, all of it", "a flush, all of it",
+                                         "  of which pushing the shadow across",
+                                         "  of which submitting (ring, pointer, doorbell)",
+                                         "  of which asking about faults",
+                                         "  of which announcing (the fence read, the doorbells)",
+                                         "waiting at a synchronisation, every call",
+                                         "  of which actually stood still for the engine"};
+#define PROF_START(ex) double prof_t0_ = (ex)->profile ? now() : 0.0
+#define PROF_END(ex, which) do { if ((ex)->profile) { (ex)->prof_ns[which] += (uint64_t)((now() - prof_t0_) * 1e9); \
+                                                      (ex)->prof_n[which]++; } } while (0)
+
+// Which region an allocation comes from. Descriptors and their constant buffers in one, command buffers in the other,
+// exactly one writer each - which is what turns the wrap guard below from a partial check into a sufficient one.
+enum { AR_DESC, AR_CMD };
+
+static double now(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+// The timeline semaphore, read back through the same view the recorder sees, so this path is replayable like the rest.
+static uint64_t sem_read_slot(tinynv_exec_t *ex, int q) {
+  uint64_t v = 0;
+  nv_rd_block(&ex->sem.dma.view, SEM_SLOT(q), &v, sizeof(v));
+  // A slot is written by one channel, which retires in order, so it must never go backwards. If it does, the whole
+  // scheme this file rests on is void - an acquire can be parked on a value that has already been and gone - and that
+  // is worth saying loudly rather than discovering again three probes later.
+  if (v > ex->sem_high[q]) ex->sem_high[q] = v;
+  else if (v < ex->sem_high[q]) {
+    // Rate limited, and it has to be: a wait spins on this, so one report per read turned a stalled run into a 4.4 GB
+    // log. The first few say what is happening and the count at the stall says how much of it there was; nothing after
+    // that is information.
+    if (ex->nbackwards++ < 8)
+      fprintf(stderr, "tinynv: the %s timeline went backwards, %llu after %llu - a slot is being written by more than "
+              "one thing\n", q ? "copy" : "compute", (unsigned long long)v, (unsigned long long)ex->sem_high[q]);
+    else if (ex->nbackwards == 8)
+      fprintf(stderr, "tinynv: (further backwards reads counted, not printed)\n");
+  }
+  return v;
+}
+
+// What both queues have finished, which is the smaller promise: a caller waiting for "everything" waits for each queue
+// to have reached what it was last asked for, and those are different numbers on the same counter.
+static int sem_reached(tinynv_exec_t *ex, uint64_t value) {
+  for (int q = 0; q < 2; q++) {
+    uint64_t want = ex->q_last[q];
+    // A pending keep-alive is the driver's work, not the caller's: while it is the last thing on the compute queue, a
+    // wait is satisfied by everything before it, and the spin goes on until the next chain is handed over.
+    if (q == 0 && ex->ka_pending && want == ex->ka_value && want) want--;
+    if (want > value) want = value;          // only as far as the caller asked
+    if (want && sem_read_slot(ex, q) < want) return 0;
+  }
+  return 1;
+}
+
+// TINYNV_KERNEL_PROFILE: one row per kernel instantiation, found by the descriptor's address. Resolved at the launch
+// rather than at the harvest: a module can be unloaded between the two, and the name is copied while it is there.
+static int32_t kprof_row(tinynv_exec_t *ex, const tinynv_kernel_desc_t *k) {
+  uint64_t h = (uint64_t)(uintptr_t)k * 11400714819323198485ull;
+  for (uint32_t i = (uint32_t)(h >> 40) % TINYNV_KPROF_INDEX;; i = (i + 1) % TINYNV_KPROF_INDEX) {
+    int32_t r = ex->kindex[i];
+    if (r < 0) {
+      if (ex->nkrow >= TINYNV_KPROF_ROWS) return -1;   // the table is four times the rows, so it never fills first
+      r = ex->nkrow++;
+      ex->krow[r].key = k;
+      tinynv_kernel_short_name(k->name ? k->name : "?", ex->krow[r].name, sizeof(ex->krow[r].name));
+      ex->kindex[i] = r;
+      return r;
+    }
+    if (ex->krow[r].key == k) return r;
+  }
+}
+
+// Read every slot the timeline has passed, in order, and attribute the interval since the previous stamp. `reached`
+// is the compute queue's value. A chain's tail is read only once a LATER value has been seen (window_end 2, the final
+// harvest at teardown, reads everything): its stamp is a command-stream release that follows the timeline release,
+// so the timeline can be at the tail's value a moment before the tail's stamp has landed. Every other stamp was
+// issued by the engine before the tail's timeline release and lands before it, in channel order.
+//
+// Windows are the host's waits that retired stamped work - one a token on a decode - and the first kprof_skip of
+// them are read but not counted, so the load, the prompt and the warm-up do not sit in a mean that is meant to be a
+// steady token. An interval is refused when the stamp before it is missing or a launch between went unstamped
+// (kskipped), when the clock went backwards (kbackwards), or when it is over 100 ms and so not one kernel.
+static void kprof_harvest(tinynv_exec_t *ex, uint64_t reached, int window_end) {
+  int final = window_end == 2, took = 0;
+  int counted = ex->kwindows >= (uint64_t)ex->kprof_skip;
+  while (ex->kharvest != ex->kwrite) {
+    tinynv_kprof_slot_t *s = &ex->kslot[ex->kharvest];
+    if (s->at > reached || (s->at == reached && s->tail && !final)) break;
+    uint64_t rep[2] = {0, 0};
+    nv_rd_block(&ex->kring.dma.view, (uint64_t)ex->kharvest * 16, rep, sizeof(rep));
+    ex->kharvest = (ex->kharvest + 1) % TINYNV_KPROF_SLOTS;
+    took++;
+    // The payload is the launch's own timeline value, so a slot from a previous lap or one not yet written cannot
+    // pass as this launch's stamp.
+    if (rep[0] != s->at || !rep[1]) { ex->kmissing++; ex->kprev_valid = 0; continue; }
+    if (ex->kprev_valid && !s->broken) {
+      if (rep[1] <= ex->kprev_clock) ex->kbackwards++;
+      else if (counted) {
+        uint64_t dt = rep[1] - ex->kprev_clock;
+        if (dt >= 100000000ull) ex->kskipped++;
+        else if (s->boundary) { ex->kboundary_ns += dt; ex->kboundary_n++; }
+        else {
+          ex->kattr_ns += dt; ex->kattr_n++;
+          if (s->first) { ex->kfirst_n++; ex->kfirst_ns += dt; }
+          if (dt >= TINYNV_KPROF_LONG_NS) {
+            ex->klong_n[s->first ? 1 : 0]++;
+            ex->klong_ns[s->first ? 1 : 0] += dt;
+            // Kept sorted, longest first; the shortest of the eight falls off.
+            int t = TINYNV_KPROF_TOP - 1;
+            if (dt > ex->ktop[t].ns) {
+              for (; t > 0 && dt > ex->ktop[t - 1].ns; t--) ex->ktop[t] = ex->ktop[t - 1];
+              ex->ktop[t].ns = dt; ex->ktop[t].row = s->row; ex->ktop[t].first = s->first;
+            }
+          }
+          if (s->row >= 0) {
+            tinynv_kprof_row_t *r = &ex->krow[s->row];
+            r->n++; r->ns += dt;
+            if (dt > r->max_ns) r->max_ns = dt;
+          } else { ex->kunnamed_ns += dt; ex->kunnamed_n++; }
+        }
+      }
+    } else if (ex->kprev_valid) ex->kskipped++;
+    if (counted) ex->kstamped++;
+    ex->kprev_clock = rep[1];
+    ex->kprev_valid = 1;
+  }
+  if (window_end == 1 && took) ex->kwindows++;
+}
+
+static int kprof_cmp(const void *a, const void *b) {
+  const tinynv_kprof_row_t *x = a, *y = b;
+  return x->ns < y->ns ? 1 : x->ns > y->ns ? -1 : 0;
+}
+
+// The report: per window, by instantiation and then with instantiations merged under the function's name. Every
+// number is divided by the windows counted, so "us/window" on a decode is microseconds per token.
+static void kprof_report(tinynv_exec_t *ex) {
+  uint64_t W = ex->kwindows > (uint64_t)ex->kprof_skip ? ex->kwindows - (uint64_t)ex->kprof_skip : 0;
+  fprintf(stderr, "libtinynv: kernel profile from the engine's clock: %llu windows counted (%llu seen, the first %d not "
+                  "counted; a window is a host wait that retired work, one a token on a decode)\n",
+          (unsigned long long)W, (unsigned long long)ex->kwindows, ex->kprof_skip);
+  if (ex->kmissing || ex->klost || ex->kskipped || ex->kbackwards || ex->kunnamed_n)
+    fprintf(stderr, "libtinynv:   %llu stamps missing (slot not written or from another lap), %llu launches unstamped (ring "
+                    "full), %llu intervals refused, %llu clocks backwards, %llu intervals of kernels past the %d rows\n",
+            (unsigned long long)ex->kmissing, (unsigned long long)ex->klost, (unsigned long long)ex->kskipped,
+            (unsigned long long)ex->kbackwards, (unsigned long long)ex->kunnamed_n, TINYNV_KPROF_ROWS);
+  if (!W || !ex->kattr_n) {
+    fprintf(stderr, "libtinynv:   nothing counted: the run ended inside the windows not counted, or no stamp was read back\n");
+    return;
+  }
+  double w = (double)W;
+  fprintf(stderr, "libtinynv:   per window: %.1f launches stamped; %.1f us in kernels over %.1f intervals, each a kernel's own "
+                  "time plus the dispatch gap\n"
+                  "libtinynv:   before it (%.1f of them a chain's first, carrying the chain seam as well); %.1f us at the "
+                  "boundary (engine idle, host\n"
+                  "libtinynv:   turnaround and the first kernel; %.2f boundaries a window)\n",
+          (double)ex->kstamped / w, (double)ex->kattr_ns / 1e3 / w, (double)ex->kattr_n / w, (double)ex->kfirst_n / w,
+          (double)ex->kboundary_ns / 1e3 / w, (double)ex->kboundary_n / w);
+  fprintf(stderr, "libtinynv:   the chain's first intervals total %.1f us a window (the seam: the engine waiting for the host's next "
+                  "chain, plus that kernel);\n"
+                  "libtinynv:   intervals of %llu us and more inside a token: %.2f a window totalling %.1f us at a chain's first launch, "
+                  "%.2f totalling %.1f us inside a chain\n",
+          (double)ex->kfirst_ns / 1e3 / w, (unsigned long long)(TINYNV_KPROF_LONG_NS / 1000), (double)ex->klong_n[1] / w,
+          (double)ex->klong_ns[1] / 1e3 / w, (double)ex->klong_n[0] / w, (double)ex->klong_ns[0] / 1e3 / w);
+  for (int t = 0; t < TINYNV_KPROF_TOP && ex->ktop[t].ns; t++)
+    fprintf(stderr, "libtinynv:   %s%8.1f us  %s%s\n", t ? "                " : "the longest:    ", (double)ex->ktop[t].ns / 1e3,
+            ex->ktop[t].row >= 0 ? ex->krow[ex->ktop[t].row].name : "(unnamed)", ex->ktop[t].first ? "  (a chain's first)" : "");
+  int n = ex->nkrow;
+  tinynv_kprof_row_t *rows = malloc((size_t)(n ? n : 1) * sizeof(*rows));
+  if (!rows) return;
+  memcpy(rows, ex->krow, (size_t)n * sizeof(*rows));
+  qsort(rows, (size_t)n, sizeof(*rows), kprof_cmp);
+  double total = (double)ex->kattr_ns;
+  fprintf(stderr, "libtinynv:   %6s %10s %9s %9s %9s  %s\n", "share", "us/window", "n/window", "mean us", "max us",
+          "kernel, by instantiation (top 40)");
+  uint64_t rest_ns = 0, rest_n = 0; int rest = 0;
+  for (int i = 0; i < n; i++) {
+    if (!rows[i].n) continue;
+    if (i < 40)
+      fprintf(stderr, "libtinynv:   %5.1f%% %10.1f %9.2f %9.2f %9.1f  %s\n", 100.0 * (double)rows[i].ns / total,
+              (double)rows[i].ns / 1e3 / w, (double)rows[i].n / w, (double)rows[i].ns / 1e3 / (double)rows[i].n,
+              (double)rows[i].max_ns / 1e3, rows[i].name);
+    else { rest_ns += rows[i].ns; rest_n += rows[i].n; rest++; }
+  }
+  if (rest)
+    fprintf(stderr, "libtinynv:   %5.1f%% %10.1f %9.2f %9s %9s  the other %d instantiations\n", 100.0 * (double)rest_ns / total,
+            (double)rest_ns / 1e3 / w, (double)rest_n / w, "", "", rest);
+  // Merged under the function's name: the part of the short name before its template arguments.
+  int nb = 0;
+  for (int i = 0; i < n; i++) {
+    if (!ex->krow[i].n) continue;
+    char base[112];
+    snprintf(base, sizeof(base), "%s", ex->krow[i].name);
+    char *lt = strchr(base, '<');
+    if (lt) *lt = 0;
+    int j;
+    for (j = 0; j < nb; j++) if (!strcmp(rows[j].name, base)) break;
+    if (j == nb) { memset(&rows[nb], 0, sizeof(rows[nb])); snprintf(rows[nb].name, sizeof(rows[nb].name), "%s", base); nb++; }
+    rows[j].n += ex->krow[i].n; rows[j].ns += ex->krow[i].ns;
+    if (ex->krow[i].max_ns > rows[j].max_ns) rows[j].max_ns = ex->krow[i].max_ns;
+  }
+  qsort(rows, (size_t)nb, sizeof(*rows), kprof_cmp);
+  fprintf(stderr, "libtinynv:   %6s %10s %9s %9s %9s  %s\n", "share", "us/window", "n/window", "mean us", "max us",
+          "kernel, instantiations merged");
+  for (int i = 0; i < nb && i < 32; i++)
+    fprintf(stderr, "libtinynv:   %5.1f%% %10.1f %9.2f %9.2f %9.1f  %s\n", 100.0 * (double)rows[i].ns / total,
+            (double)rows[i].ns / 1e3 / w, (double)rows[i].n / w, (double)rows[i].ns / 1e3 / (double)rows[i].n,
+            (double)rows[i].max_ns / 1e3, rows[i].name);
+  free(rows);
+}
+
+// A cheap checksum over a descriptor, so that "is it still what we wrote" can be asked at a stall. It does not need to
+// be a good hash; it needs to notice a descriptor whose bytes have been handed to something else.
+static uint64_t qmd_sum(const uint8_t *b) {
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < TINYNV_QMD_BYTES; i++) { h ^= b[i]; h *= 1099511628211ull; }
+  return h;
+}
+
+int tinynv_exec_reached(tinynv_exec_t *ex, uint64_t value) {
+  // Staged and not announced is work the engine has not been told about: announce it first, exactly as the wait does,
+  // or a query of an event recorded behind it would read "not yet" forever.
+  if (tinynv_submit_ring(ex->g)) return -1;
+  return sem_reached(ex, value);
+}
+
+int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
+  // A pending keep-alive is let go before a wait that needs the compute queue past it (the driver's own later work,
+  // which never happens on a decode); a wait that needs no more than what came before it leaves the spin alone.
+  if (ex->ka_pending && ex->q_last[0] != ex->ka_value) tinynv_exec_keepalive_release(ex, 1);
+  // Anything staged and not announced is work the engine has not been told about, so waiting for it would sit out the
+  // whole timeout. This is normally empty; it is not when a flush failed between staging the delivery and submitting
+  // the chain that would have announced it, and that is exactly the path where a hang would be hardest to read.
+  if (tinynv_submit_ring(ex->g)) return -1;
+  PROF_START(ex);
+  uint64_t was = ex->prof_ns[PROF_WAIT];
+  int spun = 0;
+  double deadline = now() + seconds;
+  for (;;) {
+    // `done` decides; `v` is only for saying where things stand, and with a slot per queue there is no single number
+    // for that any more. The compute slot is the one worth naming, because that is where the launches report.
+    int done = sem_reached(ex, value);
+    uint64_t v = sem_read_slot(ex, 0), vcopy = sem_read_slot(ex, 1);
+    if (done) {
+      // Everything the engine has passed is no longer interesting, and dropping it here is what keeps room for the
+      // oldest thing that is still outstanding - which is the one a stall needs to show.
+      uint64_t reached = v < vcopy ? vcopy : v;
+      // The engine is idle at this instant if nothing submitted on the compute queue is still outstanding, and then
+      // whatever is launched next ends an interval that holds idle time and the host's turnaround rather than a
+      // kernel. Not `spun`: a wait that found the work already done leaves the engine exactly as idle, and the
+      // first run of this instrument put several whole-token intervals on rope_multi and k_bin_bcast that way.
+      // The resident token's chain stamps, read once its last chain's value has been reached.
+      if (ex->profile && ex->graph_last_n && v >= ex->graph_last_at0 + (uint64_t)ex->graph_last_n - 1) {
+        uint64_t prev = 0;
+        for (int k = 0; k < ex->graph_last_n; k++) {
+          uint64_t pay = 0, clk = 0;
+          nv_rd_block(&ex->sem.dma.view, SEM_TS_CHAIN(k), &pay, sizeof(pay));
+          nv_rd_block(&ex->sem.dma.view, SEM_TS_CHAIN(k) + 8, &clk, sizeof(clk));
+          if (pay == ex->graph_last_at0 + (uint64_t)k && k && clk > prev && clk - prev < 100000000ull) { ex->graph_chain_ns[k] += clk - prev; ex->graph_chain_n[k]++; }
+          prev = clk;
+        }
+        ex->graph_last_n = 0;
+      }
+      if (ex->kprof_on) {
+        kprof_harvest(ex, v, 1);
+        if (v >= ex->q_last[0]) ex->kboundary_pending = 1;
+      }
+      int keep = 0;
+      for (int i = 0; i < ex->ntrail; i++)
+        if (ex->trail[i].upto > reached) ex->trail[keep++] = ex->trail[i];
+      ex->ntrail = keep;
+      // Counted on the way out rather than at the top, because whether this call stood still is only known here.
+      PROF_END(ex, PROF_WAIT);
+      // Harvest first, arm second, and the order is the whole of it: the slot the "from" lives in is overwritten by
+      // every batch, so a pair has to be closed before the next one is opened.
+      if (ex->profile && ex->refill_armed) {
+        uint64_t started = 0, reached = 0;
+        nv_rd_block(&ex->sem.dma.view, SEM_TS_START + 8, &started, sizeof(started));
+        // When the engine REACHED this batch, as against when it was allowed to proceed. The difference is the
+        // acquire - on the launch path, waiting for the copy engine to deliver this batch's descriptors.
+        nv_rd_block(&ex->sem.dma.view, SEM_TS_PRE + 8, &reached, sizeof(reached));
+        ex->refill_reach_raw = reached;
+        // A refill can only be forward in time. Anything else means the pair did not belong together - the head
+        // timestamp had not landed when this was read - and a negative interval is worth discarding loudly rather than
+        // folding into an average that then looks plausible.
+        // Bounded, and the bound is the point. A refill gap is microseconds; a decode token is milliseconds. Anything
+        // near a second is not a gap, it is two numbers that do not belong to the same clock - which is precisely what
+        // this instrument reported for a day, at 3.35 SECONDS, while looking like an answer. The two halves come from
+        // different mechanisms now (a host semaphore method for the head, a descriptor's second release slot for the
+        // tail) and both write the gpu's clock at +8 of a 16-byte report - which test_headers holds against NVIDIA's
+        // own NvGpuSemaphore, so it is a checked fact rather than the belief it was for an hour. The bound stays
+        // anyway: the offset was only ever one of the ways two timestamps can fail to be on the same clock.
+        // The raw pair, for the first few. Three wrong answers have come out of this instrument today and each time I
+        // reasoned from the derived number to a cause and was wrong. The two inputs say immediately which kind of
+        // wrong it is: a zero tail means the descriptor never wrote, a small integer means we are reading the payload
+        // instead of the clock, and two plausible clocks far apart mean they are not the same clock.
+        // Two windows, because the first eight refills are all prefill - A spotted that the printed pairs were ~2 ms
+        // apart at the start of a run, which is pp256, so they said nothing about a decode. The second window opens
+        // partway in, where a batch is a token.
+        //
+        // And the report's PAYLOAD beside its timestamp, which is the decisive one. Each descriptor releases its own
+        // value to this address and the host waits for the last. If the payload read back is the LAST descriptor's
+        // value while the timestamp beside it is the FIRST descriptor's clock, then the two halves of one 16 byte
+        // report came from different releases - which means the later releases wrote two words where they were told
+        // four, and per-descriptor timestamps are not a mechanism we can use. If both halves agree, they are not.
+        unsigned w = ex->refill_raw_n < TINYNV_REFILL_RAW / 2                              ? ex->refill_raw_n
+                   : (ex->refill_n + ex->refill_bad >= ex->refill_raw_from) ? ex->refill_raw_n : TINYNV_REFILL_RAW;
+        if (w < TINYNV_REFILL_RAW) {
+          uint64_t payload = 0;
+          nv_rd_block(&ex->sem.dma.view, SEM_SLOT(0), &payload, sizeof(payload));
+          ex->refill_raw[w][0] = ex->refill_from;
+          ex->refill_raw[w][1] = started;
+          ex->refill_raw[w][2] = payload;
+          // q_last[0], not ex->timeline. ex->timeline is the highest value handed to EITHER queue, and the descriptor
+          // delivery copy takes numbers after the chain's, so comparing against it reported "payload is NOT the last
+          // value" on every healthy refill. The label was wrong, not the data, and it is why the two-release lag read
+          // as a defect in the report rather than as the tail being stamped before the lm_head.
+          ex->refill_raw[w][3] = ex->q_last[0];
+          // The copy engine's clock as captured at the stall, so the 833 us it reports can be read against the tail
+          // rather than inferred from a mean. A's sweeps say the logits transfer costs <=245 us end to end after any
+          // idle this decode produces, so either this interval contains something other than the transfer or the
+          // capture is not where I think it is - and a mean cannot tell those apart.
+          ex->refill_raw[w][4] = ex->refill_copy_from;
+          // `reached` and the copy's start, raw. A's column: the bimodal ~490/~1,150 interval lies after the tiny
+          // copies (the host times those and they are steady at ~370 us on 23 of 24 tokens), so it is between the
+          // refill batch's doorbell and its first method executing. reached splits that in two - if reached moves with
+          // the population it is the compute engine's pickup after the doorbell; if reached is steady and head-reached
+          // moves, it is the acquire on the descriptor delivery, whose 37 us MEAN would be hiding a bimodal 37/740.
+          ex->refill_raw[w][5] = ex->refill_reach_raw;
+          ex->refill_raw[w][6] = ex->refill_cstart;
+          ex->refill_raw_n = w + 1;
+        }
+        // A tail that has not moved since the last refill is a specific failure with a specific cause - the report
+        // being read is not the one the completed work wrote - and it is worth naming rather than counting as "not
+        // physical". It cost three card runs to find by hand, twice because I had stamped a release that the running
+        // configuration does not execute, and the symptom was always this: one value, stuck, while the head advanced.
+        if (ex->refill_from && ex->refill_from == ex->refill_last_tail) ex->refill_stuck++;
+        ex->refill_last_tail = ex->refill_from;
+        // HEAD TO HEAD, which is the token period as the card sees it and cannot be fooled by where the tail sits.
+        //
+        // A found the sixth instrument of mine today measuring an interval that was not the one its label named: with
+        // the download and the tiny uploads both served on the compute queue, the last thing to stamp a tail before a
+        // refill is one of THOSE batches, a few hundred microseconds into what used to be the boundary. tail->head
+        // duly collapsed to ~200 us and the bimodality "vanished" - while the token period barely moved, because the
+        // interval had shrunk around the thing it was measuring rather than the thing getting cheaper.
+        //
+        // The head stamp is emitted only on a refill batch, so the gap between consecutive heads IS one token. It does
+        // not care which batches stamp tails, how many queues are involved, or what the driver reroutes next.
+        if (ex->refill_prev_head && started > ex->refill_prev_head) {
+          uint64_t period = started - ex->refill_prev_head;
+          if (period < 100000000ull) {
+            ex->refill_period_ns += period;
+            ex->refill_period_n++;
+            // And again over the decode window alone. A caught the mean reading 18.3 ms on a run whose tokens are
+            // 15.7 ms: the heads include prefill and warm-up batches, whose spacing is not a token, and they drag it
+            // up by ~2.5 ms. That is a mean over a mixed population - the same shape that hid the answer twice today
+            // - and the fix is to say which population, not to pick a cleverer average.
+            if (ex->refill_n + ex->refill_bad >= ex->refill_raw_from) {
+              ex->refill_period_dec_ns += period;
+              ex->refill_period_dec_n++;
+            }
+          }
+        }
+        ex->refill_prev_head = started;
+        uint64_t gap = started > ex->refill_from ? started - ex->refill_from : 0;
+        if (gap && gap < 100000000ull) {           // 100 ms
+          ex->refill_ns += gap;
+          ex->refill_n++;
+          if (gap > ex->refill_max_ns) ex->refill_max_ns = gap;
+          // Inside the accepted branch, and that is the fix rather than a tidy-up. These had a bound of their own -
+          // none - while the gap had one, so refill 0's four second load gap went into this mean and nowhere else. It
+          // came out as "12,071 us before the engine reached the batch" inside a 1,775 us gap: one sample in 411
+          // carrying 4.2 seconds. A saw the number was not physical; the cause was not the one either of us proposed,
+          // and it was visible in the arithmetic without another card run - 12,071 x 411 is 4.96 s, which is refill 0
+          // plus 410 ordinary gaps.
+          //
+          // The rule this should have followed from the start: a derived number must be accepted or rejected by the
+          // SAME test as the number it decomposes, or the two disagree and the disagreement looks like physics.
+          // How much of the gap the copy engine was still working through after the last kernel retired.
+          if (ex->refill_copy_from > ex->refill_from && started >= ex->refill_copy_from) {
+            ex->refill_copy_ns += ex->refill_copy_from - ex->refill_from;
+            ex->refill_copy_n++;
+            // And the split: how long the copy engine took to BEGIN, against how long the transfer then ran.
+            if (ex->refill_cstart >= ex->refill_from && ex->refill_copy_from >= ex->refill_cstart) {
+              ex->refill_cwait_ns += ex->refill_cstart - ex->refill_from;
+              ex->refill_crun_ns += ex->refill_copy_from - ex->refill_cstart;
+              ex->refill_cstart_n++;
+            }
+          }
+          if (reached > ex->refill_from && started >= reached) {
+            ex->refill_reach_ns += reached - ex->refill_from;
+            ex->refill_acq_ns += started - reached;
+            ex->refill_reach_n++;
+          }
+        } else {
+          ex->refill_bad++;
+        }
+        ex->refill_armed = 0;
+      }
+      // Not profile-gated, unlike refill_pending beside it: the short first chain is a MODE, and a mode that only
+      // works while you are measuring is not a mode. That mistake cost three card runs this morning in the other
+      // direction - instrumenting a branch the running configuration never takes.
+      if (spun) ex->after_stall = 1;
+      if (spun && ex->profile) {
+        ex->prof_ns[PROF_BLOCKED] += ex->prof_ns[PROF_WAIT] - was;
+        ex->prof_n[PROF_BLOCKED]++;
+        // The finish time of the batch that just satisfied this wait, taken now because the refill will overwrite it.
+        // +8 of the compute timeline's own report: the clock at the moment the value the host just waited for was
+        // released. See tinynv_exec_flush for why this is not a slot of its own.
+        nv_rd_block(&ex->sem.dma.view, SEM_TS_TAIL + 8, &ex->refill_from, sizeof(ex->refill_from));
+        // And what the copy engine had last finished at this same instant. A's point, and it is a real hole in every
+        // bracket so far: the tail above is a COMPUTE clock - the token's last kernel - but between that kernel and
+        // the next batch the copy engine reads the logits back to the host, ~600 KB to 1 MB over thunderbolt. That
+        // work is real, necessary, and invisible to anything stamped on the compute queue, so it has been sitting
+        // inside "the engine takes 1.7 ms to reach a batch already on its ring" as though it were latency.
+        //
+        // Read HERE rather than at the harvest, and that is the whole trick: by harvest time the refill batch's own
+        // descriptor delivery has overwritten this slot. At this instant the last copy to have finished is the one
+        // the host was waiting for.
+        nv_rd_block(&ex->sem.dma.view, SEM_TS_COPY + 8, &ex->refill_copy_from, sizeof(ex->refill_copy_from));
+        nv_rd_block(&ex->sem.dma.view, SEM_TS_CSTART + 8, &ex->refill_cstart, sizeof(ex->refill_cstart));
+        // The engine has just gone idle and the host is about to start building again. Whatever goes out next is the
+        // refill, and it is the only batch whose start time is worth knowing.
+        ex->refill_pending = 1;
+        ex->refill_asked++;
+        // The host's own clock at the moment the engine went idle, and how much launch-building this driver had done
+        // by then. Paired at the arm below, these say whether the gap the gpu reports is the host taking that long to
+        // come back - and if it is, how much of it was spent inside libtinynv rather than above it.
+        //
+        // This is the question that decides who fixes it. The gpu says the engine is dry for ~1.8 ms a token. If the
+        // host turnaround over the same interval is ~1.8 ms, the engine is dry because nobody gave it work; if it is
+        // much less, the work was submitted and the engine took its time starting. Those have nothing in common.
+        ex->refill_host_t0 = ex->refill_submit_from = now();
+        ex->refill_build_t0 = ex->prof_ns[PROF_LAUNCH];
+      }
+      return 0;
+    }
+    spun = 1;
+
+    if (now() > deadline) {
+      // Before giving up, ask the firmware. An engine that faults says so on the status queue, and the message names
+      // what it faulted on; without this the driver reports "it did not finish" and knows nothing else.
+      int bad = tinynv_gsp_poll(ex->g);
+      char what[160];
+      // An address beats a pointer to the scrollback. The report above carries the kind and the access as well, but the
+      // one number that decides where to look next belongs in the sentence that says the work did not finish.
+      if (bad && ex->g->gsp.fault_have)
+        snprintf(what, sizeof(what), "an engine faulted on address %#llx - the kind and the access are printed above",
+                 (unsigned long long)ex->g->gsp.fault_va);
+      else if (bad && ex->g->gsp.fault_sm_have)
+        snprintf(what, sizeof(what), "no mmu fault, but an SM reports error %#x, so a kernel did something illegal "
+                 "rather than touched something unmapped", ex->g->gsp.fault_sm_esr);
+      else if (bad && ex->g->gsp.err_fn)
+        snprintf(what, sizeof(what), "gsp-rm reported event %u (%s), payload %u bytes, printed above",
+                 ex->g->gsp.err_fn,
+                 ex->g->gsp.err_fn == TINYNV_MSG_EVENT_MMU_FAULT_QUEUED ? "mmu fault" : "error log",
+                 ex->g->gsp.err_len);
+      else if (bad)
+        snprintf(what, sizeof(what), "gsp-rm refused something, which is recorded above but is not a fault report");
+      else
+        snprintf(what, sizeof(what), "gsp-rm reports nothing wrong, so the work was never picked up rather than "
+                                     "attempted - look at what was submitted, not at what ran");
+      // Where the engine stopped relative to the last chain. This is the difference between "a chain was never
+      // dispatched" and "a chain was dispatched and stopped partway", which are different bugs with different fixes,
+      // and no amount of staring at the two bare numbers separates them.
+      char where[240] = "";
+      if (ex->flush_n && ex->tail_release) {
+        // Say it plainly rather than reporting a position derived from values that are no longer published. A chain
+        // that releases only at its tail cannot be located from the timeline: the number either reached the end or it
+        // did not, and everything in between is invisible by construction.
+        snprintf(where, sizeof(where), " [only the last launch of each chain reports (the default; TINYNV_TAIL_RELEASE=0 "
+                 "releases per launch): the chain covering %llu..%llu %s, and WHERE inside it the engine stopped "
+                 "cannot be known - re-run with TINYNV_TAIL_RELEASE=0 to find out]", (unsigned long long)ex->flush_lo,
+                 (unsigned long long)(ex->flush_lo + (uint64_t)ex->flush_n - 1),
+                 v >= ex->flush_lo + (uint64_t)ex->flush_n - 1 ? "completed" : "did not complete");
+      } else if (ex->flush_n) {
+        uint64_t hi = ex->flush_lo + (uint64_t)ex->flush_n - 1;
+        if (v >= ex->flush_lo && v <= hi)
+          snprintf(where, sizeof(where), " [it stopped at link %llu of the %d in the chain covering %llu..%llu, so the "
+                   "chain was dispatched and died partway]", (unsigned long long)(v - ex->flush_lo + 1), ex->flush_n,
+                   (unsigned long long)ex->flush_lo, (unsigned long long)hi);
+        else if (v < ex->flush_lo)
+          snprintf(where, sizeof(where), " [it is short of the chain covering %llu..%llu, which was handed over and "
+                   "never started]", (unsigned long long)ex->flush_lo, (unsigned long long)hi);
+        else
+          snprintf(where, sizeof(where), " [it is past the last chain (%llu..%llu), so what is missing was reserved "
+                   "and never handed over]", (unsigned long long)ex->flush_lo, (unsigned long long)hi);
+      }
+      // What the driver published, which is worth knowing: if this has not moved, the submission never happened. The
+      // engine's own read pointer is deliberately NOT reported. GPGet in the control block read as zero on both rings
+      // while both engines were demonstrably running - the copy ring had published 1588 transfers that had plainly
+      // happened - so it is not maintained the way the header's "read only" suggests, and the oracle never reads it
+      // either. A number that is always zero is not evidence of anything, and printing it invites the reader to
+      // conclude "the engine has taken none of it", which is exactly the wrong conclusion drawn from a broken gauge.
+      char ring[200] = "";
+      for (int qi = 0; qi < 2; qi++) {
+        tinynv_queue_t *q = qi ? &ex->g->gsp.copy_q : &ex->g->gsp.compute_q;
+        uint32_t get = 0, put = 0;
+        uint64_t published = 0;
+        tinynv_queue_state(ex->g, q, &get, &put, &published);
+        char one[96];
+        snprintf(one, sizeof(one), "%s%s ring: %u published, %llu written", qi ? "; " : " [",
+                 qi ? "copy" : "compute", put, (unsigned long long)published);
+        strncat(ring, one, sizeof(ring) - strlen(ring) - 1);
+      }
+      strncat(ring, "]", sizeof(ring) - strlen(ring) - 1);
+      // And the batches the engine has not finished, oldest first, with what each is waiting for. This is the question
+      // the other numbers cannot answer: an acquire for a value nothing will release parks a channel in silence, and it
+      // shows up here as a batch whose "waits for" is a number no later batch ever reaches.
+      if (ex->nbackwards)
+        fprintf(stderr, "tinynv: a timeline slot read backwards %llu times - that is the bug, and everything below is "
+                "downstream of it\n", (unsigned long long)ex->nbackwards);
+      fprintf(stderr, "tinynv: outstanding batches, oldest first (compute is at %llu):\n", (unsigned long long)v);
+      if (ex->ndropped)
+        fprintf(stderr, "tinynv:   (%llu later submissions not recorded - the trail holds the oldest outstanding, which "
+                "is the one that matters)\n", (unsigned long long)ex->ndropped);
+      int shown = 0;
+      for (int i = 0; i < ex->ntrail; i++) {
+        size_t at = (size_t)i;
+        if (ex->trail[at].upto <= v) continue;   // already done
+        fprintf(stderr, "tinynv:   #%llu %s cmdbuf %#llx %u dwords, %u chained, reaches %llu",
+                (unsigned long long)ex->trail[at].seq, ex->trail[at].copy ? "copy   " : "compute", (unsigned long long)ex->trail[at].va,
+                ex->trail[at].dwords, ex->trail[at].links, (unsigned long long)ex->trail[at].upto);
+        if (ex->trail[at].acquire)
+          fprintf(stderr, ", waits for %llu%s", (unsigned long long)ex->trail[at].acquire,
+                  ex->trail[at].acquire > v ? "  <-- NOT YET RELEASED, this channel is parked here" : " (already released)");
+        if (ex->trail[at].acquire_other)
+          fprintf(stderr, ", and on the other queue for %llu%s", (unsigned long long)ex->trail[at].acquire_other,
+                  ex->trail[at].acquire_other > (ex->trail[at].copy ? v : vcopy)
+                      ? "  <-- NOT YET RELEASED, this channel is parked here" : " (already released)");
+        fprintf(stderr, "\n");
+
+        // The two things that make a ready batch not run, asked of memory rather than guessed at. If the ring entry is
+        // not what the driver wrote, the engine was handed something that was never valid work. If the chain head's
+        // descriptor no longer checksums to what was written, its bytes were given to something else while it waited -
+        // which is the arena reused underneath submitted work, and would be my bug rather than the hardware's.
+        tinynv_queue_t *tq = ex->trail[at].copy ? &ex->g->gsp.copy_q : &ex->g->gsp.compute_q;
+        uint64_t want = tinynv_ring_entry(ex->trail[at].va, ex->trail[at].dwords);
+        uint64_t got = tinynv_ring_entry_read(ex->g, tq, ex->trail[at].slot);
+        if (got != want)
+          fprintf(stderr, "tinynv:       ring slot %llu holds %#llx, the driver wrote %#llx  <-- THE ENTRY IS WRONG\n",
+                  (unsigned long long)ex->trail[at].slot, (unsigned long long)got, (unsigned long long)want);
+        else
+          fprintf(stderr, "tinynv:       ring slot %llu holds exactly what was written\n",
+                  (unsigned long long)ex->trail[at].slot);
+        if (ex->trail[at].head_va) {
+          uint64_t off = ex->trail[at].head_va - ex->region[AR_DESC].mem.va;
+          if (off + TINYNV_QMD_BYTES <= ex->region[AR_DESC].size) {
+            // Read it from where the engine reads it. Checking the shadow was checking the copy that is never wrong
+            // against itself, which is why every stall reported an intact descriptor while the engine was looking at
+            // an arena those bytes had never reached.
+            uint8_t seen[TINYNV_QMD_BYTES];
+            if (ex->arena_vram && !ex->arena_dma)
+              nv_rd_block(&ex->g->dev.vram, ex->region[AR_DESC].mem.ranges[0].paddr + off, seen, sizeof(seen));
+            else if (ex->arena_vram)
+              memcpy(seen, (const uint8_t *)ex->mirror.dma.va + off, sizeof(seen));  // what the engine was handed
+            else memcpy(seen, (const uint8_t *)ex->region[AR_DESC].mem.dma.va + off, sizeof(seen));
+            uint64_t now_sum = qmd_sum(seen);
+            fprintf(stderr, "tinynv:       head descriptor at %#llx %s\n", (unsigned long long)ex->trail[at].head_va,
+                    now_sum == ex->trail[at].head_sum ? "is still exactly as written"
+                                                      : "HAS CHANGED SINCE IT WAS WRITTEN  <-- the arena was reused under it");
+          }
+        }
+        shown++;
+      }
+      if (!shown) fprintf(stderr, "tinynv:   none - everything submitted has finished, so what is missing was never submitted\n");
+      return tinynv_fail("the engines did not reach %llu within %.1fs (compute is at %llu, copy at %llu): %s%s%s",
+                         (unsigned long long)value, seconds, (unsigned long long)v, (unsigned long long)vcopy,
+                         what, where, ring);
+    }
+  }
+}
+
+// Scratch the GPU reads: command buffers, and the kernel descriptors that go with them. Two regions, one writer each,
+// bump allocated, recycled a piece at a time when the bump reaches the top. Video memory by default now rather than
+// host memory - the copy engine delivers the descriptors, so nothing but the engine reads them where they live.
+//
+// It is an arena rather than an allocation per use, and that is not an optimisation. Host memory the GPU can read is
+// mapped by the dext, which allows 128 mappings per connection and **never gives one back** - freeing releases the
+// pages and leaves the slot used. A descriptor allocated per launch would therefore work for 128 launches and then stop,
+// which is a fault a test that launches a few times cannot find. Session A found the same cliff from the shim's side.
+//
+// Coming round is safe because it waits, and what it waits for is in arena.c: the piece being reused, and nothing else.
+// It used to be safe because every batch outstanding was waited on, which is no longer true, and the difference
+// between those two sentences is this whole file's change.
+
+// Whether an allocation fits without the region having to start again from the bottom. Callers that hold a chain use
+// this to flush before they allocate, because coming round with a built-but-unsubmitted descriptor in the region would
+// hand its bytes to something else - arena() refuses that outright, so this is how a caller avoids reaching it.
+//
+// It asks the allocator rather than working it out, and that is the point of the line. This used to be a second copy
+// of the placement arithmetic, and a second copy is the shape that drifts: the copy in arena.c is driven by a test and
+// this one was not, so had they diverged the test would have gone on passing while the callers of THIS one decided
+// wrongly whether they needed to flush.
+static int arena_fits(tinynv_exec_t *ex, int r, uint64_t bytes, uint64_t align) {
+  int wrap = 0;
+  tinynv_arena_place(&ex->region[r], bytes, align, &wrap);
+  return !wrap;
+}
+
+// Push what has been built since the last push into video memory. The engine reads descriptors from there, so bytes
+// that are only in the shadow are bytes the engine will not see - it reads whatever the arena held before.
+static void push_shadow(tinynv_exec_t *ex) {
+  if (!ex->arena_vram) return;
+  // Two spans rather than one, and that is required rather than tidy: allocations are consecutive within a region and
+  // are not consecutive across them, so a single span covering both would push everything between - which, with the
+  // regions megabytes apart, is most of the arena.
+  for (int r = 0; r < 2; r++) {
+    // In DMA mode the descriptor span is delivered by the copy engine at the flush and its span is cleared there, so
+    // there is nothing here to write. Command buffers still come this way and must: the engine fetches a command
+    // buffer to find the acquire inside it, so the acquire cannot be what protects it, and it has to be present before
+    // the engine is told about it at all.
+    if (ex->arena_dma && r == AR_DESC) continue;
+    if (ex->region[r].dirty_hi <= ex->region[r].dirty_lo) continue;
+    nv_wr_block(&ex->g->dev.vram, ex->region[r].mem.ranges[0].paddr + ex->region[r].dirty_lo,
+                ex->region[r].shadow + ex->region[r].dirty_lo,
+                (size_t)(ex->region[r].dirty_hi - ex->region[r].dirty_lo));
+    ex->region[r].dirty_lo = ex->region[r].dirty_hi = 0;
+  }
+}
+
+static void *arena(tinynv_exec_t *ex, int r, uint64_t bytes, uint64_t align, uint64_t *va) {
+  tinynv_exec_region_t *rg = &ex->region[r];
+  int wrap = 0;
+  uint64_t off = tinynv_arena_place(rg, bytes, align, &wrap);
+  if (wrap) {
+    // Coming round hands back scratch an engine may still be reading. It must not happen while a chain is pending:
+    // those descriptors live in this region and nothing has been told to run them yet, so no wait would cover them and
+    // the rewind would give their bytes away.
+    //
+    // That guard used to be a partial check, and the gap cost six hardware runs: flush() zeroes the chain count and
+    // then allocates its own command buffer, so when THAT allocation wrapped, the count was already zero and the reset
+    // went ahead under descriptors built moments earlier. With a region each, flush's command buffer can no longer
+    // reach the descriptors, so the check now covers every wrap that could reach them. It still has to exist - the
+    // descriptors are live and nothing has been told to run them - but it is no longer the only thing standing between
+    // us and that bug.
+    if (r == AR_DESC && ex->nchain) {
+      tinynv_fail("scratch wrapped with %d launches still unsubmitted", ex->nchain);
+      return NULL;
+    }
+    // Push before rewinding, not after: whatever was built in the shadow and not yet sent still has to reach video
+    // memory, and the rewind is about to hand those bytes to something else.
+    push_shadow(ex);
+    if (tinynv_exec_flush(ex)) return NULL;
+
+    // The timeline restarts here, and this is the only place it safely can - but now only when it has to.
+    //
+    // It is a 32-bit counter because the copy engine's release is one word, and it advances once per launch - about a
+    // hundred and thirty thousand a second while generating - so four billion is nine hours of continuous work rather
+    // than the "nothing will reach it" the comment beside the limit used to claim. A server left running overnight
+    // reaches it and every wait afterwards refuses.
+    //
+    // Restarting means saying that no value anybody still holds matters, and the only way to be sure of that is to
+    // stand still: every outstanding batch finished, the slots zeroed with nothing left to write them. That used to be
+    // free, because coming round drained the region anyway. It is not free now - the whole point of recycling in
+    // pieces is that coming round no longer waits for everything - so it is taken on the counter's terms instead of
+    // the region's, near the ceiling rather than every lap. In between the counter simply keeps climbing, which is
+    // what it is for.
+    if (r == AR_DESC && ex->reserved > TINYNV_EXEC_REBASE_AT) {
+      double t0 = now();
+      if (tinynv_exec_idle(ex)) return NULL;
+      ex->wrap_wait_ns += (uint64_t)((now() - t0) * 1e9);
+      ex->reserved = ex->timeline = 0;
+      ex->q_last[0] = ex->q_last[1] = 0;
+      ex->sem_high[0] = ex->sem_high[1] = 0;
+      ex->last_q = NULL;                       // nothing to order the next batch against; it is all finished
+      ex->ntrail = 0;                          // the trail's values are absolute and would now read as the future
+      ex->flush_lo = ex->flush_n = 0;
+      // And so would these. They are the whole reason the restart has to be taken from a standstill: a piece still
+      // holding last lap's value would, after the counter moved under it, be asked to wait for a number the engine
+      // will not reach for hours.
+      for (int i = 0; i < 2; i++) memset(ex->region[i].seg_value, 0, sizeof ex->region[i].seg_value);
+      // The lap position is deliberately left alone. Setting it to "everything entered" was here, on the grounds that
+      // an idle leaves nothing to wait for - which is true, and is not the reason it was safe. The rewind below runs
+      // in the same breath and zeroes it, so the line did nothing in the path anyone would trace; it survived only in
+      // the case where flush had already come round, and there it was doing work whose justification was somewhere
+      // else. With the records zeroed, entering a piece costs a comparison and returns nothing. That is cheap enough
+      // that buying it with an argument was the wrong trade.
+      memset(ex->sem.dma.va, 0, (size_t)ex->sem.size);
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
+
+    // Ask again rather than assuming. Flush allocates its own command buffer, from this very region when this is the
+    // command-buffer region, and so may have come round already; rewinding on top of a buffer the engine has just been
+    // handed would give its bytes away while it reads them.
+    off = tinynv_arena_place(rg, bytes, align, &wrap);
+    if (wrap) {
+      // Refuse rather than carry on. Coming round with a span outstanding means bytes are about to be handed out that
+      // something still owns, and that is the one failure here the card would not report - it would launch whatever is
+      // in the descriptor now and return a wrong answer thousands of launches later.
+      if (tinynv_arena_rewind(rg)) {
+        tinynv_fail("the %s region came round with work neither submitted nor pushed",
+                    r == AR_DESC ? "descriptor" : "command buffer");
+        return NULL;
+      }
+      off = tinynv_arena_place(rg, bytes, align, &wrap);
+      ex->wraps[r]++;
+    }
+  }
+  if (wrap) {
+    tinynv_fail("scratch: %llu bytes wanted, the %s region holds %llu", (unsigned long long)bytes,
+                r == AR_DESC ? "descriptor" : "command buffer", (unsigned long long)rg->size);
+    return NULL;
+  }
+  // And the same question for a boundary crossed without coming round at all: the piece being entered was last used a
+  // lap ago, and its work has to have finished before its bytes are handed out again. This is where the cost of
+  // recycling actually lands, and on a region sized for the work it is almost never taken - the piece being reused is
+  // several pieces old by the time it comes up.
+  //
+  // No flush first, deliberately. A piece's value is recorded when its batch is submitted, never before, so what this
+  // waits for is already on its way and nothing here has to push it. Flushing would submit the chain being built early
+  // - a chain handover costs about fifteen microseconds - to no purpose, and from the command-buffer region it would
+  // allocate out from under this very call.
+  uint64_t want = tinynv_arena_enter(rg, off, bytes);
+  if (want && !sem_reached(ex, want)) {
+    double t0 = now();
+    if (tinynv_exec_wait(ex, want, 30.0)) return NULL;
+    ex->wrap_wait_ns += (uint64_t)((now() - t0) * 1e9);
+    ex->seg_waits++;
+  }
+  *va = rg->mem.va + off;
+  tinynv_arena_take(rg, off, bytes);
+  // The shadow when the arena is in video memory, the mapping itself when it is in host memory. Either way the caller
+  // writes here and the bytes reach the engine when the batch goes.
+  return rg->shadow ? rg->shadow + off : (uint8_t *)rg->mem.dma.va + off;
+}
+
+static uint32_t *cmd_space(tinynv_exec_t *ex, uint32_t dwords, uint64_t *va) {
+  return arena(ex, AR_CMD, (uint64_t)dwords * 4, 4, va);
+}
+
+// Begin a batch on a queue.
+//
+// If the last work went somewhere else, the engine is told to wait for it first. The two queues are independent - a copy
+// submitted after a kernel will otherwise start before the kernel has written what it is copying - and while everything
+// was waited on by the host that could not happen. It can now, so the ordering has to be in the command stream, which
+// is where the oracle puts it too.
+// Declared here because batch_begin needs it: a copy batch has to push any held inline uploads out as a compute batch
+// of their own before it can proceed, and run() is defined below.
+static int run(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c, uint64_t cmdbuf_va);
+
+// Hold bytes for the next compute batch to carry. The caller has already checked they fit.
+static void inline_pend_push(tinynv_exec_t *ex, uint64_t dst, const void *src, uint32_t len) {
+  memcpy(ex->inline_pend_buf + ex->inline_pend_bytes, src, len);
+  ex->inline_pend[ex->inline_pend_n].dst = dst;
+  ex->inline_pend[ex->inline_pend_n].off = ex->inline_pend_bytes;
+  ex->inline_pend[ex->inline_pend_n].len = len;
+  ex->inline_pend_n++;
+  ex->inline_pend_bytes += len;
+}
+
+// Room for one more held span of `len` bytes?
+static int inline_pend_fits(const tinynv_exec_t *ex, uint32_t len) {
+  return ex->inline_pend_n < ex->inline_pend_max && ex->inline_pend_bytes + len <= ex->inline_pend_bytes_max;
+}
+
+static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, tinynv_cmdbuf_t *c, uint64_t *va) {
+  // Everything that is not a launch is ordered after the launches already built: a copy that reads what a kernel wrote,
+  // a wait, the setup batches. flush() clears the count before it builds anything, so the call it makes back into here
+  // finds nothing pending and this does not recurse.
+  if (tinynv_exec_flush(ex)) return -1;
+  // A copy batch cannot carry compute-class methods, and a download that read memory whose bytes were still sitting in
+  // our buffer would read stale device memory. So they go out first, in a batch of their own - the old behaviour, and
+  // it happens only when a copy follows an upload with no launch between them. One level of recursion at most: the
+  // list is empty when that call returns.
+  // ...but not during a chain flush. The only copy that runs there is the descriptor delivery, which reads our own
+  // mirror and never a caller's memory, so there is nothing for held bytes to be ordered against - and pushing them
+  // out here as a compute batch is what broke the timeline. They ride out with the chain batch instead, which is
+  // where they belonged all along.
+  if (q == &ex->g->gsp.copy_q && ex->inline_pend_n && !ex->in_chain_flush) {
+    uint64_t iva;
+    tinynv_cmdbuf_t ic;
+    if (batch_begin(ex, &ex->g->gsp.compute_q, 40, &ic, &iva)) return -1;
+    ex->submitting_inline = 1;
+    int rc = run(ex, &ex->g->gsp.compute_q, &ic, iva);
+    ex->submitting_inline = 0;
+    if (rc) return -1;
+  }
+  // The refill's head timestamp, and it has to be built here rather than in run(): run() is handed a command buffer
+  // that already holds the batch's launches, so anything it appends times the end. One semaphore method is six dwords
+  // and the space for it is reserved here, by the only code that knows the batch has not been sized for it.
+  int head_ts = ex->profile && ex->refill_pending && q != &ex->g->gsp.copy_q;
+  // Room for any small uploads waiting to ride along. They are compute-class methods, so only a compute batch can
+  // carry them; a copy batch has already pushed them out above.
+  uint32_t inl = 0;
+  if (q != &ex->g->gsp.copy_q)
+    for (unsigned i = 0; i < ex->inline_pend_n; i++) inl += TINYNV_INLINE_DWORDS(ex->inline_pend[i].len);
+  // Six dwords for the same-queue acquire below (one semaphore method), which every asynchronous compute batch takes.
+  uint32_t sq = q != &ex->g->gsp.copy_q && !ex->sync && ex->q_last[0] ? 6u : 0u;
+  uint32_t *w = cmd_space(ex, dwords + inl + sq + (head_ts ? 12u : 0u), va);
+  if (!w) return -1;
+  *c = (tinynv_cmdbuf_t){.words = w, .n = 0, .cap = dwords + inl + sq + (head_ts ? 12u : 0u)};
+  // Synchronously there is nothing to order against: the previous batch was waited on before this one was built, so
+  // the acquire would always be already satisfied. Leaving it out is what makes TINYNV_SYNC=1 the pre-d29cb32 path
+  // rather than the new path with a wait bolted on, which matters when the question is whether the acquire is the bug.
+  //
+  // The flush above is load-bearing for this line, and the order of the two is the whole of it. A semaphore acquire
+  // breaks the descriptor chain - the oracle says so and works around it by hand, waiting for the previous launch
+  // whenever it emits a cross-queue wait on the compute queue. Here the flush has already handed the chain over and
+  // moved the timeline to its last value, so waiting for the timeline *is* waiting for the previous launch, and the
+  // workaround is the ordering of these two statements rather than a special case. Reverse them and dependent kernels
+  // start running underneath a copy that was meant to follow them.
+  // Before the acquire, deliberately, and it is the whole point of this one. The stamp below sits AFTER the acquire,
+  // so it reports when the batch was allowed to PROCEED - which on the launch path means when the descriptor copy this
+  // batch waits on had finished. The pair brackets that wait: this clock is when the engine reached the batch, that
+  // one is when it could start, and the difference is time spent waiting on the copy engine rather than on anything
+  // the compute engine was doing.
+  //
+  // Needed because the idle sweep came back flat: a launch after 2 ms of idle costs ~57 us end to end, not 800, so the
+  // ~800 us a token boundary spends "starting work already on its ring" is not the engine waking up. A suggested the
+  // acquire, and the acquire is the first thing this batch executes.
+  if (head_ts && tinynv_cmd_timestamp(c, ex->sem.va + SEM_TS_PRE, ex->reserved + 1)) return -1;
+  ex->pending_acquire = ex->pending_acquire_other = 0;
+  int qi = q == &ex->g->gsp.copy_q;
+  if (!ex->sync && ex->last_q && ex->last_q != q) {
+    // Wait on the queue we are switching away from, in its own slot, for the value it was last asked for. Waiting on a
+    // shared location for "the last value anyone asked for" was the bug: that number may have been written and then
+    // overwritten by the other engine finishing something older, and the acquire then waits for it forever.
+    int other = !qi;
+    if (ex->q_last[other]) {
+      if (tinynv_cmd_wait(c, ex->sem.va + SEM_SLOT(other), ex->q_last[other])) return -1;
+      ex->pending_acquire_other = ex->q_last[other];
+    }
+  }
+  // THE SAME-QUEUE ACQUIRE, BEFORE ANY HELD BYTES (H4's address-0 fault, 2026-09-21). Every asynchronous compute batch
+  // waits here for the compute work before it. This used to be emitted by tinynv_exec_flush AFTER this function returned
+  // - so the held uploads below, which this batch's command stream writes the moment it runs, landed while the previous
+  // chain's kernels could still be executing: bytes the guest issued AFTER those launches, underneath them. The standalone
+  // batches that carry held bytes on their own (a copy's, a full list's) had no same-queue acquire at all. Now all of
+  // them take it, and the chain flush no longer emits a second one.
+  if (sq) {
+    if (tinynv_cmd_wait(c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) return -1;
+    ex->pending_acquire = ex->q_last[0];
+  }
+  // Emitted here: after both acquires that order this batch, before anything the caller appends, and before the memory
+  // barrier a launch batch emits next - so the bytes are written and flushed before any kernel in this batch can read
+  // them, and only after every launch the guest issued before them has finished.
+  if (q != &ex->g->gsp.copy_q && ex->inline_pend_n) {
+    for (unsigned i = 0; i < ex->inline_pend_n; i++)
+      if (tinynv_cmd_inline_upload(c, ex->inline_pend[i].dst, ex->inline_pend_buf + ex->inline_pend[i].off,
+                                   ex->inline_pend[i].len))
+        return -1;
+    ex->inline_batches_saved += ex->inline_pend_n;
+    ex->inline_pend_n = 0;
+    ex->inline_pend_bytes = 0;
+  }
+  if (q != &ex->g->gsp.copy_q) ex->after_stall = 0;
+  ex->last_q = q;
+  // After the acquire, deliberately. Before it, this would record the moment the engine reached a wait it may then sit
+  // on for as long as the other queue takes - which is not when this batch started working, and would report an idle
+  // gap shorter than the truth by exactly the part that is somebody else's fault.
+  if (head_ts) {
+    if (tinynv_cmd_timestamp(c, ex->sem.va + SEM_TS_START, ex->reserved + 1)) return -1;
+    ex->refill_pending = 0;
+    ex->refill_armed = 1;
+    ex->refill_armed_n++;
+    if (ex->refill_host_t0 > 0.0) {
+      ex->refill_host_ns += (uint64_t)((now() - ex->refill_host_t0) * 1e9);
+      ex->refill_build_ns += ex->prof_ns[PROF_LAUNCH] - ex->refill_build_t0;
+      ex->refill_host_n++;
+      ex->refill_host_t0 = 0.0;
+    }
+    // The head timestamp is written into this batch's command buffer HERE, at its beginning, but the engine does not
+    // execute it until the batch is submitted and picked up. So the gpu-measured gap runs from the engine going idle
+    // all the way to the engine starting again, and the host-measured gap above stops at the moment the host began
+    // BUILDING - the launches, the push and the submit all come after it. That is why the two differ by ~850 us and
+    // neither half is wrong: they are measuring different ends of the same interval.
+    //
+    // This closes it. The clock is taken again when the batch is actually handed over, so the interval splits into
+    // three: the caller turning the token around, this driver building and submitting, and whatever the engine takes
+    // to start work that is already on the ring. The last of those is the only one with nowhere else to hide.
+    ex->refill_submit_open = 1;
+  }
+  return 0;
+}
+
+// Hand a finished batch to a queue and wait for it. The release at the end of every batch is what is waited on.
+// The half that is the same however the batch releases: make the bytes visible, hand them over, and move the timeline
+// to what the batch will have reached. Synchronously, wait for it here.
+static int submit_batch(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c, uint64_t cmdbuf_va, uint64_t upto,
+                       int links) {
+  uint64_t seq = ex->nsubmit++;
+  if (ex->ntrail < TINYNV_EXEC_TRAIL) {
+    size_t at = (size_t)ex->ntrail++;
+    ex->trail[at].seq = seq;
+    ex->trail[at].slot = q->entries ? q->put % q->entries : 0;
+    ex->trail[at].head_va = ex->pending_head_va;
+    ex->trail[at].head_sum = ex->pending_head_sum;
+    ex->trail[at].va = cmdbuf_va;
+    ex->trail[at].acquire = ex->pending_acquire;
+    ex->trail[at].acquire_other = ex->pending_acquire_other;
+    ex->trail[at].upto = upto;
+    ex->trail[at].dwords = c->n;
+    ex->trail[at].copy = q == &ex->g->gsp.copy_q;
+    ex->trail[at].links = (uint8_t)(links > 255 ? 255 : links);
+  } else {
+    ex->ndropped++;
+  }
+  ex->pending_head_va = ex->pending_head_sum = 0;
+  ex->pending_acquire = ex->pending_acquire_other = 0;
+
+  // The one crossing. Everything this batch needs the engine to read - descriptors, constant buffers, the command
+  // buffer itself - was built in the shadow and goes over in a single block write, so the engine then reads all of it
+  // out of video memory locally. That is the whole change: it replaces roughly twenty small non-posted fetches coming
+  // back across the link per launch with one posted write going out per batch.
+  // Nothing is read back after this. These bytes and the ring's write pointer go to the same place by the same path,
+  // and tinynv_submit reads that pointer back before it rings, which cannot pass these writes either.
+  for (int r = 0; r < 2; r++) tinynv_arena_submitted(&ex->region[r], upto);
+  { PROF_START(ex); push_shadow(ex); PROF_END(ex, PROF_PUSH); }
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  { PROF_START(ex);
+    // Deferred, this writes the ring entry and the pointer and stops. The next batch out calls tinynv_submit, whose
+    // ring half announces everything staged - so the pair costs one round trip instead of two. Never deferred
+    // synchronously: submit_batch waits at the end of this function, and waiting on a batch nobody has rung is a hang.
+    // Staged (the ring entry and the write pointer, posted writes) and announced (one read as the fence, then the
+    // doorbells) are timed apart: the read is a round trip to the server process and the writes are not.
+    int rc = tinynv_submit_stage(ex->g, q, cmdbuf_va, c->n);
+    PROF_END(ex, PROF_SUBMIT);
+    if (rc) return -1;
+    if (!(ex->defer_ring && !ex->sync)) {
+      PROF_START(ex);
+      rc = ex->ring_async ? tinynv_submit_ring_send(ex->g) : tinynv_submit_ring(ex->g);
+      PROF_END(ex, PROF_RING);
+      if (rc) return -1;
+    } }
+  ex->nsubmit_kind[q == &ex->g->gsp.copy_q ? 2 : links ? 0 : 1]++;
+  ex->hist[ex->nhist % 128].dwords = c->n; ex->hist[ex->nhist % 128].copy = q == &ex->g->gsp.copy_q;
+  ex->hist[ex->nhist % 128].links = (uint8_t)(links > 255 ? 255 : links); ex->nhist++;
+  // The highest value handed over, not the most recent one. With the descriptor delivery submitting a copy that takes
+  // a number after the chain's, the compute batch is submitted with a LOWER value than the copy that preceded it, and
+  // a timeline that took the latest would step backwards - under-waiting at the next idle, which is a wrap handing out
+  // bytes an engine is still reading.
+  // See the arm in batch_begin: this is the far end of the host's half of a refill.
+  if (ex->refill_submit_open && ex->refill_submit_from > 0.0) {
+    ex->refill_submit_ns += (uint64_t)((now() - ex->refill_submit_from) * 1e9);
+    ex->refill_submit_n++;
+    ex->refill_submit_open = 0;
+    ex->refill_submit_from = 0.0;
+  }
+  // Anything that gets here other than an inline upload is work a caller may have to wait for. Set at the point of
+  // submission rather than inferred later: a flag that is only correct if every future path remembers to set it is the
+  // shape that has cost this project three card runs today, so the default is "needs waiting" and the single
+  // exception is stated where it is taken.
+  // Loud, because the silent version of this cost a day. A compute submission inside a chain flush takes a LATER
+  // timeline value than the chain that is handed over after it, so the slot goes backwards by the length of the
+  // chain - and the only symptom is a warning thousands of launches later, or a fault, or nothing at all for 370
+  // requests. Anything reaching here in that window is the same bug wearing a different hat.
+  if (ex->in_chain_flush && q == &ex->g->gsp.compute_q)
+    return tinynv_fail("a compute batch was submitted inside a chain flush: it takes timeline value %llu and the "
+                       "chain handed over after it releases a lower one, so the timeline would go backwards by the "
+                       "length of the chain", (unsigned long long)upto);
+  if (!ex->submitting_inline && !ex->internal_work) ex->needs_wait = 1;   // the driver's own work is waited for by the driver
+  if (upto > ex->timeline) ex->timeline = upto;
+  ex->q_last[q == &ex->g->gsp.copy_q] = upto;
+  return ex->sync ? tinynv_exec_wait(ex, upto, 30.0) : 0;
+}
+
+// Diagnostic only, built for the 2026-09-18 MoE per-token descriptor-delta measurement. Dumps every submitted
+// batch's raw dwords, exactly as built, so two decode tokens' worth of batches can be diffed offline. TINYNV_
+// DUMP_CMD=<path> turns it on; unset, this is one getenv call, cached.
+//
+// NEEDS A REAL DEVICE - checked and it does not work on the null device, corrected here after finding out the
+// hard way: tinynv.c's launch path only reaches tinynv_exec_run (and so this hook) when s->dev->has_pci; without
+// a card it takes an early-return "would launch" print and never touches exec.c's batch machinery at all. There
+// is no card-free way to capture this.
+//
+// MEASURED, real hardware, 16-token MoE decode (Qwen3.5-35B-A3B), two consecutive steady-state tokens (same
+// 26-record size sequence, so aligned position-for-position): of 2,435 dwords submitted per token across those
+// 26 batches, only 65 (2.7%, 260 bytes) actually differ from the previous token - one dword in the big compute
+// chain, three per small copy-engine record (mostly KV-cache write offset/address pairs). The changed values are
+// not just small, they are PREDICTABLE FIXED-STRIDE COUNTERS: the offset field advances by exactly the same
+// delta every layer within a token (e.g. +2635), and the paired address dwords advance by exactly the same
+// delta every layer too (+4276224 bytes) - consistent with the ggml-cuda code-level finding that MoE expert
+// selection is expressed as small on-device buffer *content* (mmid.cu's ids/ids_src1), never as changed launch
+// addresses. This is well inside TINYNV_INLINE_MAX (a single call) and the default inline-pend budget with
+// large margin - confirms extending the existing, already-hardware-proven TINYNV_INLINE_UPLOAD path to patch
+// this delta in place is sufficient; no second GPFIFO channel is needed for this specific problem.
+// Record format: [u32 queue: 0=compute 1=copy][u32 n dwords][n*4 bytes], appended, never truncated.
+static void dump_cmd_maybe(const tinynv_queue_t *q, const tinynv_exec_t *ex, const tinynv_cmdbuf_t *c) {
+  static int checked = 0;
+  static FILE *f = NULL;
+  if (!checked) {
+    checked = 1;
+    const char *path = getenv("TINYNV_DUMP_CMD");
+    if (path && *path) f = fopen(path, "ab");
+  }
+  if (!f) return;
+  uint32_t hdr[2] = {(uint32_t)(q == &ex->g->gsp.copy_q), c->n};
+  fwrite(hdr, sizeof(hdr), 1, f);
+  fwrite(c->words, 4, c->n, f);
+  fflush(f);
+}
+
+static int run(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c, uint64_t cmdbuf_va) {
+  dump_cmd_maybe(q, ex, c);
+  // The timeline only moves once the work is actually on the ring. Advancing first and then failing to submit would
+  // leave a value nothing will ever release, and every wait after it - including the arena's - would sit out its whole
+  // timeout before reporting a fault that happened somewhere else entirely.
+  uint64_t at = ex->reserved + 1;
+  // The copy engine releases the timeline itself; the compute engine is released by the host methods. See
+  // tinynv_cmd_copy_release: a host-method release on a copy channel can retire before the engine has drained, which
+  // asynchronously means a kernel starts reading a buffer the copy is still writing. The copy engine's own release is
+  // one word, so the timeline has to stay inside 32 bits for the two to agree on the same eight bytes. That is 4
+  // billion batches, which nothing will reach, and refusing is still better than wrapping where nobody is looking.
+  if (at > 0xffffffffull) return tinynv_fail("the timeline has run past 32 bits (%llu batches)", (unsigned long long)at);
+  int is_copy = q == &ex->g->gsp.copy_q;
+  uint64_t slot = ex->sem.va + SEM_SLOT(is_copy);
+  // The head timestamp used to be emitted here and was wrong twice over: appended after the caller's launches, and
+  // carrying RELEASE_WFI, so it recorded when the batch FINISHED. batch_begin emits it now, at the head, without the
+  // wait. See tinynv_cmd_timestamp.
+  // Under the profile the compute release carries a clock, for the same reason the chain tail's does: everything that
+  // advances this timeline has to leave a timestamp beside it, or a batch that ends here rather than in a chain leaves
+  // the previous chain's clock sitting at +8 and the next refill measures against it. Free - this release already
+  // waits for idle, and a four word report costs eight bytes of a 128 byte stride.
+  if (ex->profile && is_copy && tinynv_cmd_copy_timestamp(c, ex->sem.va + SEM_TS_COPY, at)) return -1;
+  if (is_copy ? tinynv_cmd_copy_release(c, slot, at)
+              : (ex->profile ? tinynv_cmd_release_clocked(c, slot, at) : tinynv_cmd_release(c, slot, at)))
+    return -1;
+  ex->reserved = at;
+  return submit_batch(ex, q, c, cmdbuf_va, at, 0);
+}
+
+// Hand over the chain built so far: one launch method for the head, and the descriptors carry the rest. Each descriptor
+// releases its own timeline value when its kernel finishes, so there is no release in the command stream and no
+// wait-for-idle between kernels - which is the whole point, since that wait is what stopped one kernel overlapping the
+// next. The last value in the chain is what the timeline reaches.
+// What the chain has to be true of before it is handed over. This is not defensive tidiness: the way this goes wrong is
+// a kernel running beside the one it depends on, which produces a wrong number rather than a fault, intermittently and
+// only under load. A chain that does not link, or a timeline value released twice or never, is exactly that bug one
+// step earlier, where it can still be turned into a refusal. Cheap - a few reads per flush, against a kernel launch.
+static int chain_is_sound(tinynv_exec_t *ex, int n) {
+  uint64_t base = ex->reserved - (uint64_t)n;   // the chain releases base+1 .. base+n, in order
+  for (int i = 0; i < n; i++) {
+    const char *why = NULL;
+    // Tail-only: every link but the last must be silent, and the last carries the whole chain's value. Checking the
+    // shape that was asked for rather than either shape is the point - a check that accepts both cannot tell a chain
+    // built wrong from a chain built the other way.
+    // Under TINYNV_KERNEL_PROFILE every stamped link releases too - its own value, into its own ring slot - and the
+    // check is the same one: the value a link releases is the one it reserved, whichever address it goes to.
+    int stamped = ex->kprof_on && ex->chain[i].kslot < TINYNV_KPROF_SLOTS;
+    int releases = ex->no_chain_deps ? 0 : (!ex->tail_release || stamped || i == n - 1);
+    uint64_t want = base + 1 + (uint64_t)i;   // the tail's is ex->reserved, which is base + n
+    uint64_t next = ex->no_chain_deps ? 0 : (i + 1 < n ? ex->chain[i + 1].va : 0);
+    if (tinynv_qmd_link_check(&ex->chain[i].qmd, releases, want, next, &why))
+      return tinynv_fail("launch %d of %d in the chain is wrong: %s", i, n, why ? why : "unspecified");
+  }
+  return 0;
+}
+
+// TINYNV_DELTA_DELIVERY's per-flush budget. Once every launch's patches are known, their pushbuffer footprint - the
+// data AND the eight header dwords each tinynv_cmd_inline_upload call costs (TINYNV_INLINE_DWORDS) - is capped as a
+// whole flush against ex->delta_aggregate_max (TINYNV_DELTA_AGGREGATE_KB; tinynv_exec_delta_aggregate has the
+// default). Deliberately not TINYNV_INLINE_MAX: that number prices ONE small copy against the copy engine moving it
+// instead; the real alternative on a miss here is the FULL delivery of the whole flush's dirty span - ~192 KB through
+// the mirror and the copy engine, and at a token boundary the channel switch that comes with it (libtinynv-design.md
+// SS4f). Processor writes cost ~4.2us/KB (SS4d: 1.5 KB at a launch's descriptor is 6.3 us of ~7), so the budget is a
+// ceiling and not a target: the point of sub-launch runs is that a flush's genuine change is a few tens of KB.
+//
+// Headers are counted since 2026-09-19 because with runs they are a real fraction: a flush of a thousand small patches
+// carries 32 KB of headers alone, and a cap that priced only the data would let the batch outgrow what the check said
+// it was. The 64 KB this replaces counted data only and was sized against the per-launch envelope, which overstated
+// genuine change 7-10x; neither number has been swept on hardware, which is why it is a knob and not a constant.
+//
+// One patch's pushbuffer cost in dwords. A run longer than TINYNV_INLINE_MAX goes out as several calls (the emit loop
+// in tinynv_exec_flush), so the headers are per piece. This is the one place that arithmetic lives: the reservation
+// (want_dwords) and the emit loop are both exact in terms of it, and a batch sized by one and filled by the other is
+// the shape of bug the command buffer refuses at the push ("holds %u dwords and the batch needs more") rather than
+// at the card, which is where it belongs.
+static uint32_t delta_span_dwords(uint32_t len) {
+  uint32_t pieces = (len + TINYNV_INLINE_MAX - 1) / TINYNV_INLINE_MAX;
+  return 8u * pieces + len / 4u;
+}
+
+int tinynv_delta_runs(const uint8_t *fresh, const uint8_t *last, uint32_t lo, uint32_t hi, uint32_t gap,
+                      tinynv_delta_span_t *out, unsigned max, tinynv_delta_span_t *envelope) {
+  // Dwords, not bytes, because that is what an inline upload carries (submit.c: a whole number of dwords at a 4-byte
+  // aligned address). Diffing at the granularity the patch is made at leaves nothing to widen afterwards - the
+  // widening that once crashed a run ("an inline upload is a whole number of dwords, not 1542 bytes", 2026-09-19)
+  // has nothing left to do, and a run can never be a byte wider than the dwords that differ.
+  unsigned n = 0;
+  int over = 0;
+  envelope->lo = hi;
+  envelope->hi = lo;
+  for (uint32_t j = lo; j < hi; j += 4) {
+    if (!memcmp(fresh + j, last + j, 4)) continue;
+    if (j < envelope->lo) envelope->lo = j;
+    envelope->hi = j + 4;
+    if (over) continue;   // past max: only the envelope is still being tracked, and the caller will use that
+    // Close enough to the run before it that carrying the unchanged dwords between them costs less than a second
+    // call's headers would, so it rides with that run. At the default gap the two costs are equal at the boundary
+    // and the merge wins the tie: fewer calls is fewer LAUNCH_DMAs for the engine to process, which a dword count
+    // does not price at all.
+    if (n && j - out[n - 1].hi <= gap) { out[n - 1].hi = j + 4; continue; }
+    if (n == max) { over = 1; continue; }
+    out[n].lo = j;
+    out[n].hi = j + 4;
+    n++;
+  }
+  return over ? -1 : (int)n;
+}
+
+int tinynv_exec_flush(tinynv_exec_t *ex) {
+  if (!ex->nchain) return 0;
+  PROF_START(ex);
+  int n = ex->nchain;
+  ex->nchain = 0;   // before anything that could come back through batch_begin
+  // The tail could not be known while the chain was growing, so its release is attached here, once it is. It carries
+  // the last value the chain reserved, which is the only value anything waits for: every wait in this file is for what
+  // submit_batch was told, and that is this number.
+  // Under the profile the tail's release carries the gpu clock as well as the value: a four word report instead of
+  // two, payload at +0 where the timeline has always been read and the clock at +8. Nothing else changes - same slot,
+  // same address, same moment, eight more bytes into a 128 byte stride.
+  // A descriptor that releases the timeline publishes its writes system-wide whatever TINYNV_QMD_MEMBAR asked of the
+  // others: the release is what the host, the copy engine and the next chain's acquire trust, and a release carries no
+  // barrier of its own (tinynv_qmd_release sets address, payload and size only).
+  if (ex->tail_release && !ex->no_chain_deps && ex->qmd_membar != TINYNV_QMD_MEMBAR_SYS &&
+      tinynv_qmd_membar(&ex->chain[n - 1].qmd, TINYNV_QMD_MEMBAR_SYS))
+    return -1;
+  // TINYNV_KERNEL_PROFILE: the tail was stamped by its descriptor like every other launch, until now. That slot has
+  // to carry the timeline, so the stamp is taken off it and the tail is stamped by a command-stream release with
+  // wait-for-idle into the same ring slot instead, appended below after the launch. Nothing depends on the second
+  // release slot of a descriptor, whose behaviour nobody has established (the retraction further down).
+  uint32_t ktail = ex->kprof_on ? ex->chain[n - 1].kslot : TINYNV_KPROF_SLOTS;
+  // A chain that was built before a wait and is handed over after it runs after the idle the wait saw: its first
+  // launch is the boundary, not the next one built. Normally nothing is pending across a wait and this is idle.
+  if (ex->kprof_on && ex->kboundary_pending && ex->chain[0].kslot < TINYNV_KPROF_SLOTS) {
+    ex->kslot[ex->chain[0].kslot].boundary = 1;
+    ex->kboundary_pending = 0;
+  }
+  if (ktail < TINYNV_KPROF_SLOTS) {
+    if (tinynv_qmd_release_clear(&ex->chain[n - 1].qmd)) return -1;
+    ex->kslot[ktail].tail = 1;
+  }
+  if (ex->tail_release && !ex->no_chain_deps &&
+      tinynv_qmd_release(&ex->chain[n - 1].qmd, ex->sem.va + SEM_SLOT(0), ex->reserved, ex->profile ? 1 : 0) < 0)
+    return tinynv_fail("the last descriptor has no free release slot");
+  // Why the clock rides on the timeline's own release rather than a second one of its own.
+  //
+  // RETRACTED, and the retraction matters more than the arrangement. This comment used to say "the second release slot
+  // simply does not fire for us after the first descriptor, and I do not know why" - stated as an established property
+  // of the hardware, on the evidence that changing the writer changed nothing in A's raw pairs. That evidence was
+  // real and the conclusion was false. Neither writer was running: the flush-time release this stamped is behind
+  // TINYNV_TAIL_RELEASE, which is OFF unless asked for, so both "fixes" edited code that a decode never executes. The
+  // one value that appeared came from a setup batch on another path, which is why the stuck tail was always the FIRST
+  // batch's end.
+  //
+  // I left that false mechanism in the code for an hour after correcting the behaviour, which is the worse half: a
+  // wrong fix gets found, a wrong explanation sitting in a comment gets believed. There is no evidence either way
+  // about whether a descriptor's second release slot works, and anyone who needs it should find out rather than read
+  // it here.
+  //
+  // What is true is the arrangement below: the clock rides on the release that advances the timeline, which
+  // demonstrably fires on every chain because the host is already waiting on it. Same slot, same moment, and it
+  // cannot be stale relative to the value that satisfied the wait, because it IS that value's report.
+  if (chain_is_sound(ex, n)) return -1;
+
+  // The descriptors were edited in place while the chain grew - each one's pointer to the next is written when the next
+  // arrives - so they are copied out only now that no more editing can happen.
+  for (int i = 0; i < n; i++) memcpy(ex->chain[i].host, ex->chain[i].qmd.b, TINYNV_QMD_BYTES);
+
+  // What this chain's own descriptors release, captured before anything else can take a number. The delivery below
+  // submits a batch of its own, and a submitted batch takes the next timeline value - so after it, ex->reserved is the
+  // COPY's value and no longer the chain's. Submitting the chain with that number is what stalled every delivered
+  // chain on hardware: the compute slot was declared to reach a value its descriptors never release, so the first wait
+  // on it sat out its whole timeout while the engine, correctly, had nothing left to do.
+  const uint64_t chain_upto = ex->reserved;
+  // From here until the chain is submitted, NOTHING may take a timeline value on the compute queue. The chain's
+  // descriptors release base+1..chain_upto, and the chain batch is handed over LAST - so a compute batch submitted in
+  // this window releases a HIGHER value first and the timeline goes backwards by the length of the chain.
+  //
+  // That is the bug that made inline uploads corrupt the dense 27B: held bytes were pushed out here, inside the
+  // delivery copy's batch_begin, as a compute batch of their own. A's logs name it exactly - "12952 after 13070" is a
+  // drop of 118, which is a chain - and it was deterministic per build because the arena and the load sequence are.
+  ex->in_chain_flush = 1;
+
+  // Hand the descriptors over by copy engine, before the batch that will read them is begun - so that batch_begin
+  // below sees the copy as the last queue used and emits the acquire that orders the two. The copy in turn acquires on
+  // the previous compute chain, which is what stops it overwriting descriptors a running chain is still reading.
+  // A SMALL descriptor span rides in the compute batch itself, so there is no copy-engine batch and therefore no
+  // cross-queue acquire and no channel switch at all.
+  //
+  // This is the thing the whole boundary investigation arrives at. The copy engine delivering descriptors is the last
+  // copy-engine work at a token boundary, and the switch between the two channels costs ~700 us on about half the
+  // tokens. Writing a full chain's ~192 KB across the link instead is ~800 us, worse; inlining a full chain does not
+  // fit in a pushbuffer. What fits is a SHORT first chain - and the gap-depth curve prices one at ~22 us of chain
+  // overhead (gap(d) = 1.0 + 22/d across five depths), so two launches cost the token ~20 us to take the handoff off
+  // its critical path.
+  //
+  // Correctness is the same argument as any other held span: emitted after the acquire that orders the batch, before
+  // the launch method that reads them, flushed by the same FLUSH_ONLY the caller's tensors get.
+  //
+  // TINYNV_DELTA_DELIVERY: the span about to be delivered, captured before any branch below clears it, so
+  // last_delivered can be brought up to date at the end regardless of which path actually did the delivering.
+  uint64_t delta_lo = ex->region[AR_DESC].dirty_lo, delta_hi = ex->region[AR_DESC].dirty_hi;
+  int delta_handled = 0;
+  // This flush's patches and their footprint, hoisted out of the block below because the actual write happens after
+  // batch_begin() further down - see the comment there for why it moved. The spans themselves live in ex->delta_span.
+  unsigned delta_pend_n = 0;
+  uint32_t delta_pend_dwords = 0;
+  if (ex->delta_delivery && ex->region[AR_DESC].last_delivered && ex->arena_dma &&
+      ex->wraps[AR_DESC] && delta_hi > delta_lo) {
+    // Trusted only past the region's first lap (wraps[AR_DESC] set): before that, last_delivered has never been
+    // compared against a real prior delivery at this address, so there is nothing yet to diff against honestly.
+    //
+    // Per launch, and within a launch per run. A flush holds up to chain_max launches before delivering (n here), and
+    // one min-max diff over that much content reads as "almost 100% different" the instant even one byte differs
+    // near each end - measured on hardware 2026-09-18 (TINYNV_DELTA_VERBOSE), which is why the single-envelope
+    // version of this that shipped in a4f9010 was a correctness-safe no-op in practice. One envelope per launch
+    // (c728085) then found the same shape one level down: every launch's ~1.5 KB span carries some genuine change
+    // each token, but only 40-240 bytes of it - 3-15% of the envelope, measured 2026-09-19 - so the envelope
+    // overstated a flush's change 7-10x, and raising the budget only moved where it missed. tinynv_delta_runs finds
+    // the runs of dwords that actually differ, which is the granularity the change occurs at: a KV-cache offset here,
+    // a pair of address dwords there, each advancing by a fixed stride a token (libtinynv-design.md SS4h).
+    //
+    // All-or-nothing per flush, checked before anything is pushed: either every launch's own patches fit inline, or
+    // none of them are pushed here and the flush falls through to the existing full-span paths below untouched.
+    // Committing some launches' patches here and then letting a fallback path resend the same bytes as part of a
+    // wider copy would deliver a byte twice under two different values of "what's there now" - a correctness bug,
+    // not a slower correct answer - which is why the check pass below commits nothing until it has looked at
+    // every launch in the chain.
+    uint8_t *sh = ex->region[AR_DESC].shadow, *ld = ex->region[AR_DESC].last_delivered;
+    // DIAGNOSTIC ONLY, TINYNV_DELTA_VERBOSE: the first three flushes through here in full, then only the misses.
+    // Each pass through this block ends in exactly one of delta_n, delta_skip_n and delta_full_n, so their sum is
+    // how many came before this one.
+    int verbose = getenv("TINYNV_DELTA_VERBOSE") != NULL;
+    // Full-depth flushes only: the first flushes after a rewind are one-launch chains from the prompt phase, and
+    // diagnosing those (as this did until 2026-09-19 12:2x) says nothing about the decode chains the delta path lives
+    // on. Three of at least 64 launches, then only the misses.
+    // ...and not the first ones of those either: the first decode token's chains are diffed against the PROMPT's
+    // prefill chains at the same addresses (different kernels, different shapes), the one token the rewind cannot
+    // help - 44-65 KB of genuine change a flush, measured 2026-09-19 - where the steady state is ~2 KB. Flushes 31-33
+    // are three tokens into the decode.
+    static int seen;
+    if (verbose && n >= 64) seen++;
+    int diag = verbose && n >= 64 && seen > 30 && seen <= 33;
+    unsigned ns = 0, changed = 0;   // patches recorded so far across every launch checked, and launches that had any
+    uint32_t need_dwords = 0, need_bytes = 0, env_bytes = 0;
+    int all_fit = 1;
+    for (int i = 0; i < n; i++) {
+      uint32_t lo = (uint32_t)(ex->chain[i].va - ex->region[AR_DESC].mem.va), hi = lo + ex->chain[i].len;
+      // Room in the flat list for this launch's runs: its own per-launch cap, and never so much that a launch still
+      // to come in this chain is left without the one slot its envelope needs. Holding one slot back per remaining
+      // launch means every launch always has room for at least its envelope, so a full list can only ever cost a
+      // launch its runs, never the flush its fast path (TINYNV_DELTA_SPANS_MAX >= TINYNV_EXEC_CHAIN_MAX makes the
+      // reservation possible from the first launch on; asserted beside the define).
+      unsigned room = TINYNV_DELTA_SPANS_MAX - ns - (unsigned)(n - 1 - i);
+      if (room > TINYNV_DELTA_LAUNCH_RUNS_MAX) room = TINYNV_DELTA_LAUNCH_RUNS_MAX;
+      tinynv_delta_span_t env;
+      int k = tinynv_delta_runs(sh, ld, lo, hi, ex->delta_gap, ex->delta_span + ns, room, &env);
+      if (env.hi <= env.lo) continue;   // this launch is byte-identical to its last delivery - nothing to send for it
+      uint32_t run_dwords = 0, run_bytes = 0;
+      for (int r = 0; r < k; r++) {
+        run_bytes += ex->delta_span[ns + r].hi - ex->delta_span[ns + r].lo;
+        run_dwords += delta_span_dwords(ex->delta_span[ns + r].hi - ex->delta_span[ns + r].lo);
+      }
+      uint32_t env_dwords = delta_span_dwords(env.hi - env.lo);
+      // The cheaper of the two shapes, priced in pushbuffer dwords. At the default gap the runs can never cost more
+      // than the envelope - every gap kept is longer than the headers it saves - so this only decides anything when
+      // the gap is swept below that or the runs overflowed their room. It is the decision either way, so it is made
+      // here rather than assumed.
+      if (k < 0 || env_dwords <= run_dwords) {
+        ex->delta_span[ns] = env;
+        k = 1;
+        run_dwords = env_dwords;
+        run_bytes = env.hi - env.lo;
+        ex->delta_collapse_n++;
+      }
+      if (diag) {
+        fprintf(stderr, "libtinynv: delta runs: launch %d envelope %u B (%u dw) -> %d run%s %u B (%u dw)\n", i,
+                env.hi - env.lo, env_dwords, k, k == 1 ? "" : "s", run_bytes, run_dwords);
+        // And WHERE, for the first eight launches of the flush: which dwords of the descriptor slot or which bytes of
+        // the constant buffer changed since the previous token. This is the ground truth a chain-replay field
+        // classifier would be built from (docs/driver/chain-replay-plan.md SS2, "one thing the logs cannot tell me"):
+        // a release payload sits in the QMD, a per-token parameter in cbuf0 past the driver's own 0x380 bytes.
+        if (i < 8)
+          for (int r = 0; r < k; r++) {
+            uint32_t off = ex->delta_span[ns + r].lo - lo, len = ex->delta_span[ns + r].hi - ex->delta_span[ns + r].lo;
+            if (off < TINYNV_QMD_SLOT_BYTES)
+              fprintf(stderr, "libtinynv:   launch %d run %d: QMD dwords %u..%u\n", i, r, off / 4, (off + len) / 4 - 1);
+            else
+              fprintf(stderr, "libtinynv:   launch %d run %d: cbuf0 +%u..+%u (%s)\n", i, r, off - TINYNV_QMD_SLOT_BYTES,
+                      off - TINYNV_QMD_SLOT_BYTES + len - 1,
+                      off - TINYNV_QMD_SLOT_BYTES < 0x380 ? "driver parameters" : "kernel parameters");
+          }
+      }
+      // Capped as a whole flush by pushbuffer footprint, headers included - see delta_span_dwords and the comment
+      // above tinynv_exec_flush for why that and not TINYNV_INLINE_MAX. This is the only way the pass falls back now:
+      // a run longer than one call carries is split at emit time, and the list always has room for an envelope.
+      if (need_dwords + run_dwords > ex->delta_aggregate_max / 4u) {
+        all_fit = 0;
+        if (verbose && ex->delta_full_n <= 20)
+          fprintf(stderr, "libtinynv: delta miss #%llu: launch %d of %d takes the flush's patches to %u dwords "
+                          "(%u patches, %u B genuine before it), past TINYNV_DELTA_AGGREGATE_KB\n",
+                  (unsigned long long)ex->delta_full_n + 1, i, n, need_dwords + run_dwords, ns + (unsigned)k,
+                  need_bytes);
+        break;
+      }
+      ns += (unsigned)k;
+      need_dwords += run_dwords;
+      need_bytes += run_bytes;
+      env_bytes += env.hi - env.lo;
+      changed++;
+    }
+    if (diag)
+      fprintf(stderr, "libtinynv: delta flush: %d launches, %u changed, envelope %u B, genuine %u B in %u patches, "
+                      "pushbuffer %u B with headers%s\n", n, changed, env_bytes, need_bytes, ns, need_dwords * 4u,
+              all_fit ? "" : " - DID NOT FIT");
+    // One line per full-depth flush for the whole run, so alignment can be read as a trace rather than sampled: a
+    // token whose launch sequence differs from the previous token's (a kernel variant or split count chosen from the
+    // KV length, one launch more or fewer) shifts every later launch and reads as tens of KB; an aligned one as ~2.
+    else if (verbose && n >= 64)
+      fprintf(stderr, "libtinynv: delta flush #%d: %d launches, %u changed, genuine %u B, %u patches\n", seen, n, changed,
+              need_bytes, ns);
+    if (all_fit) {
+      // Nothing above touched arena state - safe to commit now that every launch has been checked. The actual
+      // tinynv_cmd_inline_upload calls happen after batch_begin() below, once the chain's own command buffer
+      // exists to write them into; ex->delta_span[0..delta_pend_n) and delta_pend_dwords (set here) are what that
+      // later code reads.
+      delta_pend_n = ns;
+      delta_pend_dwords = need_dwords;
+      // Ownership moves over the whole originally-dirty span regardless of how many launches actually had bytes to
+      // send, same as the full-span paths below: every launch in the chain read consistently as of this delivery,
+      // not just the ones that changed.
+      tinynv_arena_mark(&ex->region[AR_DESC], delta_lo, delta_hi, chain_upto);
+      ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
+      if (ns) {
+        ex->hybrid_n++;
+        ex->delta_n++;
+        ex->delta_bytes += need_bytes;
+        ex->delta_span_n += ns;
+        ex->delta_pb_bytes += need_dwords * 4u;
+      } else {
+        // Every launch in the chain matched its last delivery - a decode step can repeat a cache-hit prefix
+        // exactly. Ownership still has to move; no bytes need to.
+        ex->delta_skip_n++;
+      }
+      delta_handled = 1;
+    } else {
+      // The flush's genuine change is bigger than the budget (a chain shape that does not match what was here last
+      // lap, or a real bulk change) - fall through to the existing full-span paths below, unchanged. Conservative on
+      // purpose: this is never worse than today's behaviour, only sometimes not as good as it could be.
+      ex->delta_full_n++;
+    }
+  }
+  if (!delta_handled && ex->hybrid_delivery && ex->arena_dma &&
+      ex->region[AR_DESC].dirty_hi > ex->region[AR_DESC].dirty_lo &&
+      ex->region[AR_DESC].dirty_hi - ex->region[AR_DESC].dirty_lo <= TINYNV_INLINE_MAX &&
+      inline_pend_fits(ex, (uint32_t)(ex->region[AR_DESC].dirty_hi - ex->region[AR_DESC].dirty_lo))) {
+    uint64_t lo = ex->region[AR_DESC].dirty_lo, len = ex->region[AR_DESC].dirty_hi - lo;
+    inline_pend_push(ex, ex->region[AR_DESC].mem.va + lo, ex->region[AR_DESC].shadow + lo, (uint32_t)len);
+    tinynv_arena_mark(&ex->region[AR_DESC], lo, lo + len, chain_upto);
+    ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
+    ex->hybrid_n++;
+  }
+  if (!delta_handled && ex->arena_dma && ex->region[AR_DESC].dirty_hi > ex->region[AR_DESC].dirty_lo) {
+    uint64_t lo = ex->region[AR_DESC].dirty_lo, len = ex->region[AR_DESC].dirty_hi - lo;
+    // One sequential write into memory the engine can read, in place of the same bytes going out as scattered
+    // four-byte register writes. Same volume, and this way the processor writes it once, in order.
+    memcpy((uint8_t *)ex->mirror.dma.va + lo, ex->region[AR_DESC].shadow + lo, (size_t)len);
+    // Against the chain that reads these descriptors rather than the copy that delivers them: the chain finishing
+    // implies the copy did, since it acquires on it, and the bytes are in use until the chain is done with them.
+    tinynv_arena_mark(&ex->region[AR_DESC], lo, lo + len, chain_upto);
+    ex->region[AR_DESC].dirty_lo = ex->region[AR_DESC].dirty_hi = 0;
+    // Written but not announced. The compute batch built just below is the next thing out, and its submit announces
+    // both - one read before two doorbells instead of one read each. That read is a message to another process here, so
+    // it costs a full round trip and drains whatever writes are queued ahead of it, which is why halving the count is
+    // worth more than the microseconds suggest. Every flush in delivery mode was paying for two.
+    ex->defer_ring = 1;
+    int rc = tinynv_exec_copy(ex, ex->region[AR_DESC].mem.va + lo, ex->mirror.va + lo, len);
+    ex->defer_ring = 0;
+    if (rc) return -1;
+  }
+  // Whichever path just ran (delta patch, full inline, full copy, or none because there was nothing dirty) has
+  // now made video memory match shadow across the whole originally-dirty span: the delta path patched only what
+  // differed because the rest was already correct there, and the two full-span paths always send the whole span.
+  // Bringing last_delivered up to date here, once, regardless of which branch fired, is what makes the NEXT lap's
+  // diff honest - a bug in this line, and only this line, would be the one way this feature could ever go from
+  // "sometimes not as good as it could be" to "wrong": if the recorded mirror ever drifts from the bytes actually
+  // resident, a future skip could omit an update that had to reach video memory.
+  if (ex->region[AR_DESC].last_delivered && delta_hi > delta_lo)
+    memcpy(ex->region[AR_DESC].last_delivered + delta_lo, ex->region[AR_DESC].shadow + delta_lo, delta_hi - delta_lo);
+
+  uint64_t va;
+  tinynv_cmdbuf_t c;
+  // Four dwords per launch method, and in the unlinked mode every descriptor needs its own rather than the head
+  // alone carrying the rest.
+  // Eight more under the profile for the tail stamp appended below.
+  // Room for this flush's own delta patches, on top of batch_begin()'s own reservation for whatever TINYNV_INLINE_UPLOAD
+  // has pending: delta_span_dwords per patch, summed in the check pass above - exact because every run is a dword
+  // multiple by construction (tinynv_delta_runs diffs dwords) and the emit loop below splits a long run into pieces
+  // exactly as delta_span_dwords priced them.
+  uint32_t want_dwords = (ex->no_chain_deps ? 48 + 4 * (uint32_t)n : 48) + (ex->profile ? 8u : 0u) +
+                         (ktail < TINYNV_KPROF_SLOTS ? 8u : 0u) + delta_pend_dwords;
+  if (batch_begin(ex, &ex->g->gsp.compute_q, want_dwords, &c, &va)) return -1;
+  // Written here, not queued through inline_pend: batch_begin() has already reserved the room want_dwords asked
+  // for and drained whatever TINYNV_INLINE_UPLOAD had pending into this same c, in that order, ahead of this -
+  // same "after the acquire, before anything the caller appends" placement inline_pend's own drain relies on
+  // (see batch_begin), just written directly since these were never held anywhere else to begin with.
+  if (delta_pend_n) {
+    const uint8_t *sh = ex->region[AR_DESC].shadow;
+    for (unsigned s = 0; s < delta_pend_n; s++)
+      // A run longer than one call carries (TINYNV_INLINE_MAX) goes out as consecutive pieces; each is a whole
+      // number of dwords at a dword-aligned address because the run is and TINYNV_INLINE_MAX is.
+      for (uint32_t off = ex->delta_span[s].lo; off < ex->delta_span[s].hi; off += TINYNV_INLINE_MAX) {
+        uint32_t len = ex->delta_span[s].hi - off;
+        if (len > TINYNV_INLINE_MAX) len = TINYNV_INLINE_MAX;
+        if (tinynv_cmd_inline_upload(&c, ex->region[AR_DESC].mem.va + off, sh + off, len)) return -1;
+      }
+  }
+
+  // Wait for the chain before this one. A chain orders the kernels inside it - each descriptor schedules the next - but
+  // nothing ordered one chain against the next, because the thing that used to do that was the wait-for-idle release
+  // this whole change removed. So two chains ran at once: their descriptors wrote the same slot, a later chain's tail
+  // landed before an earlier chain's, and the timeline went 2041 then 1885. That is not a reporting artefact, it is
+  // dependent kernels from different chains running side by side, which is the bug the chaining was meant to avoid,
+  // one level up from where I fixed it.
+  //
+  // One acquire per chain, not per launch: thirty-two kernels still pipeline inside it, and only the seam between
+  // chains is serialised. That is the cost of correctness here and it is a thirty-second of what the old release cost.
+  // (That acquire is emitted by batch_begin now, at the head of the batch and before any held bytes it carries - see
+  // there. Emitting it here, after them, is what let held uploads land underneath the previous chain.)
+  // the caches have to forget what the last kernel left in them, or this one reads its predecessor's constants
+  if (tinynv_cmd_memory_barrier(&c)) return -1;
+  if (ex->no_chain_deps) {
+    // Every descriptor launched from the command stream, nothing scheduling anything, and the batch ending in a
+    // host-method release that waits for the engine to go idle - which is what makes the wait afterwards mean
+    // "all of them finished" when no descriptor can be trusted to be last.
+    for (int i = 0; i < n; i++) if (tinynv_cmd_launch(&c, ex->chain[i].va)) return -1;
+    if (tinynv_cmd_release(&c, ex->sem.va + SEM_SLOT(0), chain_upto)) return -1;
+  } else if (tinynv_cmd_launch(&c, ex->chain[0].va)) return -1;
+  // When this batch's work actually ends, and it has to be a host release that waits for idle rather than the
+  // timeline's own report.
+  //
+  // The report was wrong and the way it was wrong is the lesson. Every descriptor releases its value to one address
+  // and each overwrites the last, so the report should hold the final descriptor's payload and clock. A saw
+  // "payload N-2" on every refill and I dismissed the two-release lag as microseconds against a 1.8 ms gap. That
+  // assumed descriptors are interchangeable. They are not: the LAST descriptor of a decode token is the lm_head -
+  // 248,320 rows of Q4_K against the hidden state, ~700 MB of weights, ~400 us - which is the biggest kernel in the
+  // token. Stamping two releases early put the lm_head's whole duration inside every "dry engine" figure of the day,
+  // and it fits both models: the mixture's lm_head is ~170 us and its number is ~150-200 us lower.
+  //
+  // So the tail comes from a release that cannot be ambiguous about which work it followed. WFI, its own address,
+  // nothing else writing there. The ordering it imposes already exists - every chain opens with an acquire on the
+  // previous chain's timeline value - and it is profile-only regardless.
+  // Not on the driver's own work. A download served by a caller's kernel is still a launch, and it would otherwise
+  // stamp "the token's last kernel finished" partway through the boundary it is part of.
+  if (ex->profile && !ex->internal_work && tinynv_cmd_release_clocked(&c, ex->sem.va + SEM_TS_TAIL, chain_upto))
+    return -1;
+  // The tail's stamp (TINYNV_KERNEL_PROFILE): the clock when the engine went idle after this chain, into the tail's
+  // own ring slot, with the tail's own value as the payload the harvest checks. The chain after this one is ordered
+  // behind it on the channel, so by the time a later timeline value is seen this has been written.
+  if (ktail < TINYNV_KPROF_SLOTS && tinynv_cmd_release_clocked(&c, ex->kring.va + 16ull * ktail, chain_upto))
+    return -1;
+  ex->flush_lo = chain_upto - (uint64_t)n + 1;
+  ex->flush_n = n;
+  ex->pending_head_va = ex->chain[0].va;
+  ex->pending_head_sum = qmd_sum(ex->chain[0].host);
+  ex->in_chain_flush = 0;
+  // The keep-alive, if one is spinning, is let go just before the caller's chain is handed over: the chain acquires on
+  // the keep-alive's own timeline value, which it releases the moment it sees the flag. The driver's own work (the
+  // keep-alive launch itself, a download by kernel) does not release it.
+  if (!ex->internal_work) tinynv_exec_keepalive_release(ex, 0);
+  if (submit_batch(ex, &ex->g->gsp.compute_q, &c, va, chain_upto, n)) return -1;
+  // Once per chain rather than once per launch: see tinynv_exec_run. This reports on work already handed over, which
+  // is what it reported on before too - a launch that has not been submitted cannot have faulted.
+  { PROF_START(ex); int bad = tinynv_gsp_poll(ex->g); PROF_END(ex, PROF_POLL);
+    if (bad) return tinynv_fail("gsp-rm reported a fault, logged above"); }
+  PROF_END(ex, PROF_FLUSH);
+  return 0;
+}
+
+
+// TINYNV_GRAPH_RESIDENT - a recorded token, kept resident and run as one chain.
+//
+// Why this exists: with the delta path a decode's descriptors are byte-identical from one token to the next (every
+// chain after the first patches 29 dwords, which is none), yet each token still costs thirteen chain hand-overs, each
+// a submit with a fence read and an engine pickup of ~40 us, and the engine cannot start until the first chain of
+// 128 is built. A caller that captures its token (ggml's CUDA-graph path) says in advance which launches a token is;
+// the driver records them once into a region of their own, links all of them into one chain, and every replay is
+// one batch: the tail's release payload patched inline, an acquire on the previous work, the launch of the head.
+//
+// What a replay does not do is check that the caller's kernels still want what was recorded; that is the caller's
+// contract (CUDA's too), and ggml re-captures when a node's properties change.
+#define TINYNV_GRAPH_BYTES (16u << 20)
+
+int tinynv_exec_graph_begin(tinynv_exec_t *ex) {
+  if (!ex->graph_resident) return 1;
+  if (!ex->tail_release || ex->no_chain_deps || ex->sync) return 1;   // the chain shape a recording relies on
+  if (ex->rec) return tinynv_fail("a token is already being recorded");
+  if (tinynv_exec_flush(ex)) return -1;   // the caller's launches built before the recording are handed over first
+  tinynv_graph_rec_t *r = calloc(1, sizeof(*r));
+  if (!r) return tinynv_fail("out of memory for a recording");
+  r->size = TINYNV_GRAPH_BYTES;
+  if (ex->graph_pool_n) {
+    ex->graph_pool_n--;
+    r->mem = ex->graph_pool[ex->graph_pool_n].mem;
+    r->mirror = ex->graph_pool[ex->graph_pool_n].mirror;
+  } else {
+    // Mapped as the arena's descriptor region is: video memory, uncached, so the engine reads what the copy engine and
+    // the inline patches wrote and not a line it cached on the previous replay.
+    if (tinynv_mm_alloc_buffer(&ex->g->mm, r->size, 0, 0, 1, 1, 0, &r->mem)) { free(r); return -1; }
+    if (tinynv_mm_alloc_buffer(&ex->g->mm, r->size, 1, 1, 1, 0, 0, &r->mirror)) { tinynv_vmap_free(&ex->g->mm, &r->mem); free(r); return -1; }
+  }
+  ex->rec = r;
+  return 0;
+}
+
+void tinynv_exec_graph_free(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+  if (!r) return;
+  if (r->sealed && r->launches && !ex->torn_down) tinynv_exec_idle(ex);   // the engine may still be reading it
+  if (!ex->torn_down) {
+    if (r->mem.size && r->mirror.size && ex->graph_pool_n < 4) {
+      ex->graph_pool[ex->graph_pool_n].mem = r->mem;
+      ex->graph_pool[ex->graph_pool_n].mirror = r->mirror;
+      ex->graph_pool_n++;
+    } else {
+      if (r->mem.size) tinynv_vmap_free(&ex->g->mm, &r->mem);
+      if (r->mirror.size) tinynv_vmap_free(&ex->g->mm, &r->mirror);
+    }
+  }
+  free(r);
+}
+
+int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+  if (ex->rec) return tinynv_fail("a replay was asked for while a token is being recorded");
+  if (!r || !r->sealed) return tinynv_fail("that recording was never sealed");
+  if (tinynv_exec_flush(ex)) return -1;   // launches the caller built before this replay go first
+  uint64_t at0 = ex->reserved + 1;
+  if (at0 + (uint64_t)r->nchains > 0xffffffffull)
+    return tinynv_fail("the timeline has run past 32 bits (%llu batches)", (unsigned long long)at0);
+  // Every chain's tail releases its own value, so the chain after it can acquire on it: the tails are patched with
+  // this replay's values in a copy of each descriptor, and all of them are carried into video memory by the first
+  // batch, ahead of every launch. A releasing descriptor keeps the system-scope barrier whatever the knob asked.
+  const uint32_t qdw = (uint32_t)TINYNV_QMD_BYTES / 4u;
+  tinynv_qmd_t tails[TINYNV_GRAPH_CHAINS];
+  for (int k = 0; k < r->nchains; k++) {
+    tails[k] = r->chains[k].tail_qmd;
+    if (tinynv_qmd_release(&tails[k], ex->sem.va + SEM_SLOT(0), at0 + (uint64_t)k, ex->profile ? 1 : 0) < 0)
+      return tinynv_fail("the recording's chain %d has no free release slot", k);
+    if (ex->qmd_membar != TINYNV_QMD_MEMBAR_SYS && tinynv_qmd_membar(&tails[k], TINYNV_QMD_MEMBAR_SYS)) return -1;
+  }
+  tinynv_exec_keepalive_release(ex, 0);
+  for (int k = 0; k < r->nchains; k++) {
+    uint64_t va, at = at0 + (uint64_t)k;
+    tinynv_cmdbuf_t c;
+    // TINYNV_GRAPH_PACE: hand chain k over only once chain k-2 has released, the way the ordinary path's build
+    // time paces it - a measurement of whether batches queued far ahead cost the engine (their acquires poll host
+    // memory across the link for the whole of the chain before them). One chain of lookahead, like the host has.
+    if (ex->graph_pace && k >= 2) {
+      double t0 = now();
+      if (tinynv_submit_ring(ex->g)) return -1;   // what is staged must be announced before anything is waited for
+      while (sem_read_slot(ex, 0) < at0 + (uint64_t)k - 2) {
+        if (now() - t0 > 2.0) return tinynv_fail("the resident token's chain %d did not release in 2 s", k - 2);
+      }
+    }
+    uint32_t want = 48u + (k == 0 ? (8u + qdw) * (uint32_t)r->nchains : 0u) + (ex->profile ? 16u : 0u);
+    // All but the last chain's batch are staged: one fence read and one doorbell announce the whole token.
+    ex->defer_ring = k < r->nchains - 1;
+    if (batch_begin(ex, &ex->g->gsp.compute_q, want, &c, &va)) { ex->defer_ring = 0; return -1; }
+    if (k == 0)
+      for (int i = 0; i < r->nchains; i++)
+        if (tinynv_cmd_inline_upload(&c, r->chains[i].tail_va, tails[i].b, TINYNV_QMD_BYTES)) { ex->defer_ring = 0; return -1; }
+    if (!ex->sync && ex->q_last[0]) {
+      if (tinynv_cmd_wait(&c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) { ex->defer_ring = 0; return -1; }
+      ex->pending_acquire = ex->q_last[0];
+    }
+    if (tinynv_cmd_memory_barrier(&c)) { ex->defer_ring = 0; return -1; }
+    if (tinynv_cmd_launch(&c, r->chains[k].head_va)) { ex->defer_ring = 0; return -1; }
+    if (ex->profile && k == r->nchains - 1 && tinynv_cmd_release_clocked(&c, ex->sem.va + SEM_TS_TAIL, at)) { ex->defer_ring = 0; return -1; }
+    if (ex->profile && k < 64 && tinynv_cmd_release_clocked(&c, ex->sem.va + SEM_TS_CHAIN(k), at)) { ex->defer_ring = 0; return -1; }
+    ex->reserved = at;
+    ex->flush_lo = at;
+    ex->flush_n = (int)r->chains[k].n;
+    ex->pending_head_va = r->chains[k].head_va;
+    ex->pending_head_sum = qmd_sum(r->chains[k].head_host);
+    if (submit_batch(ex, &ex->g->gsp.compute_q, &c, va, at, (int)r->chains[k].n)) { ex->defer_ring = 0; return -1; }
+  }
+  ex->defer_ring = 0;
+  { PROF_START(ex); int bad = tinynv_gsp_poll(ex->g); PROF_END(ex, PROF_POLL);
+    if (bad) return tinynv_fail("gsp-rm reported a fault, logged above"); }
+  r->launches++;
+  ex->graph_replays++;
+  if (ex->profile) { ex->graph_last_at0 = at0; ex->graph_last_n = r->nchains < 64 ? r->nchains : 64; }
+  return 0;
+}
+
+int tinynv_exec_graph_end(tinynv_exec_t *ex, tinynv_graph_rec_t **out) {
+  tinynv_graph_rec_t *r = ex->rec;
+  *out = NULL;
+  if (!r) return tinynv_fail("no token is being recorded");
+  ex->rec = NULL;
+  int failed = r->failed, n = (int)r->n;
+  if (failed || !n) {
+    tinynv_exec_graph_free(ex, r);
+    return failed ? -1 : tinynv_fail("the recording holds no launches");
+  }
+  { tinynv_graph_chain_t *ch = &r->chains[r->nchains - 1];   // the last chain ends at the last descriptor
+    ch->tail_va = (uint64_t)(r->prev_host - (uint8_t *)r->mirror.dma.va) + r->mem.va;
+    ch->tail_qmd = r->prev_qmd; }
+  // The descriptors cross the link once, by the copy engine; every replay reads them from video memory. The first
+  // replay's batch acquires on this copy through batch_begin, which orders a compute batch after the copy queue.
+  if (tinynv_exec_copy(ex, r->mem.va, r->mirror.va, r->used)) { tinynv_exec_graph_free(ex, r); return -1; }
+  r->sealed = 1;
+  ex->graph_records++;
+  *out = r;
+  if (tinynv_exec_graph_launch(ex, r)) { *out = NULL; tinynv_exec_graph_free(ex, r); return -1; }
+  return 0;
+}
+
+// Waiting for everything means everything, including launches that are built and not yet handed over: those have
+// timeline values nothing has been told to release, so waiting without flushing first waits out the whole timeout.
+int tinynv_exec_idle(tinynv_exec_t *ex) {
+  // A never-initialised exec has no gpu behind it, and every path below reaches through one - tinynv_exec_wait calls
+  // tinynv_submit_ring(ex->g) first thing, which dereferences it. This used to be somebody else's problem to avoid,
+  // and on 2026-09-15 the teardown did not avoid it: a refused boot called this on a zeroed struct, faulted inside a
+  // signal handler that re-entered the same call, and spun at 98% CPU until SIGKILL - which left the card bus
+  // mastering long enough to latch a DART fault, which costs a physical replug. The caller is fixed too. This is here
+  // because a function that faults when it could refuse makes its caller's mistake unreadable, and the whole cost of
+  // that afternoon was in the unreadability rather than in the mistake.
+  if (!ex || !ex->g) return -1;
+  if (tinynv_exec_flush(ex)) return -1;
+  if (tinynv_exec_wait(ex, ex->timeline, 30.0)) return -1;
+  ex->needs_wait = 0;
+  return 0;
+}
+
+// Whether a synchronise has to wait for the engine, or only hand over what has been built.
+//
+// The driver answers this rather than the caller counting alongside it. A caller mirroring what the driver does can
+// drift, and the failure mode of drift is a synchronise that returns while a kernel is still running - a wrong answer
+// with no symptom at the place it was caused. Everything that requires completion sets the flag at the point it is
+// submitted; only an inline upload does not, because its bytes travel in the command stream.
+int tinynv_exec_needs_wait(const tinynv_exec_t *ex) { return ex->needs_wait; }
+
+int tinynv_exec_copy(tinynv_exec_t *ex, uint64_t dst_va, uint64_t src_va, uint64_t bytes) {
+  if (!bytes) return 0;
+  uint64_t va;
+  tinynv_cmdbuf_t c;
+  if (batch_begin(ex, &ex->g->gsp.copy_q, ex->profile ? 78 : 72, &c, &va)) return -1;
+  // Before the transfer methods and after batch_begin's acquire, so it marks the moment this batch's own work starts.
+  // A's question, and it is the one split nothing so far can make: the decode's logits copy takes ~600 us from the end
+  // of compute to its completion stamp, against <=245 us for the same 993 KB transfer issued cold in d2h_bench. If
+  // start-tail is most of the difference the copy engine is late to begin; if end-start is, the transfer itself runs
+  // slower here than on the bench, which would point at where the staging buffer lives rather than at scheduling.
+  if (ex->profile && tinynv_cmd_copy_timestamp(&c, ex->sem.va + SEM_TS_CSTART, ex->reserved + 1)) return -1;
+  if (tinynv_cmd_copy(&c, dst_va, src_va, bytes)) return -1;
+  return run(ex, &ex->g->gsp.copy_q, &c, va);
+}
+
+// Whether a small host-to-device copy rides in the pushbuffer instead of going to the copy engine.
+//
+// Session A timed the host side of a decode's token boundary call by call: seven copies - 20480, 4, 16, 8, 8, 512 and
+// 4 bytes - cost ~370 us together, about 50 us each including the two synchronisations each one carries. That is 2.3%
+// of a dense token and 4.8% of a mixture's, spent moving 21 KB, and six of the seven are under 512 bytes.
+//
+// ON by default since 2026-09-15, after it measured clean twice and +3% on both models - the largest validated win
+// since copy-engine descriptor delivery. TINYNV_INLINE_UPLOAD=0 turns it off.
+//
+// It shipped off for a day because it changes the DATA path rather than an instrument: a write that did not land
+// would have kernels reading stale memory, which op-verify and a byte-identical text catch - but "would catch" is a
+// reason to measure behind a knob, not a reason to ship without one. Measured: op-verify 450/450 at three chain
+// depths with 2,538 copies riding per run, text byte-identical, 27B 62.49 -> 64.49 twice and MoE 127.4 -> 131.4.
+//
+// The win is not the routing, which changed nothing on its own. It is that the upload stopped taking a batch: the
+// bytes are held and emitted into the next compute batch, so six submits a token became zero. Session A established
+// that the cost was getting a batch onto the ring rather than waiting for it, by removing the wait and seeing nothing
+// move.
+int tinynv_exec_inline_upload_mode(const char *e) { return !e || !*e || *e != '0'; }
+
+// How many small uploads the driver will hold before one has to be pushed out. 16 is what a single-slot decode needs -
+// seven a token with room to spare - and it is almost certainly too small for eight slots, where a step issues about
+// seven per slot. TINYNV_INLINE_PEND=<n> sweeps it up to the fixed ceiling, so the default comes off a measured curve
+// rather than out of the arithmetic, which is the same arithmetic that would have had me sizing a list against a
+// number that turned out to be the wrong field.
+unsigned tinynv_exec_pend_entries(const char *e) {
+  if (!e || !*e) return 16;
+  int n = atoi(e);
+  if (n < 1) n = 1;
+  if (n > TINYNV_INLINE_PEND_CAP_N) n = TINYNV_INLINE_PEND_CAP_N;
+  return (unsigned)n;
+}
+
+// TINYNV_DELTA_DELIVERY's two tunables. Both are first estimates from arithmetic rather than swept defaults, which is
+// why they are knobs: the sweep costs a card run each, not a rebuild.
+//
+// The gap: how many bytes of unchanged content two differing runs in one launch may straddle and still go out as one
+// patch. A second tinynv_cmd_inline_upload call costs 8 header dwords (TINYNV_INLINE_DWORDS), so carrying up to 8
+// dwords - 32 bytes - of unchanged data is never dearer than splitting around them, and at exactly 32 the merge wins
+// the tie (one LAUNCH_DMA fewer for the engine). Rounded down to a dword multiple, since runs are dwords. 0 is a real
+// value - only contiguous dwords merge - and not "unset"; a negative number is nonsense and reads as 0.
+uint32_t tinynv_exec_delta_gap(const char *e) {
+  if (!e || !*e) return 32;
+  long n = atol(e);
+  if (n < 0) n = 0;
+  if (n > 65536) n = 65536;
+  return (uint32_t)n & ~3u;
+}
+
+// The aggregate: a flush's patches' pushbuffer footprint, headers included, past which the flush takes the full
+// delivery instead. KB on the command line because that is the unit it will be swept in; bytes here. 0 is not a
+// budget anyone means (it would refuse every flush that had anything to say), so it and anything unreadable are the
+// default. Capped at 256 KB: the command-buffer region is 512 KB (CMD_REGION_BYTES), one batch has to fit in it
+// whole, and the same batch may carry up to 64 KB of held TINYNV_INLINE_UPLOAD bytes beside these.
+uint32_t tinynv_exec_delta_aggregate(const char *e) {
+  if (!e || !*e) return 128u * 1024u;
+  long kb = atol(e);
+  if (kb <= 0) return 128u * 1024u;
+  if (kb > 256) kb = 256;
+  return (uint32_t)kb * 1024u;
+}
+
+// How many launches the first chain after a standstill carries, so its descriptors fit in a pushbuffer and the batch
+// that restarts the engine needs no copy engine. 0 means the mode is off and every chain is full depth.
+//
+// Off by default. It is the fix the whole token-boundary investigation arrives at, and it is also the least directly
+// evidenced: the isolating experiment was confounded (writing a full chain's descriptors across the link costs about
+// as much as the switch it removes, so the two arms differ by more than the copy engine), and this is the test that
+// separates them rather than a conclusion drawn from one.
+unsigned tinynv_exec_short_chain(const char *e) {
+  if (!e || !*e) return 0;
+  int n = atoi(e);
+  if (n < 0) n = 0;
+  if (n > TINYNV_EXEC_CHAIN_MAX) n = TINYNV_EXEC_CHAIN_MAX;
+  return (unsigned)n;
+}
+
+// Wait until nothing is still reading staging buffer s, so the processor may write into it. With one buffer this was
+// implicit - every chunk drained the whole device - and with two it is the only thing keeping a memcpy from landing
+// on top of a transfer that is still in flight. Cheap when nothing is pending, which is the common case.
+static int stage_claim(tinynv_exec_t *ex, int s) {
+  if (!ex->stage_pend[s]) return 0;
+  if (tinynv_exec_wait(ex, ex->stage_pend[s], 30.0)) return -1;
+  ex->stage_pend[s] = 0;
+  return 0;
+}
+int tinynv_exec_stage_claim(tinynv_exec_t *ex) {
+  ex->claim_ext_n++;
+  if (ex->stage_pend[0]) ex->claim_ext_blocked++;
+  return stage_claim(ex, 0);
+}
+
+int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size_t n) {
+  const uint8_t *p = src;
+  // Small, whole dwords, aligned: everything else goes to the engine built for moving bytes. The 20480-byte copy of
+  // the seven stays there too - past a few KB the pushbuffer itself has to reach the card, so inlining stops paying.
+  if (ex->inline_upload && n && n <= ex->inline_max && !(n & 3u) && !(dst_va & 3u)) {
+    // AN UPLOAD NEVER LANDS BEFORE A LAUNCH THAT PRECEDES IT (H4's address-0 fault, 2026-09-21). Held bytes ride at the
+    // HEAD of the next compute batch, and a chain's launches are accumulated before that batch is begun - so an upload
+    // issued between launch k and k+1 of a pending chain landed before launch 1. A kernel earlier in the chain that
+    // wrote the destination (a zero-fill, say) then ran AFTER the new bytes and overwrote them, and a later kernel read
+    // what it left: a pointer table still zero, a read of address 0. TINYNV_SYNC=1 hid it, because every batch was
+    // waited on. The pending chain is handed over first, so the bytes ride behind these launches, at the head of the
+    // next batch, after its same-queue acquire on them. It costs a chain boundary per upload issued mid-chain, and
+    // nothing when uploads come before a step's launches, which is where llama.cpp and every H-run until H4 put them.
+    if (ex->nchain && tinynv_exec_flush(ex)) return -1;
+    // BUFFERED, not submitted, and that is the whole of the fix. This took a batch, a doorbell and an idle of its own
+    // - and worse, batch_begin FLUSHES the pending chain, so every tiny copy forced whatever launches were queued out
+    // early. Six a token. Session A measured the round trip at ~50 us a copy and then showed, by removing the wait
+    // after it and seeing nothing move, that the cost is getting the batch onto the ring rather than waiting for it.
+    //
+    // The bytes are copied out of the caller's buffer here, so the caller may reuse it the moment this returns - which
+    // is the only guarantee a synchronous upload owes. Nothing has to reach the card until something else goes, and
+    // batch_begin emits these into the next compute batch before anything in it can observe them.
+    if (ex->inline_pend_n == ex->inline_pend_max || ex->inline_pend_bytes + n > ex->inline_pend_bytes_max) {
+      // Full. Prefer to let the held bytes ride out with work that is ALREADY pending rather than building a batch
+      // for them - which is the whole point of holding them, and the version of this branch that went to the card
+      // first got it wrong: it called batch_begin, whose flush hands the pending chain over, and the chain's own
+      // batch_begin drained the held list into THAT batch. The list was then empty and the batch built here carried
+      // nothing but an acquire and a release. A wasted submit, on the path whose entire purpose is to remove submits,
+      // and it only shows up when a chain is pending - which at one slot it never is and under batching it always is.
+      if (tinynv_exec_flush(ex)) return -1;
+      if (ex->inline_pend_n) {
+        // Nothing was pending to carry them, so they do need a batch. This is the original case: a caller uploading
+        // far more than a step's worth without ever launching anything.
+        uint64_t va;
+        tinynv_cmdbuf_t c;
+        if (batch_begin(ex, &ex->g->gsp.compute_q, 40, &c, &va)) return -1;
+        ex->submitting_inline = 1;
+        int rc = run(ex, &ex->g->gsp.compute_q, &c, va);
+        ex->submitting_inline = 0;
+        if (rc) return -1;
+        ex->inline_forced_n++;
+      } else {
+        ex->inline_rode_flush_n++;
+      }
+    }
+    inline_pend_push(ex, dst_va, src, (uint32_t)n);
+    ex->inline_n++;
+    ex->inline_bytes += n;
+    return 0;   // no batch, no doorbell, no wait; and needs_wait is deliberately untouched
+  }
+  ex->upload_ce_n++;
+  ex->needs_wait = 1;
+  // Checked at init, so reaching here NULL means the exec state was overwritten after it - which is worth saying in
+  // those words, because the segfault it replaces points at this memcpy and hides the fact that the pointer is the
+  // victim rather than the culprit. Eight probe runs died here and the backtrace never said which.
+  if (!ex->stage[0].dma.va)
+    return tinynv_fail("the copy staging buffer's host mapping is NULL at upload time on exec %p (gpu va %#llx) - "
+                       "compare the exec pointer with the one that reported the buffer ready at startup: the same "
+                       "pointer means the state was overwritten, a different one means this device was never set up",
+                       (void *)ex, (unsigned long long)ex->stage[0].va);
+  ex->up_calls++;
+  { unsigned b = 0; for (size_t t = n; t >= (1u << 16) && b < 7; t >>= 2) b++; ex->up_hist[b]++; }
+  unsigned chunk_i = 0;
+  for (size_t off = 0; off < n; off += STAGE_BYTES, chunk_i++) {
+    size_t chunk = n - off < STAGE_BYTES ? n - off : STAGE_BYTES;
+    int sb = chunk_i & 1;
+    // Asked BEFORE the clock starts, so the read does not land in the memcpy figure. This is the measurement the
+    // whole second-copy-channel question turns on: a copy can only be overlapped with compute that is actually in
+    // flight, and the loop below then idles the entire device anyway. If this is always "idle", there is nothing to
+    // overlap and a channel on its own runlist cannot help.
+    // Weight loading is counted apart. Before the first kernel is ever submitted the compute engine is idle by
+    // definition, and a 7.6 GB model load is some 475 chunks - enough to drown the few hundred that matter.
+    if (!ex->q_last[0]) ex->up_load_chunks++;
+    else if (ex->q_last[0] > sem_read_slot(ex, 0)) ex->up_busy_n++;
+    else ex->up_idle_n++;
+    ex->up_chunks++;
+    // Wait only for the copy that last read THIS buffer - two chunks back - instead of draining the device. That
+    // one-line difference is the whole point: the previous chunk's transfer stays in flight across this memcpy.
+    double t2 = now();
+    if (ex->stage_single) sb = 0;   // TINYNV_STAGE_SINGLE=1: the old one-buffer, drain-every-chunk behaviour, kept
+    ex->claim_up_n++;
+    if (ex->stage_pend[sb]) ex->claim_up_blocked++;
+    if (stage_claim(ex, sb)) return -1;
+    double t0 = now();
+    memcpy(ex->stage[sb].dma.va, p + off, chunk);
+    double t1 = now();
+    if (tinynv_exec_copy(ex, dst_va + off, ex->stage[sb].va, chunk)) return -1;
+    // What this copy will have reached when it is done reading the buffer. q_last[1] is the copy queue's slot, set
+    // by the run() that tinynv_exec_copy just performed.
+    ex->stage_pend[sb] = ex->q_last[1];
+    // the arm this replaced: nothing may be in flight when the chunk ends, so the next memcpy is unconditionally safe
+    if (ex->stage_single) { if (tinynv_exec_idle(ex)) return -1; ex->stage_pend[sb] = 0; }
+    ex->up_memcpy_s += t1 - t0; ex->up_submit_s += now() - t1; ex->up_wait_s += t0 - t2;
+  }
+  return 0;
+}
+
+// The staging buffer, for the one caller that has to drive the device->stage step itself: a download served by a
+// caller's kernel rather than by the copy engine. Kernels live in tinynv.c and the stage lives here; this is the
+// smaller thing to expose.
+// Bracket the driver's own work, so the profile does not mistake it for the caller's. See the tail stamp in
+// tinynv_exec_flush.
+void tinynv_exec_set_internal(tinynv_exec_t *ex, int on) { ex->internal_work = on; }
+
+uint64_t tinynv_exec_stage_va(const tinynv_exec_t *ex) { return ex->stage[0].va; }
+void *tinynv_exec_stage_host(const tinynv_exec_t *ex) { return ex->stage[0].dma.va; }
+size_t tinynv_exec_stage_bytes(void) { return STAGE_BYTES; }
+
+int tinynv_exec_download(tinynv_exec_t *ex, void *dst, uint64_t src_va, size_t n) {
+  uint8_t *p = dst;
+  for (size_t off = 0; off < n; off += STAGE_BYTES) {
+    size_t chunk = n - off < STAGE_BYTES ? n - off : STAGE_BYTES;
+    // Let the compute drain before the copy is issued, so the copy's acquire is already satisfied when the channel is
+    // first looked at and it is never switched out waiting. See tinynv_exec_download_sync_first.
+    if (ex->download_sync_first && tinynv_exec_idle(ex)) return -1;
+    if (tinynv_exec_copy(ex, ex->stage[0].va, src_va + off, chunk)) return -1;
+    if (tinynv_exec_idle(ex)) return -1;   // reading a result is one of the few places that has to wait
+    ex->stage_pend[0] = 0;                 // the idle above covers anything that was reading it
+    // Recorded before the write, not after, so a fault inside this very memcpy still leaves the span behind.
+    tinynv_note_host_write(p + off, chunk, "download: stage -> caller");
+    memcpy(p + off, ex->stage[0].dma.va, chunk);
+  }
+  return 0;
+}
+
+// Zero a range of device memory, through the copy engine because that is the only thing that can reach it.
+//
+// `tinynv_mm_alloc_buffer`'s zero flag cannot do this: it writes through the window onto video memory and skips, in
+// silence, anything past the end of it. On a card behind thunderbolt the window is 256 MB of 32 GB, so for almost every
+// allocation that flag is a no-op that looks like a guarantee.
+int tinynv_exec_zero(tinynv_exec_t *ex, uint64_t va, uint64_t bytes) {
+  if (!bytes) return 0;
+  uint64_t chunk = ex->stage[0].size < bytes ? ex->stage[0].size : bytes;
+  if (stage_claim(ex, 0)) return -1;   // an upload's copy may still be reading this buffer
+  memset(ex->stage[0].dma.va, 0, (size_t)chunk);
+  for (uint64_t off = 0; off < bytes; off += chunk) {
+    uint64_t n = bytes - off < chunk ? bytes - off : chunk;
+    if (tinynv_exec_copy(ex, va + off, ex->stage[0].va, n)) return -1;
+  }
+  return tinynv_exec_idle(ex);   // the pattern lives in the staging buffer; nobody may refill it until this is done
+}
+
+int tinynv_exec_launch(tinynv_exec_t *ex, uint64_t qmd_va) {
+  uint64_t va;
+  tinynv_cmdbuf_t c;
+  if (batch_begin(ex, &ex->g->gsp.compute_q, 40, &c, &va)) return -1;
+  // the caches have to forget what the last kernel left in them, or this one reads its predecessor's constants
+  if (tinynv_cmd_memory_barrier(&c)) return -1;
+  if (tinynv_cmd_launch(&c, qmd_va)) return -1;
+  return run(ex, &ex->g->gsp.compute_q, &c, va);
+}
+
+// Local memory is a property of the die, not of a kernel: every thread that could be resident at once needs its own, so
+// it is sized for the whole chip and only grown when a kernel wants more per thread than the last one did.
+int tinynv_exec_ensure_local_memory(tinynv_exec_t *ex, uint32_t per_thread) {
+  if (per_thread <= ex->slm_per_thread) return 0;
+  ex->slm_per_thread = (per_thread + 31) & ~31u;
+
+  tinynv_gsp_t *gsp = &ex->g->gsp;
+  tinynv_die_t die = {.num_gpcs = gsp->max_gpcs, .num_tpc_per_gpc = gsp->max_tpc_per_gpc,
+                      .num_sm_per_tpc = gsp->max_sm_per_tpc, .max_warps_per_sm = gsp->max_warps_per_sm};
+  uint64_t per_tpc = 0, total = tinynv_local_memory_size(&die, ex->slm_per_thread, &per_tpc);
+
+  tinynv_vmap_t slm;
+  if (tinynv_mm_alloc_buffer(&ex->g->mm, total, 0, 0, 0, 1, 0, &slm)) return -1;
+  // the old range is about to stop being mapped, and a kernel already submitted is still using it as its stack
+  if (tinynv_exec_idle(ex)) { tinynv_vmap_free(&ex->g->mm, &slm); return -1; }
+  tinynv_vmap_free(&ex->g->mm, &ex->slm);
+  ex->slm = slm;
+
+  uint64_t va;
+  tinynv_cmdbuf_t c;
+  if (batch_begin(ex, &ex->g->gsp.compute_q, 40, &c, &va)) return -1;
+  if (tinynv_cmd_local_memory(&c, ex->slm.va, per_tpc)) return -1;
+  return run(ex, &ex->g->gsp.compute_q, &c, va);
+}
+
+// Putting a cubin where the GPU can run it: lay the sections out into one block, fix up the addresses inside it now
+// that the block has one, and copy it across. The guard page after it is not decoration - the instruction prefetcher
+// reads past the end of a kernel and faults on memory that is not mapped.
+#define IMAGE_GUARD 0x1000
+
+int tinynv_exec_load(tinynv_exec_t *ex, const tinynv_cubin_t *cb, const char *kernel, tinynv_exec_module_t *out) {
+  memset(out, 0, sizeof(*out));
+  if (tinynv_cubin_image(cb, kernel, 1, &out->layout)) return -1;
+  uint64_t bytes = ((out->layout.len + 0xfff) & ~0xfffull) + IMAGE_GUARD;
+  if (tinynv_mm_alloc_buffer(&ex->g->mm, bytes, 0, 0, 0, 1, 0, &out->mem)) { tinynv_image_free(&out->layout); return -1; }
+  if (tinynv_image_relocate(&out->layout, out->mem.va) ||
+      tinynv_exec_upload(ex, out->mem.va, out->layout.bytes, out->layout.len) ||
+      // the tail, including the guard page: the prefetcher reads past the end of a kernel, and what it finds should be
+      // zeros this driver put there rather than whatever the last tenant of that memory left
+      tinynv_exec_zero(ex, out->mem.va + out->layout.len, bytes - out->layout.len)) {
+    tinynv_exec_unload(&ex->g->mm, out);
+    return -1;
+  }
+  // WHERE EACH IMAGE LANDS (B, 2026-09-24; C8 191356): the SM-error report names a warp pc and nothing said which module
+  // held it. Print-only, once per module at its FIRST LAUNCH (this load runs inside kernel_ready_locked): the image's VA
+  // range, the kernel whose launch loaded it, and FNV-1a 64 over the cubin bytes as received - the same hash the guest
+  // shim prints under TINYCU_IMAGE_HASH=1 (shim.c:2792), so tools/b-slot/pc_map.py joins a pc to its guest library.
+  {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < cb->len; i++) { h ^= cb->img[i]; h *= 1099511628211ULL; }
+    fprintf(stderr, "tinynv: IMAGE PLACED %s [%#llx, %#llx) text +%#llx, cubin %zu bytes fnv1a64 %016llx\n", kernel,
+            (unsigned long long)out->mem.va, (unsigned long long)(out->mem.va + out->layout.len),
+            (unsigned long long)out->layout.text_off, cb->len, (unsigned long long)h);
+  }
+  return 0;
+}
+
+void tinynv_exec_unload(tinynv_mm_t *mm, tinynv_exec_module_t *m) {
+  // no idle here: the caller owns the ordering, because it is the one that knows no kernel from this module is queued
+  tinynv_vmap_free(mm, &m->mem);
+  tinynv_image_free(&m->layout);
+  memset(m, 0, sizeof(*m));
+}
+
+// test_hw_namedbar's must-fail arm: nonzero overrides every launch's BARRIER_COUNT (1 reproduces the pre-fix grant)
+uint32_t tinynv_exec_test_barriers_force;
+// The whole of a launch as the caller sees it, timed as one thing. Everything else the summary reports is subtracted
+// from this, so if the parts do not add up the difference is real work nobody has named yet rather than a rounding.
+// One descriptor, as this driver builds them: the kernel's own numbers, the constant banks, the tail the measurement
+// knobs asked for. Shared by the ordinary launch and the recorder, so a recorded token's descriptors are exactly the
+// ones a plain launch would have built at that address.
+static int build_qmd(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k, const uint32_t grid[3],
+                     const uint32_t block[3], uint32_t dyn_smem, uint32_t cbuf0_bytes, uint64_t qmd_va, uint64_t slot,
+                     tinynv_qmd_t *out) {
+  tinynv_gsp_t *gsp = &ex->g->gsp;
+  tinynv_qmd_t q;
+  memset(&q, 0, sizeof(q));
+  // Which descriptor generation this chip takes, by the same test the oracle makes: the compute class it answers to.
+  // Ampere and Ada take v3, Blackwell v5. memset left this at v5, which is right for exactly one of the three.
+  q.v3 = ex->g->dev.class_compute < TINYNV_CLASS_COMPUTE_BLACKWELL_A;
+  tinynv_qmd_program_t prog = {.regs = k->regs,
+                               // What the kernel declared plus what the caller asked for at the call site. The descriptor
+                               // holds one number, so the two have to be added here: a kernel given only its static
+                               // share does not fail, it indexes past the end of what it was given.
+                               .shmem = (uint32_t)((0x400 + k->static_smem + dyn_smem + 127) & ~127u),
+                               .slm_per_thread = ex->slm_per_thread,
+                               .prog_size = (uint32_t)k->text_size,
+                               .sass_version = tinynv_sass_version(gsp->sm_version),
+                               .barriers = tinynv_exec_test_barriers_force ? tinynv_exec_test_barriers_force : k->num_barriers};
+  // the field is 5 bits (nv_regs.h BARRIER_COUNT 1137-1141): a kernel declaring more is refused by name, never truncated
+  if (prog.barriers > 31) return tinynv_fail("kernel %s declares %u barriers; the descriptor holds at most 31", k->name, prog.barriers);
+  tinynv_qmd_launch_t l = {.program_addr = m->mem.va + m->layout.text_off};
+  for (int i = 0; i < 3; i++) { l.grid[i] = grid[i]; l.block[i] = block[i]; }
+
+  // Bank 0 is the one being built here, in this allocation; the rest are sections of the image, and a kernel that reads
+  // a __device__ table finds its address in one of them.
+  prog.constbuf_used[0] = 1;
+  // The tail of every descriptor: the oracle's unless a measurement mode asked otherwise. With per-launch releases
+  // (TINYNV_TAIL_RELEASE=0) every descriptor releases and keeps the system-scope barrier, so the membar knob only
+  // reaches the non-releasing links of a tail-released chain; the flush puts the tail back to system scope.
+  prog.membar = ex->tail_release ? ex->qmd_membar : TINYNV_QMD_MEMBAR_SYS;
+  prog.invalidate = ex->qmd_invalidate;
+  // The size bound is the cubin's section, not the allocation: nvcc sizes .nv.constant0 to exactly the driver's
+  // parameters plus the kernel's, so it always covers the arguments written below, and the allocation is only larger
+  // because constant buffers are placed on 256 byte boundaries. Binding the allocation's size instead would tell the
+  // hardware a buffer is bigger than the compiler said it was.
+  prog.constbuf_size[0] = m->layout.constbuf[0].used ? (uint32_t)m->layout.constbuf[0].size : cbuf0_bytes;
+  l.constbuf_addr[0] = qmd_va + slot;
+  l.constbuf_set[0] = 1;
+  for (int i = 1; i < TINYNV_QMD_CONSTBUFS; i++) {
+    if (!m->layout.constbuf[i].used) continue;
+    prog.constbuf_used[i] = 1;
+    prog.constbuf_size[i] = (uint32_t)m->layout.constbuf[i].size;
+    l.constbuf_addr[i] = m->mem.va + m->layout.constbuf[i].off;
+    l.constbuf_set[i] = 1;
+  }
+
+  int rc = tinynv_qmd_program(&q, &prog) || tinynv_qmd_launch(&q, &l);
+  if (!rc && q.overlaps) rc = tinynv_fail("%u bits of the descriptor were claimed twice", q.overlaps);
+  if (rc) return -1;
+  *out = q;
+  return 0;
+}
+
+// TINYNV_GRAPH_RESIDENT: a launch while a token is being recorded goes into the recording's own region - the same
+// descriptor, at an address the engine will read on every replay - and is linked to the one before it. Nothing is
+// reserved on the timeline and nothing is handed over: the whole token becomes one chain, sealed and run by
+// tinynv_exec_graph_end, and run again by tinynv_exec_graph_launch.
+static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k, const uint32_t grid[3],
+                      const uint32_t block[3], uint32_t dyn_smem, const void *params, size_t params_len, uint32_t cbuf0_bytes) {
+  tinynv_graph_rec_t *r = ex->rec;
+  const uint64_t slot = TINYNV_QMD_SLOT_BYTES, need = slot + cbuf0_bytes;
+  uint64_t off = (r->used + 255) & ~255ull;
+  if (off + need > r->size) {
+    r->failed = 1;
+    return tinynv_fail("the recorded token does not fit its resident region (%llu MB, %u launches so far)",
+                       (unsigned long long)(r->size >> 20), r->n);
+  }
+  uint8_t *host = (uint8_t *)r->mirror.dma.va + off;
+  uint64_t qmd_va = r->mem.va + off;
+  tinynv_qmd_t q;
+  if (build_qmd(ex, m, k, grid, block, dyn_smem, cbuf0_bytes, qmd_va, slot, &q)) { r->failed = 1; return -1; }
+  tinynv_graph_chain_t *ch = r->nchains ? &r->chains[r->nchains - 1] : NULL;
+  if (ch && ch->n >= (uint32_t)ex->chain_max) {
+    // this chain is full: it ends at the previous descriptor and the next one starts here
+    ch->tail_va = r->used ? (uint64_t)(r->prev_host - (uint8_t *)r->mirror.dma.va) + r->mem.va : 0;
+    ch->tail_qmd = r->prev_qmd;
+    ch = NULL;
+  }
+  if (ch) {
+    // the previous descriptor schedules this one; its bytes are written again with the link in them
+    if (tinynv_qmd_chain(&r->prev_qmd, qmd_va, ex->chain_prefetch)) { r->failed = 1; return -1; }
+    memcpy(r->prev_host, r->prev_qmd.b, TINYNV_QMD_BYTES);
+  } else {
+    if (r->nchains == TINYNV_GRAPH_CHAINS) { r->failed = 1; return tinynv_fail("the recorded token has more than %d chains", TINYNV_GRAPH_CHAINS); }
+    ch = &r->chains[r->nchains++];
+    memset(ch, 0, sizeof(*ch));
+    ch->head_va = qmd_va;
+    ch->head_host = host;
+  }
+  ch->n++;
+  memcpy(host, q.b, TINYNV_QMD_BYTES);
+  memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
+  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, q.v3, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
+  if (params_len) memcpy(host + slot + k->param_base, params, params_len);
+  r->prev_qmd = q;
+  r->prev_host = host;
+  r->n++;
+  r->used = off + need;
+  return 0;
+}
+
+int tinynv_exec_run(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k, const uint32_t grid[3],
+                    const uint32_t block[3], uint32_t dyn_smem, const void *params, size_t params_len) {
+  int tinynv_exec_run_inner(tinynv_exec_t *, tinynv_exec_module_t *, const tinynv_kernel_desc_t *, const uint32_t[3],
+                            const uint32_t[3], uint32_t, const void *, size_t);
+  PROF_START(ex);
+  int rc = tinynv_exec_run_inner(ex, m, k, grid, block, dyn_smem, params, params_len);
+  PROF_END(ex, PROF_LAUNCH);
+  return rc;
+}
+
+int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k,
+                          const uint32_t grid[3], const uint32_t block[3], uint32_t dyn_smem, const void *params,
+                          size_t params_len) {
+
+  // A kernel's stack, plus what the driver reserves below it. This is per thread; the die multiplies it out.
+  if (tinynv_exec_ensure_local_memory(ex, k->min_stack + 0x240)) return -1;
+
+  // The descriptor and constant buffer 0 share one allocation, the way the oracle lays it out: the descriptor in the
+  // first slot and the buffer right after it, with the driver's parameters first and the kernel's at the offset the
+  // cubin names. On Blackwell that offset is 0x380, which is exactly the 224 dwords of driver parameters, so the two
+  // meet with no gap - a property of this architecture rather than a rule, since sm_86 puts it at 0x160 and the driver
+  // parameters somewhere else entirely. Nothing here should be carried to another architecture without checking that.
+  uint32_t cbuf0_bytes = (uint32_t)(k->param_base + params_len);
+  if (cbuf0_bytes < TINYNV_QMD_CBUF0_MIN_DWORDS * 4) cbuf0_bytes = TINYNV_QMD_CBUF0_MIN_DWORDS * 4;
+  cbuf0_bytes = (cbuf0_bytes + 0xff) & ~0xffu;                 // constant buffers start and end 256 aligned
+  uint64_t slot = TINYNV_QMD_SLOT_BYTES;
+  if (ex->rec) return rec_launch(ex, m, k, grid, block, dyn_smem, params, params_len, cbuf0_bytes);
+
+  // Two reasons to hand the chain over before building into it: it is full, or the arena has no room left and is about
+  // to start again from the bottom, which would give these descriptors' bytes to something else. Both are checked here
+  // rather than inside the allocator, which cannot flush without re-entering itself.
+  // The first chain after the engine has stood still is deliberately short, so its descriptors fit in a pushbuffer
+  // and the batch that restarts the engine needs no copy engine. Every chain after it is full depth; the cost is one
+  // chain's overhead (~22 us) once a token, and what it buys is the delivery handoff moving off the critical path.
+  unsigned cap = (ex->hybrid_delivery && ex->after_stall) ? ex->short_chain : (unsigned)ex->chain_max;
+  if (ex->nchain >= (int)cap && tinynv_exec_flush(ex)) return -1;
+  // TINYNV_DELTA_REWIND: come round now, at the first launch after a standstill, rather than wherever the region
+  // happens to run out. Measured 2026-09-19 with sub-launch runs engaging on every flush: each launch's span still
+  // differed from what was last delivered at its address by ~35% (70 KB of a 200 KB flush, dword-precise), and the
+  // pushbuffer that carried it cost the MoE decode 44% - because the ring rewinds at a chain boundary, not a token
+  // boundary, so the launch last delivered at an address is a DIFFERENT launch of the same kernel from another
+  // layer or another point in the token, and the diff is between two layers' pointers and strides rather than
+  // between one launch and its own previous-token self. Starting each token from the bottom makes launch k of every
+  // token land where launch k of the last one did. Then what differs is what actually changes a token: a release
+  // value, a KV position, an offset - a few dwords a launch.
+  //
+  // Done by declaring the region full so the next placement comes round through arena()'s own wrap path, which is
+  // the only path that knows how: it refuses if a chain is pending (none is - the standstill flushed it), pushes and
+  // flushes, waits per piece for whatever still owns the bytes, and refuses if any span is unaccounted for. Nothing
+  // here reasons about ownership; that is deliberate. The region has to hold a whole token between rewinds (a dense
+  // 27B decode token is ~2.5 MB of descriptors, the region 64 MB); a token that does not fit simply wraps as before.
+  if (ex->delta_rewind && ex->after_stall && !ex->nchain && ex->region[AR_DESC].next) {
+    ex->region[AR_DESC].next = ex->region[AR_DESC].size;
+    ex->delta_rewind_n++;
+  }
+  // TINYNV_KERNEL_PROFILE: the ring comes round where the descriptors do - at the first launch after a standstill -
+  // once everything given out has been read, so launch k of every token stamps the same slot and the release address
+  // in its descriptor is the same bytes token to token for the delta path. This launch is also the token boundary:
+  // the interval ending at its stamp holds the engine's idle time and the host's turnaround, and is kept apart.
+  // The wait that ended the standstill left the last chain's tail unread (its stamp follows the timeline release);
+  // by now the host has been away sampling a token, so it is read here, and if a stamp has not landed after all the
+  // payload check counts it missing rather than believing it.
+  int kboundary = ex->kprof_on && ex->kboundary_pending;
+  if (kboundary) {
+    ex->kboundary_pending = 0;
+    if (ex->kharvest != ex->kwrite) kprof_harvest(ex, sem_read_slot(ex, 0), 2);
+    if (ex->kharvest == ex->kwrite) ex->kwrite = ex->kharvest = 0;
+  }
+  if (!arena_fits(ex, AR_DESC, slot + cbuf0_bytes, 256) && tinynv_exec_flush(ex)) return -1;
+
+  uint64_t qmd_va;
+  uint8_t *host = arena(ex, AR_DESC, slot + cbuf0_bytes, 256, &qmd_va);  // the launch method carries the address shifted by eight
+  if (!host) return -1;
+
+  tinynv_qmd_t q;
+  if (build_qmd(ex, m, k, grid, block, dyn_smem, cbuf0_bytes, qmd_va, slot, &q)) return -1;
+
+  // The kernel reports its own completion rather than the command stream reporting it. That is what removes the
+  // wait-for-idle between launches: a release in the command stream has to wait for the engine to go quiet before it
+  // can be trusted, and waiting for the engine to go quiet is exactly what stops this kernel overlapping the next.
+  uint64_t at = ex->reserved + 1;
+  if (at > 0xffffffffull) return tinynv_fail("the timeline has run past 32 bits (%llu batches)", (unsigned long long)at);
+  // Under TINYNV_TAIL_RELEASE the release is attached at the flush instead, to the last descriptor only. The value is
+  // still reserved here, so nothing about how work is numbered changes - only how much of that numbering the engine is
+  // asked to report. What is being measured is whether that report is what a launch costs.
+  // Until 2026-09-19 THIS was the release the default configuration used, and the one the profile had to stamp:
+  // TINYNV_TAIL_RELEASE was off unless asked for, so the flush-time release in tinynv_exec_flush - which I stamped
+  // first, and then stamped again a different way - was not executed on any ordinary run. Both of those "fixes"
+  // changed code that did not run, which is why the number they were meant to fix did not move either time. The
+  // default has since flipped (tinynv_exec_tail_release says why), so the flush-time release is now the ordinary one
+  // and this branch is the TINYNV_TAIL_RELEASE=0 diagnostic; both are stamped under the profile, and test_exec_mode
+  // pins which one an empty environment takes. Every descriptor releasing a four word report is not a cost: they
+  // retire in order and each overwrites the last, so +8 ends up holding the clock of whichever kernel finished most
+  // recently. Which is the definition of the thing being measured.
+  if (!ex->tail_release && !ex->no_chain_deps &&
+      tinynv_qmd_release(&q, ex->sem.va + SEM_SLOT(0), at, ex->profile) < 0)
+    return tinynv_fail("the descriptor has no free release slot");
+  // TINYNV_KERNEL_PROFILE: this descriptor's own report - its value, then the engine's clock - into the next ring
+  // slot. Whether it turns out to be the chain's tail is decided at the flush, which then takes this off and stamps
+  // the tail from the command stream. A full ring first reads what has retired; if it is still full the launch goes
+  // unstamped and the next stamped interval is marked as spanning two kernels rather than counted.
+  uint32_t kslot_i = TINYNV_KPROF_SLOTS;
+  if (ex->kprof_on) {
+    uint32_t next = (ex->kwrite + 1) % TINYNV_KPROF_SLOTS;
+    if (next == ex->kharvest) kprof_harvest(ex, sem_read_slot(ex, 0), 0);
+    if (next == ex->kharvest) { ex->klost++; ex->kgap_break = 1; }
+    else {
+      kslot_i = ex->kwrite;
+      tinynv_kprof_slot_t *s = &ex->kslot[kslot_i];
+      s->at = at;
+      s->row = kprof_row(ex, k);
+      s->first = ex->nchain == 0;
+      s->boundary = (uint8_t)kboundary;
+      s->tail = 0;
+      s->broken = (uint8_t)ex->kgap_break;
+      ex->kgap_break = 0;
+      if (tinynv_qmd_release(&q, ex->kring.va + 16ull * kslot_i, at, 1) < 0)
+        return tinynv_fail("the descriptor has no free release slot for its stamp");
+      ex->kwrite = next;
+    }
+  }
+
+  // Ordering. Nothing in the command stream separates one kernel from the next any more, so the order has to be in the
+  // descriptors: the one before this points at it and schedules it when it finishes. Without this a launch and the
+  // launch after it are both resident at once, which is right for independent kernels and silently wrong for the ones
+  // that read what their predecessor wrote - which is almost all of them.
+  if (!ex->no_chain_deps && ex->nchain &&
+      tinynv_qmd_chain(&ex->chain[ex->nchain - 1].qmd, qmd_va, ex->chain_prefetch)) return -1;
+
+  memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
+  tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, q.v3, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
+  if (params_len) memcpy(host + slot + k->param_base, params, params_len);
+
+  // Held, not handed over: the next launch still has to be able to write its address into this descriptor. The bytes
+  // are copied into the arena by flush(), once no more editing can happen.
+  ex->chain[ex->nchain].qmd = q;
+  ex->chain[ex->nchain].host = host;
+  ex->chain[ex->nchain].va = qmd_va;
+  ex->chain[ex->nchain].len = (uint32_t)(slot + cbuf0_bytes);
+  ex->chain[ex->nchain].kslot = kslot_i;
+  ex->nchain++;
+  if (!ex->internal_work) ex->launches_since_ka++;
+  // TINYNV_RING_ASYNC: the previous chain's announcement is completed here, sixteen launches in, by which time its
+  // fence read's reply has arrived; the doorbell is then at most ~30 us later than a blocking announcement would
+  // have rung it, and the host spent those microseconds building rather than waiting.
+  if (ex->ring_async && ex->nchain == 16 && ex->g->ring_pending) {
+    PROF_START(ex);
+    int rc = tinynv_submit_ring_complete(ex->g);
+    PROF_END(ex, PROF_RING);
+    if (rc) return -1;
+  }
+  ex->reserved = at;
+
+  // Asking the firmware whether anything faulted happens at the flush, not here. It is two reads across the link every
+  // time it is asked - the status queue's read and write pointers - and across a link where a round trip is a
+  // microsecond or two, doing that once per launch was a third of the entire per-launch cost to ask a question whose
+  // answer almost always is "nothing". Once per chain asks it thirty-two times less often and answers the same
+  // question: a kernel that faults on some of its blocks still releases its semaphore, so the only place a fault is
+  // ever mentioned is the status queue, and reading it a little later still reads it.
+  return ex->sync ? tinynv_exec_flush(ex) : 0;
+}
+
+// Chain depth, asked for rather than compiled in. Sweeping it is how the two failures at 32 and at 2 were told apart,
+// and doing that by editing a header means every measurement comes from a build whose id says "dirty" - which is
+// exactly the provenance you want when a result is surprising, and exactly what you cannot have if the knob is a
+// constant. The array is still sized by the compile-time maximum; this only lowers it.
+// Taken as an argument rather than read here, for the same reason the submission mode is: the resolved value is what
+// a run depends on, and with the environment unset that value is now the ONLY thing carrying the fast path. A default
+// nobody can check without a card is a claim that can only be agreed with.
+// Where the chain's timeline release is attached: one per descriptor (0, the default) or one on the tail only (1).
+//
+// A resolver like the others, because being resolved inline is part of how this cost three card runs. Every other mode
+// in this file can be asked about without a card - which is what makes "the default is X" a checkable claim instead of
+// a line of code somebody has to find. This one was a getenv buried in the middle of exec_init, and I twice
+// instrumented the release it selects AWAY from while believing I had instrumented the one that runs.
+// On by default since 2026-09-19 (Antonio's word, after the day's measurements): releasing once per chain is what
+// leaves a token's descriptors byte-identical to the previous token's except for what actually changed, which is
+// what lets TINYNV_DELTA_DELIVERY patch ~2 KB a flush instead of ~7 KB and turned the MoE decode from a loss into a
+// gain. TINYNV_TAIL_RELEASE=0 releases per launch again, which is the setting that can locate a stall inside a chain.
+int tinynv_exec_tail_release(const char *e) { return !e || !*e || *e != '0'; }
+
+// TINYNV_KERNEL_PROFILE: off unless asked. A run that stamps every descriptor is measuring, and the report at teardown
+// says what it saw; nothing else about the run should find itself in that state by accident.
+int tinynv_exec_kernel_profile(const char *e) { return e && *e && *e != '0'; }
+
+// TINYNV_KEEPALIVE: off unless asked, until it has been measured on both decodes and soaked; TINYNV_KEEPALIVE_US is the
+// spin's ceiling (the watchdog), 2,000 us unless asked, never under 50 or over 20,000.
+// TINYNV_RING_ASYNC: off until measured on both decodes and soaked.
+int tinynv_exec_ring_async(const char *e) { return e && *e && *e != '0'; }
+// ON by default since 2026-09-19: a device-to-device copy on the copy queue makes batch_begin hand the launch chain
+// over first, and a Mamba-hybrid token is 81 such copies among 611 launches - so its chain averaged 8 launches and it
+// paid ~74 seams worth 3.7 ms of a 10 ms token. Served by the lent copy kernel the copy joins the chain instead.
+// Measured interleaved: Nemotron Nano 9B 111.3/109.7 -> 143.5/144.0 tg128 (+30%, and past its native 140.6) with
+// prefill 6,422 -> 7,159; the MoE and the dense 27B unchanged, which is the shape a targeted fix should have. Gated:
+// op-verify 450/450 at three depths, both greedy texts and all three images byte-identical, a five-minute MTP soak
+// clean. TINYNV_DTOD_VIA_COMPUTE=0 puts these copies back on the copy engine.
+int tinynv_exec_dtod_via_compute(const char *e) { return !e || !*e || *e != '0'; }
+
+// TINYNV_GRAPH_RESIDENT: off until measured on both decodes and soaked.
+int tinynv_exec_graph_resident(const char *e) { return e && *e && *e != '0'; }
+int tinynv_exec_keepalive(const char *e) { return e && *e && *e != '0'; }
+unsigned tinynv_exec_keepalive_us(const char *e) {
+  if (!e || !*e) return 2000;
+  long n = atol(e);
+  if (n < 50) return 2000;
+  if (n > 20000) n = 20000;
+  return (unsigned)n;
+}
+
+unsigned tinynv_exec_keepalive_min_kb(const char *e) {
+  if (!e || !*e) return 64;
+  long n = atol(e);
+  if (n < 0) return 64;
+  if (n > 1048576) n = 1048576;
+  return (unsigned)n;
+}
+
+int tinynv_exec_keepalive_arm(tinynv_exec_t *ex, uint64_t *flag_va) {
+  if (!ex->ka_flag.size) return tinynv_fail("the keep-alive flag was never allocated (TINYNV_KEEPALIVE is off)");
+  uint32_t zero = 0;
+  nv_wr_block(&ex->ka_flag.dma.view, 0, &zero, sizeof(zero));
+  ex->ka_pending = 1;
+  ex->ka_launched++;
+  ex->launches_since_ka = 0;
+  *flag_va = ex->ka_flag.va;
+  return 0;
+}
+
+void tinynv_exec_keepalive_release(tinynv_exec_t *ex, int by_wait) {
+  if (!ex->ka_pending) return;
+  uint32_t one = 1;
+  nv_wr_block(&ex->ka_flag.dma.view, 0, &one, sizeof(one));
+  ex->ka_pending = 0;
+  if (by_wait) ex->ka_released_wait++; else ex->ka_released_chain++;
+}
+// TINYNV_KERNEL_PROFILE_SKIP: windows not counted at the start of a run. Four unless asked - the load, the prompt and
+// the first tokens, none of which is the steady decode the mean is meant to describe.
+int tinynv_exec_kernel_profile_skip(const char *e) {
+  if (!e || !*e) return 4;
+  long n = atol(e);
+  return n < 0 ? 4 : n > 100000 ? 100000 : (int)n;
+}
+
+// The Itanium scheme as nvcc applies it to a kernel: _Z, either a nested name (N ... E) or one length-prefixed
+// identifier, then I ... E template arguments, of which only literals are read - L<type><value>E, the type a builtin
+// letter or a length-prefixed enum name, S_ / S<n>_ repeating an earlier one. Anything else stops the reading and
+// leaves "...", which is honest about a function-pointer argument (k_bin_bcast<&op_add, ...>) rather than a guess at
+// it. The parameter list after the arguments is dropped: it is the same for every instantiation.
+const char *tinynv_kernel_short_name(const char *m, char *out, size_t cap) {
+  size_t o = 0;
+  if (!cap) return out;
+#define PUT(c) do { if (o + 1 < cap) out[o++] = (c); } while (0)
+#define PUTS(s, n) do { for (size_t i_ = 0; i_ < (n); i_++) PUT((s)[i_]); } while (0)
+  if (!m || m[0] != '_' || m[1] != 'Z') { snprintf(out, cap, "%s", m ? m : "?"); return out; }
+  const char *p = m + 2;
+  int nested = *p == 'N';
+  if (nested) p++;
+  int parts = 0;
+  while (*p >= '0' && *p <= '9') {
+    char *end;
+    size_t n = strtoul(p, &end, 10);
+    p = end;
+    if (strlen(p) < n) { PUTS("...", 3); goto done; }
+    if (parts++) PUTS("::", 2);
+    PUTS(p, n);
+    p += n;
+    if (!nested) break;
+  }
+  if (nested && *p == 'E') p++;
+  if (*p == 'I') {
+    p++;
+    PUT('<');
+    char last_enum[48] = "";
+    int args = 0;
+    while (*p && *p != 'E') {
+      if (args++) PUTS(", ", 2);
+      if (*p != 'L') { PUTS("...", 3); break; }
+      p++;
+      char en[48] = "";
+      int is_bool = 0;
+      if (*p >= '0' && *p <= '9') {
+        char *end;
+        size_t n = strtoul(p, &end, 10);
+        p = end;
+        if (strlen(p) < n || n >= sizeof(en)) { PUTS("...", 3); break; }
+        memcpy(en, p, n);
+        en[n] = 0;
+        p += n;
+        memcpy(last_enum, en, sizeof(en));
+      } else if (*p == 'S') {
+        while (*p && *p != '_') p++;
+        if (*p == '_') p++;
+        memcpy(en, last_enum, sizeof(en));
+      } else if (*p == 'b') { is_bool = 1; p++; }
+      else if (*p && strchr("ijlmxyst", *p)) p++;
+      else { PUTS("...", 3); break; }
+      const char *v = p;
+      if (*p == 'n') p++;
+      while (*p >= '0' && *p <= '9') p++;
+      if (*p != 'E') { PUTS("...", 3); break; }
+      if (en[0]) { PUT('('); PUTS(en, strlen(en)); PUT(')'); }
+      if (is_bool) { const char *b = v[0] == '1' ? "true" : "false"; PUTS(b, strlen(b)); }
+      else {
+        if (*v == 'n') { PUT('-'); v++; }
+        PUTS(v, (size_t)(p - v));
+      }
+      p++;   // the E that closes the literal
+    }
+    PUT('>');
+  }
+done:
+  out[o < cap ? o : cap - 1] = 0;
+  return out;
+#undef PUT
+#undef PUTS
+}
+
+// TINYNV_DELTA_DELIVERY and TINYNV_DELTA_REWIND, resolved where test_exec_mode can drive them. Both on by default
+// since 2026-09-19: sub-launch runs alone lose 44% on the MoE (every flush ~90 KB of pushbuffer), runs with the
+// token-aligned rewind are a dense win and an MoE loss, and runs + rewind + tail release are a win on both (dense
+// 27B 67.8 -> 70.7 tg128, MoE 35B-A3B ~161 -> ~166), byte-identical output, server and image paths clean
+// (docs/handoff-2026-09-19.md). The rewind is meaningless without delivery, so it follows delivery off.
+// OFF BY DEFAULT since 2026-10-15 (B; TINYNV_DELTA_DELIVERY=1 opts back in). On the 5090 with the D2D-kernel path,
+// Flash-Next split 27/21 (llama.cpp e36df60, decode_bench short 256 x3, one window, base arms first and last): delivery on
+// 38.5 tok/s, off 51.0 (= the V1-line binary's 50.6), tokens EQUAL on short and edit; REWIND=0, TAIL_RELEASE=0,
+// STAGE_SINGLE=1 and QMD_MEMBAR=sys each moved it by <= 1.3. The 09-19 win above was measured before the D2D kernel.
+int tinynv_exec_delta_delivery(const char *e) { return e && *e && *e != '0'; }
+
+// 32,764 by default since 2026-09-19 (Antonio: "no reason not to take free percentages"): the one per-token upload
+// above the old 4,096 cap - 8,192 bytes - riding the pushbuffer measured +2.3% on the MoE decode and +1.6% on the
+// dense, op-verify 450/450 and both greedy texts byte-identical. TINYNV_INLINE_MAX=4096 is the old behaviour.
+uint32_t tinynv_exec_inline_max(const char *e) {
+  if (!e || !*e) return TINYNV_INLINE_MAX;
+  long n = atol(e);
+  if (n < 4) return TINYNV_INLINE_MAX;
+  if (n > TINYNV_INLINE_MAX) n = TINYNV_INLINE_MAX;
+  return (uint32_t)n & ~3u;
+}
+
+// "none" by default since 2026-09-19: a non-releasing descriptor's end-of-grid barrier measured +3% on the dense
+// decode and nothing on the MoE, with op-verify 450/450 at three depths, both greedy texts byte-identical and a
+// five-minute llama-server + MTP soak clean (docs/handoff-2026-09-19.md, 12:45-13:03). Releasing descriptors keep
+// the system-scope barrier regardless. TINYNV_QMD_MEMBAR=sys is the oracle's choice, "gpu" the scope that bought
+// nothing. Unrecognised spellings are the default, and the mode test pins which one that is.
+int tinynv_exec_qmd_membar(const char *e) {
+  if (!e || !*e) return TINYNV_QMD_MEMBAR_NONE;
+  if (!strcmp(e, "sys")) return TINYNV_QMD_MEMBAR_SYS;
+  if (!strcmp(e, "gpu")) return TINYNV_QMD_MEMBAR_GPU;
+  return TINYNV_QMD_MEMBAR_NONE;
+}
+int tinynv_exec_qmd_invalidate(const char *e) {
+  if (!e || !*e) return TINYNV_QMD_INVALIDATE_ALL;
+  if (!strcmp(e, "cb0")) return TINYNV_QMD_INVALIDATE_CB0;
+  if (!strcmp(e, "none")) return TINYNV_QMD_INVALIDATE_NONE;
+  return TINYNV_QMD_INVALIDATE_ALL;
+}
+int tinynv_exec_delta_rewind(int delivery, const char *e) { return delivery && (!e || !*e || *e != '0'); }
+
+// Whether a download waits for the compute to finish on the HOST before issuing its copy, instead of issuing the copy
+// straight away and letting it wait on the card.
+//
+// Session A's measurement is what this exists to test. In a decode the logits copy ends 520-880 us after the token's
+// last kernel retires, while the same transfer issued cold costs <=245 us end to end. The copy is not slow, it starts
+// late - and the spread is the tell. llama.cpp issues the copy while compute is still running, so it lands on the copy
+// channel behind an acquire on the compute timeline; a channel whose acquire is unsatisfied is switched out and
+// revisited on the runlist's timeslice, which is a delay of up to a timeslice rather than a constant. The compute
+// batch's own acquire on the descriptor delivery never stalls - 37 us - because that copy has already finished by the
+// time the batch reaches it, so it never switches out. Prefill agrees: there the copy is issued into a compute that
+// ends sooner relative to it and the same interval is 48-280 us.
+//
+// Waiting on the host first costs a poll (7 us granularity) and a submit (~30 us) and buys not being switched out. It
+// is a knob rather than a change because it could be worse if the mechanism is something else, and because the two
+// arms want measuring in the same session rather than across two builds.
+int tinynv_exec_download_sync_first(const char *e) { return e && *e && *e != '0'; }
+
+int tinynv_exec_chain_depth(const char *e) {
+  if (!e || !*e) return TINYNV_EXEC_CHAIN_DEFAULT;
+  int n = atoi(e);
+  if (n < 1) n = 1;
+  if (n > TINYNV_EXEC_CHAIN_MAX) n = TINYNV_EXEC_CHAIN_MAX;
+  return n;
+}
+
+// And the delivery path, resolved the same way. On unless TINYNV_ARENA_DMA starts with '0', and forced off with a
+// reason when the arena is in host memory, where there is nothing to deliver across.
+int tinynv_exec_arena_dma(const char *e, int arena_vram, const char **why) {
+  int on = !(e && *e && *e == '0');
+  if (!on) { if (why) *why = "TINYNV_ARENA_DMA=0 was asked for"; return 0; }
+  if (!arena_vram) { if (why) *why = "the arena is in host memory, so there is nothing to deliver"; return 0; }
+  if (why) *why = (e && *e) ? "TINYNV_ARENA_DMA was asked for" : "the default";
+  return 1;
+}
+
+// Which submission path to take, and the words for why - the startup line has to name what decided it, and "the
+// default" is a different report from "you asked for this", especially now that the default is the faster path.
+//
+// The two environment values are arguments rather than read here so that the whole table can be checked without a GPU
+// and without touching the environment (test_exec_mode). Offline there is otherwise no way to see this decision at all:
+// tinynv_exec_init is reached only after a card has booted, so before this test the shipping default could only be
+// confirmed by running on hardware, which is the one thing a default flip should not require.
+//
+// A value is off when it starts with '0' and on when it is anything else non-empty, which is the convention the other
+// knobs in this file already use. Empty or unset is not an answer either way.
+//
+// When the two contradict, the synchronous path wins and the line says so. That is deliberate: TINYNV_SYNC=1 is what
+// someone adds to a command line that already carries TINYNV_ASYNC=1 - every script and note in this project still has
+// it - and they are adding it because something is wrong and they want the proven path. Silently keeping async there
+// would make a debugging step do nothing while appearing to work.
+int tinynv_exec_sync_mode(const char *async, const char *sync, const char **why) {
+  int on_async = async && *async, on_sync = sync && *sync;
+  int ask_sync  = (on_sync && *sync != '0') || (on_async && *async == '0');
+  int ask_async = (on_async && *async != '0') || (on_sync && *sync == '0');
+  if (ask_sync && ask_async) {
+    *why = "TINYNV_SYNC and TINYNV_ASYNC ask for opposite things; taking the synchronous path";
+    return 1;
+  }
+  if (ask_sync)  { *why = on_sync ? "TINYNV_SYNC was asked for" : "TINYNV_ASYNC=0 was asked for"; return 1; }
+  if (ask_async) { *why = on_async ? "TINYNV_ASYNC was asked for" : "TINYNV_SYNC=0 was asked for"; return 0; }
+  *why = "the default";
+  return 0;
+}
+
+int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
+  memset(ex, 0, sizeof(*ex));
+  ex->g = g;
+  const char *why_sync = NULL;
+  ex->sync = tinynv_exec_sync_mode(getenv("TINYNV_ASYNC"), getenv("TINYNV_SYNC"), &why_sync);
+  ex->chain_max = tinynv_exec_chain_depth(getenv("TINYNV_CHAIN_DEPTH"));
+  { const char *a = getenv("TINYNV_ARENA_VRAM"); ex->arena_vram = !(a && *a == '0'); }
+  // On unless asked otherwise, which is what the oracle does. Off is a one bit experiment against the theory that a
+  // prefetched descriptor's resources are reserved before its predecessor has released them.
+  { const char *e2 = getenv("TINYNV_CHAIN_PREFETCH"); ex->chain_prefetch = !(e2 && *e2 == '0'); }
+  ex->tail_release = tinynv_exec_tail_release(getenv("TINYNV_TAIL_RELEASE"));
+  { const char *m = getenv("TINYNV_QMD_MEMBAR"), *i = getenv("TINYNV_QMD_INVALIDATE");
+    ex->qmd_membar = tinynv_exec_qmd_membar(m);
+    ex->qmd_invalidate = tinynv_exec_qmd_invalidate(i);
+    // Named either way, with what decided it. The barrier line is the ordinary one now that "none" is the default;
+    // the invalidates are still a measurement knob (dropping them produces wrong output) and say so loudly.
+    fprintf(stderr, "libtinynv: non-releasing descriptors end with %s barrier (%s); releasing ones keep the system-scope "
+                    "barrier%s\n",
+            ex->qmd_membar == TINYNV_QMD_MEMBAR_GPU ? "a gpu-scope" : ex->qmd_membar == TINYNV_QMD_MEMBAR_NONE ? "no" : "a system-scope",
+            m && *m ? "TINYNV_QMD_MEMBAR was asked for" : "the default",
+            ex->tail_release ? "" : " - and with TINYNV_TAIL_RELEASE=0 every descriptor releases, so the barrier knob changes nothing");
+    if (ex->qmd_invalidate != TINYNV_QMD_INVALIDATE_ALL)
+      fprintf(stderr, "libtinynv: MEASUREMENT MODE: descriptors invalidate %s on entry (TINYNV_QMD_INVALIDATE=%s was asked "
+                      "for) - this produced a WRONG greedy text on 2026-09-19; a diagnostic, not a mode\n",
+              ex->qmd_invalidate == TINYNV_QMD_INVALIDATE_CB0 ? "only constant bank 0" : "NOTHING", i && *i ? i : "(unset)"); }
+  ex->download_sync_first = tinynv_exec_download_sync_first(getenv("TINYNV_DOWNLOAD_SYNC_FIRST"));
+  { const char *e = getenv("TINYNV_SHORT_FIRST_CHAIN");
+    ex->short_chain = tinynv_exec_short_chain(e);
+    ex->hybrid_delivery = ex->short_chain != 0;
+    if (ex->hybrid_delivery)
+      fprintf(stderr, "libtinynv: the first chain after a standstill carries %u launches and its descriptors ride in "
+                      "the batch (was asked for)\n", ex->short_chain); }
+
+  // Measured 2026-09-18 (TINYNV_DUMP_CMD, see the diagnostic near tinynv_exec's run()): a steady-state MoE decode
+  // token's descriptor content is 2.7% different from the token before it - a handful of KV-cache offset/address
+  // dwords advancing by a fixed stride, never the launch addresses themselves (ggml-cuda's MoE dispatch expresses
+  // expert routing as small on-device buffer content, not as changed kernel addresses). The ring already reuses
+  // the same physical address a lap later; this diffs the fresh shadow content against what was last actually
+  // sent there and patches only the difference, instead of resending a structurally-fresh full chain every time.
+  { const char *e = getenv("TINYNV_DELTA_DELIVERY"), *r = getenv("TINYNV_DELTA_REWIND");
+    ex->delta_delivery = tinynv_exec_delta_delivery(e);
+    ex->delta_rewind = tinynv_exec_delta_rewind(ex->delta_delivery, r);
+    const char *g = getenv("TINYNV_DELTA_GAP"), *a = getenv("TINYNV_DELTA_AGGREGATE_KB");
+    ex->delta_gap = tinynv_exec_delta_gap(g);
+    ex->delta_aggregate_max = tinynv_exec_delta_aggregate(a);
+    // Every knob named with what decided it, the way every other line here is: a sweep is read off these lines,
+    // never off what anyone remembers exporting - and a run with an empty environment says "the default" so it can
+    // be told from one whose harness is still exporting things.
+    if (ex->delta_delivery)
+      fprintf(stderr, "libtinynv: AR_DESC delivery patches only what changed since the last lap (%s): runs of dwords, "
+                      "merged across gaps of up to %u bytes (%s), up to %u KB of pushbuffer a flush (%s)\n",
+              "TINYNV_DELTA_DELIVERY was asked for",
+              ex->delta_gap, g && *g ? "TINYNV_DELTA_GAP was asked for" : "the default",
+              ex->delta_aggregate_max / 1024u, a && *a ? "TINYNV_DELTA_AGGREGATE_KB was asked for" : "the default");
+    else
+      fprintf(stderr, "libtinynv: AR_DESC delivery is the full copy every flush (%s; TINYNV_DELTA_DELIVERY=1 patches only "
+                      "what changed)\n", e && *e ? "TINYNV_DELTA_DELIVERY=0 was asked for" : "the default");
+    if (ex->delta_rewind)
+      fprintf(stderr, "libtinynv: the descriptor region starts from the bottom at every standstill, so the delta is "
+                      "a launch against its own previous token (%s)\n",
+              r && *r ? "TINYNV_DELTA_REWIND was asked for" : "the default");
+    else if (ex->delta_delivery)
+      // The one combination measured to be a loss: without the rewind a launch is diffed against a different
+      // launch of the same kernel and every flush carries ~90 KB of pushbuffer (MoE -44%, 2026-09-19). Said loudly.
+      fprintf(stderr, "libtinynv: WARNING: delta delivery WITHOUT the rewind (TINYNV_DELTA_REWIND=0 was asked for) - "
+                      "measured 44%% slower on the MoE decode; this is a diagnostic setting, not a mode\n"); }
+
+  { const char *e = getenv("TINYNV_INLINE_PEND");
+    ex->inline_pend_max = tinynv_exec_pend_entries(e);
+    // Bytes scale with entries rather than being a second knob: the two would otherwise have to be swept together and
+    // the interesting variable is how many uploads a step makes, not how big they are.
+    // 2 KB an entry since 2026-09-19, when the inline cap grew to 32 KB: at 512 B an entry the 8 KB upload every
+    // decode token makes filled the default list on its own and cost a batch of its own each time.
+    ex->inline_pend_bytes_max = ex->inline_pend_max * 2048u;
+    if (ex->inline_pend_bytes_max > TINYNV_INLINE_PEND_CAP_BYTES)
+      ex->inline_pend_bytes_max = TINYNV_INLINE_PEND_CAP_BYTES; }
+
+  { const char *e = getenv("TINYNV_INLINE_UPLOAD");
+    ex->inline_upload = tinynv_exec_inline_upload_mode(e);
+    // Named like every other mode, with what decided it. A ran the arm and could not show from the log that the knob
+    // had taken effect - and a routing that silently never routed looks exactly like a routing that changed nothing:
+    // clean, correct and unmoved. That is the same shape as the sensor knob that gated only half of what it claimed,
+    // and as TINYNV_TAIL_RELEASE being off while I instrumented the branch it selects away from. Three times in one
+    // day is a convention, not a coincidence.
+    const char *mx = getenv("TINYNV_INLINE_MAX");
+    ex->inline_max = tinynv_exec_inline_max(mx);
+    fprintf(stderr, "libtinynv: small host-to-device copies %s (%s)%s\n",
+            ex->inline_upload ? "ride in the pushbuffer" : "go to the copy engine",
+            e && *e ? "was asked for" : "the default",
+            ex->inline_upload ? ", held until the next batch goes out" : "");
+    if (ex->inline_upload)
+      fprintf(stderr, "libtinynv: up to %u bytes a copy ride that way (%s); larger ones go to the copy engine\n",
+              ex->inline_max, mx && *mx ? "TINYNV_INLINE_MAX was asked for" : "the default"); }
+  // Where the second window of raw refill pairs opens. The first eight are always the start of a run, which is prefill;
+  // 200 is comfortably inside a decode for any run long enough to matter, and a short run simply prints fewer.
+  { const char *e = getenv("TINYNV_REFILL_RAW_FROM"); ex->refill_raw_from = e && *e ? strtoull(e, NULL, 10) : 200; }
+  { const char *e4 = getenv("TINYNV_NO_CHAIN_DEPS"); ex->no_chain_deps = e4 && *e4 && *e4 != '0'; }
+  { const char *e5 = getenv("TINYNV_LAUNCH_PROFILE"); ex->profile = e5 && *e5 && *e5 != '0'; }
+  ex->kprof = tinynv_exec_kernel_profile(getenv("TINYNV_KERNEL_PROFILE"));
+  ex->ring_async = tinynv_exec_ring_async(getenv("TINYNV_RING_ASYNC"));
+  ex->dtod_via_compute = tinynv_exec_dtod_via_compute(getenv("TINYNV_DTOD_VIA_COMPUTE"));
+  fprintf(stderr, "libtinynv: device-to-device copies are served by a caller's kernel on the compute queue (%s), so they join "
+                  "the launch chain instead of handing it over%s\n",
+          ex->dtod_via_compute ? "the default" : "TINYNV_DTOD_VIA_COMPUTE=0: back on the copy engine",
+          ex->dtod_via_compute ? "" : " - NOT in effect");
+  ex->graph_resident = tinynv_exec_graph_resident(getenv("TINYNV_GRAPH_RESIDENT"));
+  { const char *e = getenv("TINYNV_GRAPH_PACE"); ex->graph_pace = e && *e && *e != '0'; }
+  if (ex->graph_resident)
+    fprintf(stderr, "libtinynv: recorded tokens are kept resident and run as one chain (TINYNV_GRAPH_RESIDENT was asked for)\n");
+  if (ex->ring_async)
+    fprintf(stderr, "libtinynv: announcements are pipelined (TINYNV_RING_ASYNC was asked for): the fence read is sent with the "
+                    "batch and the doorbell rung sixteen launches into the next chain\n");
+  ex->keepalive = tinynv_exec_keepalive(getenv("TINYNV_KEEPALIVE"));
+  ex->keepalive_us = tinynv_exec_keepalive_us(getenv("TINYNV_KEEPALIVE_US"));
+  ex->keepalive_min_kb = tinynv_exec_keepalive_min_kb(getenv("TINYNV_KEEPALIVE_MIN_KB"));
+  ex->kprof_skip = tinynv_exec_kernel_profile_skip(getenv("TINYNV_KERNEL_PROFILE_SKIP"));
+  // Delivered by the copy engine by default since 2026-09-15, having been the opt-in path for a day and a 62-minute
+  // soak: 1,876 requests, 343,160 tokens, 188 greedy probes all identical, no refusals. TINYNV_ARENA_DMA=0 goes back to
+  // writing descriptors across the link, for a card or a link where this turns out to be wrong rather than because the
+  // default is in doubt.
+  const char *why_dma = NULL;
+  ex->arena_dma = tinynv_exec_arena_dma(getenv("TINYNV_ARENA_DMA"), ex->arena_vram, &why_dma);
+  { const char *e = getenv("TINYNV_STAGE_SINGLE"); ex->stage_single = e && *e && *e != '0'; }
+  // The host-memory case is decided inside that call rather than corrected after it, so there is one place that knows
+  // when delivery is off and why. It used to be decided twice - set from the environment here, then cleared again
+  // below with a message - and two places deciding one thing is how the reason and the value come apart.
+  if (!ex->arena_dma && ex->arena_vram)
+    fprintf(stderr, "libtinynv: descriptors are written across the link, not delivered by the copy engine (%s)\n",
+            why_dma);
+  // One line, once, naming the path. Which of the two is running is the first thing to establish about a report of a
+  // hang or a dropped card, and asking the reporter to remember what they exported is how that gets established wrong.
+  fprintf(stderr, "libtinynv: submitting %s (%s), chaining up to %d launches (%s)\n",
+          ex->sync ? "synchronously, every batch waited on" : "asynchronously",
+          why_sync, ex->chain_max,
+          getenv("TINYNV_CHAIN_DEPTH") && *getenv("TINYNV_CHAIN_DEPTH") ? "TINYNV_CHAIN_DEPTH was asked for"
+                                                                       : "the default");
+  fprintf(stderr, "libtinynv: the command arena is in %s\n",
+          ex->arena_vram ? "video memory" : "host memory (TINYNV_ARENA_VRAM=0 was asked for)");
+  if (!ex->chain_prefetch) fprintf(stderr, "libtinynv: chain prefetch is off (TINYNV_CHAIN_PREFETCH=0)\n");
+  // Named either way. Per chain is the default since 2026-09-19 (it is what keeps a token's descriptors identical to
+  // the last token's for the delta path); per launch is the setting that can locate a stall inside a chain, so a run
+  // that hangs is worth repeating with TINYNV_TAIL_RELEASE=0 before reading its wait-failure report.
+  { const char *t = getenv("TINYNV_TAIL_RELEASE");
+    if (ex->tail_release)
+      fprintf(stderr, "libtinynv: releasing once per chain (%s); a stall cannot be located inside a chain this way - "
+                      "TINYNV_TAIL_RELEASE=0 releases per launch\n", t && *t ? "TINYNV_TAIL_RELEASE was asked for" : "the default");
+    else
+      fprintf(stderr, "libtinynv: releasing once per launch (TINYNV_TAIL_RELEASE=0 was asked for)\n"); }
+  if (ex->no_chain_deps)
+    fprintf(stderr, "libtinynv: *** NOTHING ORDERS ONE KERNEL AGAINST THE NEXT (TINYNV_NO_CHAIN_DEPS) *** every\n"
+                    "libtinynv: descriptor is launched independently, so dependent kernels run side by side and any\n"
+                    "libtinynv: result from this run is meaningless. It exists to time submission with nothing\n"
+                    "libtinynv: waiting on anything. Do not use it to produce numbers anyone will act on.\n");
+  // All three are host memory the GPU reads across the bus: the processor writes every one of them, and on a card behind
+  // thunderbolt the window onto video memory is far too small to be where the two sides meet.
+  if (tinynv_mm_alloc_buffer(&g->mm, SEM_BYTES, 1, 1, 1, 0, 1, &ex->sem)) return -1;
+  // The keep-alive's flag: one host page the engine polls and the processor writes, like the timeline's own slots.
+  if (ex->keepalive && tinynv_mm_alloc_buffer(&g->mm, 0x1000, 1, 1, 1, 0, 1, &ex->ka_flag)) return -1;
+  // TINYNV_KERNEL_PROFILE needs the chain shape it stamps: chained descriptors releasing the timeline at the tail
+  // only, so that every other link's first release slot is free for its stamp. The ring is host memory like the
+  // timeline's own slots, written by the engine and read here.
+  if (ex->kprof) {
+    ex->kprof_on = ex->tail_release && !ex->no_chain_deps;
+    if (!ex->kprof_on)
+      fprintf(stderr, "libtinynv: TINYNV_KERNEL_PROFILE needs chained descriptors releasing at the tail only (the default "
+                      "TINYNV_TAIL_RELEASE, no TINYNV_NO_CHAIN_DEPS): not stamping\n");
+    else {
+      if (tinynv_mm_alloc_buffer(&g->mm, (uint64_t)TINYNV_KPROF_SLOTS * 16, 1, 1, 1, 0, 1, &ex->kring)) return -1;
+      ex->kslot = calloc(TINYNV_KPROF_SLOTS, sizeof(*ex->kslot));
+      ex->krow = calloc(TINYNV_KPROF_ROWS, sizeof(*ex->krow));
+      ex->kindex = malloc((size_t)TINYNV_KPROF_INDEX * sizeof(*ex->kindex));
+      if (!ex->kslot || !ex->krow || !ex->kindex) return tinynv_fail("out of memory for the kernel profile");
+      for (int i = 0; i < TINYNV_KPROF_INDEX; i++) ex->kindex[i] = -1;
+      fprintf(stderr, "libtinynv: kernel profile on: every descriptor releases the engine's clock into a slot of its own "
+                      "(%u slots); the first %d windows are not counted; the report is at teardown\n",
+              (unsigned)TINYNV_KPROF_SLOTS, ex->kprof_skip);
+    }
+  }
+  // The allocator's zero flag does nothing for host memory - it zeroes through the window onto video memory, which this
+  // is not - so the timeline starts as whatever the dext handed over. Every wait in this file is "has the engine reached
+  // N yet", so a single non-zero byte here means the first wait returns immediately and nothing is ever really waited
+  // for: work would appear to complete before it ran, and the first symptom would be a result read back too early.
+  memset(ex->sem.dma.va, 0, (size_t)ex->sem.size);
+  // In video memory, where the engine reads a descriptor without crossing the link. That is the difference between a
+  // launch costing twenty-nine microseconds and eleven: on the 27B, decode went from 17.9 tokens a second to 45.5, and
+  // on the 8B, which is smaller and so more launch-bound still, from about thirty to a hundred and thirty.
+  //
+  // Host memory remains available as TINYNV_ARENA_VRAM=0. It is not there because this is doubted - it has been through
+  // both models, a five-hundred token decode across many wraps, three byte-identical greedy runs, and the synchronous
+  // path - but because a card whose window does not reach, or a backend whose block write behaves differently, would
+  // otherwise have nowhere to go.
+  // How big the descriptor region is, and it is a different question in each mode. When the processor writes it, it has
+  // to live in the window onto video memory, and that window is 256 MB with the boot's own reserve already inside it -
+  // so a few megabytes is all there is. When the copy engine delivers it, the processor never touches it, so it comes
+  // from plain video memory and the only thing bounding it is the host memory its shadow and mirror cost beside it.
+  //
+  // That is worth paying. The wrap is the last thing on this path that stops to wait, and an hour of real serving spent
+  // 14.5% of itself draining, at 150,297 wraps of a 3.5 MB region. Sixty-four megabytes is eighteen times fewer.
+  uint64_t desc_bytes = CMD_BYTES - CMD_REGION_BYTES;
+  if (ex->arena_dma) {
+    desc_bytes = (uint64_t)DESC_MB_DEFAULT << 20;
+    const char *e = getenv("TINYNV_DESC_MB");
+    if (e && *e) { long mb = atol(e); if (mb >= 1 && mb <= 1024) desc_bytes = (uint64_t)mb << 20; }
+  }
+  ex->region[AR_DESC].size = desc_bytes;
+  ex->region[AR_CMD].size = CMD_REGION_BYTES;
+  // tinynv_delta_span_t holds AR_DESC offsets in 32 bits. TINYNV_DESC_MB stops at 1024 today, so this cannot trip;
+  // it is here so that the day the region can be bigger, the refusal names the reason instead of a patch landing
+  // 4 GB short of where it was meant to.
+  if (ex->region[AR_DESC].size > 0xffffffffull)
+    return tinynv_fail("a %llu byte descriptor region is past what delta delivery's 32-bit offsets can address",
+                       (unsigned long long)ex->region[AR_DESC].size);
+
+  if (ex->arena_vram) {
+    // Only what the processor still writes has to be reachable through the window: command buffers always, descriptors
+    // only when the copy engine is not delivering them.
+    uint64_t visible = CMD_REGION_BYTES + (ex->arena_dma ? 0 : desc_bytes);
+    if (tinynv_mm_reserve_cpu_region(&g->mm, visible + (1u << 20))) return -1;
+    if (tinynv_mm_alloc_buffer(&g->mm, CMD_REGION_BYTES, 0, 1, 1, 1, 0, &ex->region[AR_CMD].mem)) return -1;
+    if (tinynv_mm_alloc_buffer(&g->mm, desc_bytes, 0, ex->arena_dma ? 0 : 1, 1, 1, 0, &ex->region[AR_DESC].mem))
+      return -1;
+    for (int r = 0; r < 2; r++)
+      if (!(ex->region[r].shadow = calloc(1, (size_t)ex->region[r].size)))
+        return tinynv_fail("out of memory for a %llu byte scratch shadow", (unsigned long long)ex->region[r].size);
+    if (ex->delta_delivery &&
+        !(ex->region[AR_DESC].last_delivered = calloc(1, (size_t)ex->region[AR_DESC].size)))
+      return tinynv_fail("out of memory for a %llu byte last-delivered mirror",
+                         (unsigned long long)ex->region[AR_DESC].size);
+  } else {
+    if (tinynv_mm_alloc_buffer(&g->mm, CMD_REGION_BYTES, 1, 1, 1, 0, 1, &ex->region[AR_CMD].mem)) return -1;
+    if (tinynv_mm_alloc_buffer(&g->mm, desc_bytes, 1, 1, 1, 0, 1, &ex->region[AR_DESC].mem)) return -1;
+  }
+  ex->region[AR_DESC].next = ex->region[AR_CMD].next = 0;
+  // Tell the crash witness about the buffers this driver holds for the life of the device. Recording them once here
+  // rather than on each write keeps the launch path free of a store, and it answers the question a per-write list
+  // cannot: whether a faulting address is inside something of ours at all.
+  for (int r = 0; r < 2; r++) {
+    tinynv_note_host_region(ex->region[r].shadow, (size_t)ex->region[r].size,
+                            r == AR_DESC ? "descriptor shadow" : "command shadow");
+    tinynv_note_host_region(ex->region[r].mem.dma.va, (size_t)ex->region[r].mem.dma.size,
+                            r == AR_DESC ? "descriptor region (host memory)" : "command region (host memory)");
+  }
+
+  for (int i = 0; i < 2; i++)
+    if (tinynv_mm_alloc_buffer(&g->mm, STAGE_BYTES, 1, 1, 1, 0, 0, &ex->stage[i])) return -1;
+  // The allocator reports failure by returning, so a NULL host mapping here is a SUCCESSFUL allocation that came back
+  // without one - a different fault, and one that used to travel all the way to a memcpy to address zero in
+  // tinynv_exec_upload. Said here, where the cause still is.
+  if (!ex->stage[0].dma.va || !ex->stage[1].dma.va)
+    return tinynv_fail("a copy staging buffer was allocated (gpu va %#llx, %llu bytes) but came back with no host "
+                       "mapping, so nothing can be staged through it",
+                       (unsigned long long)ex->stage[0].va, (unsigned long long)ex->stage[0].size);
+  fprintf(stderr, "libtinynv: two copy staging buffers ready on exec %p: gpu va %#llx and %#llx, %llu bytes each\n",
+          (void *)ex, (unsigned long long)ex->stage[0].va, (unsigned long long)ex->stage[1].va,
+          (unsigned long long)ex->stage[0].size);
+  for (int i = 0; i < 2; i++)
+    tinynv_note_host_region(ex->stage[i].dma.va, (size_t)ex->stage[i].dma.size, "copy staging buffer");
+  // Laid out at the descriptor region's own offsets, so a dirty span copies to the place it came from and no mapping
+  // arithmetic exists anywhere to get wrong. One allocation whose base does not move for the life of the device, which
+  // is also what lets phase 2 bind an aperture to it once rather than renegotiating whenever it grows.
+  if (ex->arena_dma && tinynv_mm_alloc_buffer(&g->mm, desc_bytes, 1, 1, 1, 0, 0, &ex->mirror)) return -1;
+  tinynv_note_host_region(ex->mirror.dma.va, (size_t)ex->mirror.dma.size, "descriptor mirror");
+  if (ex->arena_dma)
+    // Naming what decided it, not just the knob. "(TINYNV_ARENA_DMA)" read as "you asked for this" on every line it
+    // ever printed, which was true while it was opt-in and stopped being true the moment it became the default - and a
+    // run started with no environment at all is exactly the run where that distinction is the thing being checked.
+    fprintf(stderr, "libtinynv: descriptors are delivered by the copy engine (%s), not written across the link by the "
+                    "processor; TINYNV_ARENA_DMA=0 goes back\n", why_dma);
+
+  // Each engine is told which class it runs and, for the compute engine, where local and shared memory appear. Until
+  // this batch has been through, the engines will not run anything: an unbound subchannel faults on the first method.
+  uint64_t va;
+  tinynv_cmdbuf_t c;
+  if (batch_begin(ex, &g->gsp.compute_q, 64, &c, &va)) return -1;
+  if (tinynv_cmd_set_object(&c, 1, g->dev.class_compute)) return -1;
+  if (tinynv_cmd_shader_window(&c, 0, TINYNV_LOCAL_WINDOW)) return -1;
+  if (tinynv_cmd_shader_window(&c, 1, TINYNV_SHARED_WINDOW)) return -1;
+  if (run(ex, &g->gsp.compute_q, &c, va)) return -1;
+
+  if (batch_begin(ex, &g->gsp.copy_q, 40, &c, &va)) return -1;
+  if (tinynv_cmd_set_object(&c, 4, g->dev.class_dma_copy)) return -1;
+  if (run(ex, &g->gsp.copy_q, &c, va)) return -1;
+  // the engines must be bound before anything is built on them, and this happens once
+  if (tinynv_exec_idle(ex)) return -1;
+
+  ex->ready = 1;
+  return 0;
+}
+
+void tinynv_exec_fini(tinynv_exec_t *ex) {
+  // Everything submitted has been waited for by the caller (tinynv.c idles before this), so the last chain's tail can
+  // be read now along with anything else still in the ring.
+  // A keep-alive still spinning is let go and waited for here: the caller's idle before this deliberately ignored it.
+  if (ex->ka_pending) { tinynv_exec_keepalive_release(ex, 1); tinynv_exec_wait(ex, ex->ka_value, 2.0); }
+  if (ex->kprof_on) { kprof_harvest(ex, ~0ull, 2); kprof_report(ex); }
+  // Under the profile, the trail's last 128 submissions in order: a token's worth of batches by queue, size and links,
+  // which is the only place the batch count a token pays can be read off directly.
+  if (ex->profile && ex->nhist) {
+    uint32_t n = ex->nhist < 128 ? ex->nhist : 128, start = ex->nhist < 128 ? 0 : ex->nhist % 128;
+    fprintf(stderr, "libtinynv: the last %u submissions in order (queue:dwords/links) -", n);
+    for (uint32_t i = 0; i < n; i++) {
+      uint32_t k = (start + i) % 128;
+      fprintf(stderr, "%s%s:%u/%u", i % 16 ? " " : "\nlibtinynv:   ", ex->hist[k].copy ? "copy" : "comp", ex->hist[k].dwords, ex->hist[k].links);
+    }
+    fprintf(stderr, "\n");
+  }
+  if (ex->graph_records)
+    fprintf(stderr, "libtinynv: %llu tokens recorded as resident chains, replayed %llu times under one announcement each\n",
+            (unsigned long long)ex->graph_records, (unsigned long long)ex->graph_replays);
+  if (ex->profile && ex->graph_records) {
+    fprintf(stderr, "libtinynv:   resident chains, engine clock, chain k's end minus chain k-1's (the hand-over plus the chain):");
+    for (int k = 1; k < TINYNV_GRAPH_CHAINS; k++)
+      if (ex->graph_chain_n[k]) fprintf(stderr, "%s%d: %.0f us (%llu)", k % 6 == 1 ? "\nlibtinynv:     " : "  ", k,
+                                        (double)ex->graph_chain_ns[k] / 1e3 / (double)ex->graph_chain_n[k], (unsigned long long)ex->graph_chain_n[k]);
+    fprintf(stderr, "\n");
+  }
+  if (ex->rec) { ex->rec->failed = 1; tinynv_graph_rec_t *r = ex->rec; ex->rec = NULL; tinynv_exec_graph_free(ex, r); }
+  if (ex->nsubmit)
+    fprintf(stderr, "libtinynv: %llu batches submitted: %llu launch chains, %llu other compute batches, %llu copy-engine batches\n",
+            (unsigned long long)ex->nsubmit, (unsigned long long)ex->nsubmit_kind[0], (unsigned long long)ex->nsubmit_kind[1],
+            (unsigned long long)ex->nsubmit_kind[2]);
+  if (ex->ka_launched)
+    fprintf(stderr, "libtinynv: keep-alive launched %llu times after a synchronisation; released %llu by the next chain's "
+                    "hand-over, %llu by a wait\n", (unsigned long long)ex->ka_launched,
+            (unsigned long long)ex->ka_released_chain, (unsigned long long)ex->ka_released_wait);
+  // One line, and only when it happened, because a wrap is a stall and a run that paid several wants to know without
+  // having to have asked in advance.
+  if (ex->wraps[AR_DESC] || ex->wraps[AR_CMD] || ex->seg_waits)
+    fprintf(stderr, "\ntinynv: scratch came round %llu times in the descriptor region and %llu in the command buffer; "
+                    "%llu of the pieces reused were still in use, costing %.2f ms of waiting in total\n",
+            (unsigned long long)ex->wraps[AR_DESC], (unsigned long long)ex->wraps[AR_CMD],
+            (unsigned long long)ex->seg_waits, (double)ex->wrap_wait_ns / 1e6);
+  // OUTSIDE the profile, deliberately. It was inside it, which would have been useless for exactly the run that
+  // needed it: A's inline arm is a CORRECTNESS experiment - op-verify and a byte-identical text - and nobody runs
+  // those with a launch profile on. A count that only appears when you were already measuring cannot answer "was the
+  // knob in effect", which is the one question it exists for.
+  if (ex->hybrid_n)
+    fprintf(stderr, "libtinynv: %llu descriptor deliveries rode in the compute batch instead of crossing on the copy "
+                    "engine.\n", (unsigned long long)ex->hybrid_n);
+  if (ex->delta_n || ex->delta_skip_n || ex->delta_full_n)
+    fprintf(stderr, "libtinynv: delta delivery patched %llu flushes (%llu patches, %llu bytes genuine, %llu bytes of "
+                    "pushbuffer with headers, %.1f KB a flush; %llu launches went as their one envelope), skipped %llu "
+                    "with nothing changed, and %llu fell back full because the flush's patches did not fit the "
+                    "budget.\n",
+            (unsigned long long)ex->delta_n, (unsigned long long)ex->delta_span_n, (unsigned long long)ex->delta_bytes,
+            (unsigned long long)ex->delta_pb_bytes,
+            ex->delta_n ? (double)ex->delta_pb_bytes / 1024.0 / (double)ex->delta_n : 0.0,
+            (unsigned long long)ex->delta_collapse_n, (unsigned long long)ex->delta_skip_n,
+            (unsigned long long)ex->delta_full_n);
+  if (ex->delta_rewind_n)
+    fprintf(stderr, "libtinynv: the descriptor region was started from the bottom at %llu standstills "
+                    "(TINYNV_DELTA_REWIND).\n", (unsigned long long)ex->delta_rewind_n);
+  if (ex->inline_n || ex->upload_ce_n)
+    fprintf(stderr, "libtinynv: %llu host-to-device copies rode in the pushbuffer (%llu bytes) and %llu went to the "
+                    "copy engine.\n           Held list (%u entries, %u bytes): %llu rode in a batch already going "
+                    "out, %llu overflowed onto work\n           already pending, %llu overflowed with nothing pending "
+                    "and cost a batch of their own.\n           Only the LAST number is the win being given back; a "
+                    "large one means the list wants to be bigger.\n",
+            (unsigned long long)ex->inline_n, (unsigned long long)ex->inline_bytes,
+            (unsigned long long)ex->upload_ce_n, ex->inline_pend_max, ex->inline_pend_bytes_max, (unsigned long long)ex->inline_batches_saved,
+            (unsigned long long)ex->inline_rode_flush_n, (unsigned long long)ex->inline_forced_n);
+  if (ex->up_calls) {
+    static const char *const edge[8] = {"<64K", "<256K", "<1M", "<4M", "<16M", "<64M", "<256M", ">=256M"};
+    fprintf(stderr, "libtinynv: bulk uploads: %llu calls in %llu chunks. The compute engine was BUSY for %llu of "
+                    "them and IDLE for %llu (%.1f%% busy), with %llu more during weight load (compute idle by "
+                    "definition, not counted).\n           A copy can only be overlapped with compute that is in "
+                    "flight, so the busy share is the ceiling on what a second copy channel could ever "
+                    "win.\n           Spent: %.3f s host memcpy, %.3f s build+submit, %.3f s waiting for the card "
+                    "(%.3f s total).\n           Call sizes:",
+            (unsigned long long)ex->up_calls, (unsigned long long)ex->up_chunks, (unsigned long long)ex->up_busy_n,
+            (unsigned long long)ex->up_idle_n,
+            (ex->up_busy_n + ex->up_idle_n) ? 100.0 * (double)ex->up_busy_n / (double)(ex->up_busy_n + ex->up_idle_n) : 0.0,
+            (unsigned long long)ex->up_load_chunks,
+            ex->up_memcpy_s, ex->up_submit_s, ex->up_wait_s,
+            ex->up_memcpy_s + ex->up_submit_s + ex->up_wait_s);
+    for (int i = 0; i < 8; i++) if (ex->up_hist[i]) fprintf(stderr, " %s=%llu", edge[i], (unsigned long long)ex->up_hist[i]);
+    fprintf(stderr, "\n           Staging buffers: the upload rotation waited on %llu of %llu claims; the four "
+                    "callers that share buffer 0\n           (download, zero, fill, kernel-download) waited on %llu "
+                    "of %llu. A high second number is the cost of sharing.\n",
+            (unsigned long long)ex->claim_up_blocked, (unsigned long long)ex->claim_up_n,
+            (unsigned long long)ex->claim_ext_blocked, (unsigned long long)ex->claim_ext_n);
+  }
+
+  if (ex->profile && ex->prof_n[PROF_LAUNCH]) {
+    uint64_t L = ex->prof_n[PROF_LAUNCH];
+    fprintf(stderr, "libtinynv: where the processor's time went, per launch, over %llu launches\n",
+            (unsigned long long)L);
+    for (int i = 0; i <= PROF_RING; i++)
+      fprintf(stderr, "libtinynv:   %-46s %7.2f us  (%llu calls)\n", PROF_NAME[i],
+              (double)ex->prof_ns[i] / 1e3 / (double)L, (unsigned long long)ex->prof_n[i]);
+    // The two wait lines are per launch like everything above, so they can be added to the others and compared against
+    // what a launch is actually allowed to cost. That comparison is the point: if building a launch is a fraction of
+    // the budget and standing still is most of it, then no amount of faster submission changes the answer.
+    for (int i = PROF_WAIT; i <= PROF_BLOCKED; i++)
+      fprintf(stderr, "libtinynv:   %-46s %7.2f us  (%llu calls)\n", PROF_NAME[i],
+              (double)ex->prof_ns[i] / 1e3 / (double)L, (unsigned long long)ex->prof_n[i]);
+    double named = (double)(ex->prof_ns[PROF_FLUSH]);
+    double rest_of_flush = named - (double)(ex->prof_ns[PROF_PUSH] + ex->prof_ns[PROF_SUBMIT] + ex->prof_ns[PROF_POLL] + ex->prof_ns[PROF_RING]);
+    fprintf(stderr, "libtinynv:   %-46s %7.2f us\n", "  of which everything else in a flush",
+            rest_of_flush / 1e3 / (double)L);
+    fprintf(stderr, "libtinynv:   %-46s %7.2f us\n", "building a launch, outside any flush",
+            (double)(ex->prof_ns[PROF_LAUNCH] - ex->prof_ns[PROF_FLUSH]) / 1e3 / (double)L);
+    // And the summary that answers the question, stated as a share rather than left to be worked out. The host is
+    // either the thing holding this up or it is not, and the two numbers that decide it are how much of a launch it
+    // spends working and how much it spends stopped.
+    {
+      double work = (double)ex->prof_ns[PROF_LAUNCH] / 1e3 / (double)L;
+      double stopped = (double)ex->prof_ns[PROF_BLOCKED] / 1e3 / (double)L;
+      fprintf(stderr, "libtinynv:   so per launch the processor spends %.2f us building and %.2f us stopped waiting "
+                      "for the engine;\n", work, stopped);
+      fprintf(stderr, "libtinynv:   %llu of %llu waits had to stand still, and everything above is host time - the rest "
+                      "of a launch is the engine working.\n",
+              (unsigned long long)ex->prof_n[PROF_BLOCKED], (unsigned long long)ex->prof_n[PROF_WAIT]);
+    }
+    // The engine's own account of the refill, which is the only part of a synchronisation neither side was measuring.
+    for (unsigned i = 0; i < ex->refill_raw_n; i++)
+      fprintf(stderr, "libtinynv:   refill %u raw: tail %llu  head %llu  (head-tail %lld ns)  report payload %llu, "
+                      "timeline %llu, copy-end %llu, reached %llu, copy-start %llu%s\n", i,
+              (unsigned long long)ex->refill_raw[i][0], (unsigned long long)ex->refill_raw[i][1],
+              (long long)(ex->refill_raw[i][1] - ex->refill_raw[i][0]),
+              (unsigned long long)ex->refill_raw[i][2], (unsigned long long)ex->refill_raw[i][3],
+              (unsigned long long)ex->refill_raw[i][4], (unsigned long long)ex->refill_raw[i][5],
+              (unsigned long long)ex->refill_raw[i][6],
+              ex->refill_raw[i][2] == ex->refill_raw[i][3]
+                  ? "  (payload is the compute queue's last value)"
+                  : "  (payload is NOT the compute queue's last value)");
+    if (ex->refill_host_n)
+      fprintf(stderr, "libtinynv:   and on the host's own clock the same gap took %.1f us, of which %.1f us was inside "
+                      "this driver\n            building launches - the rest is the caller between one token and the "
+                      "next (%llu measured).\n",
+              (double)ex->refill_host_ns / 1e3 / (double)ex->refill_host_n,
+              (double)ex->refill_build_ns / 1e3 / (double)ex->refill_host_n,
+              (unsigned long long)ex->refill_host_n);
+    if (ex->refill_period_n)
+      fprintf(stderr, "libtinynv:   head to head, every refill: %.1f us across %llu - includes prefill and warm-up, "
+                      "whose spacing is not a token.\n",
+              (double)ex->refill_period_ns / 1e3 / (double)ex->refill_period_n,
+              (unsigned long long)ex->refill_period_n);
+    if (ex->refill_period_dec_n)
+      fprintf(stderr, "libtinynv:   head to head, DECODE ONLY: %.1f us across %llu - one token as the card times it, "
+                      "and the number\n            to hold everything else against: it cannot be shrunk by moving a "
+                      "stamp, which the intervals above can.\n",
+              (double)ex->refill_period_dec_ns / 1e3 / (double)ex->refill_period_dec_n,
+              (unsigned long long)ex->refill_period_dec_n);
+    else if (ex->refill_period_n)
+      fprintf(stderr, "libtinynv:   (no decode-window periods: the run ended before refill %llu, so the line above is "
+                      "all there is)\n", (unsigned long long)ex->refill_raw_from);
+    if (ex->refill_copy_n)
+      fprintf(stderr, "libtinynv:   %.1f us of that was the copy engine still working after the last kernel retired - "
+                      "the logits\n            going back to the host, which is work rather than latency (%llu "
+                      "measured).\n",
+              (double)ex->refill_copy_ns / 1e3 / (double)ex->refill_copy_n,
+              (unsigned long long)ex->refill_copy_n);
+    // NOT "transferring", which is what this said until A measured it at 2 us on every single refill. The copy's
+    // LAUNCH_DMA moves its data asynchronously to the methods that follow it, and neither of these stamps waits for
+    // it - so the pair brackets the two stamps' own spacing and nothing else. The second number is kept because it is
+    // evidence about the copy engine's method throughput, and renamed because calling it the transfer made a 2 us
+    // reading look like a measurement of a 993 KB copy. Timing the transfer needs a release that waits for it.
+    if (ex->refill_cstart_n)
+      fprintf(stderr, "libtinynv:   of that, %.1f us before the copy engine reached the copy batch, then %.1f us to "
+                      "the next stamp\n            (NOT the transfer: nothing here waits for it) (%llu measured).\n",
+              (double)ex->refill_cwait_ns / 1e3 / (double)ex->refill_cstart_n,
+              (double)ex->refill_crun_ns / 1e3 / (double)ex->refill_cstart_n,
+              (unsigned long long)ex->refill_cstart_n);
+    if (ex->refill_reach_n)
+      fprintf(stderr, "libtinynv:   of which %.1f us before the engine reached the batch and %.1f us with the batch "
+                      "reached but\n            held at its acquire - the copy engine delivering this batch's "
+                      "descriptors (%llu measured).\n",
+              (double)ex->refill_reach_ns / 1e3 / (double)ex->refill_reach_n,
+              (double)ex->refill_acq_ns / 1e3 / (double)ex->refill_reach_n,
+              (unsigned long long)ex->refill_reach_n);
+    if (ex->refill_submit_n)
+      fprintf(stderr, "libtinynv:   and %.1f us had passed when that batch was actually handed over, so the engine took "
+                      "the\n            remaining %.1f us to start work already on its ring (%llu measured).\n",
+              (double)ex->refill_submit_ns / 1e3 / (double)ex->refill_submit_n,
+              (double)ex->refill_ns / 1e3 / (double)(ex->refill_n ? ex->refill_n : 1) -
+                  (double)ex->refill_submit_ns / 1e3 / (double)ex->refill_submit_n,
+              (unsigned long long)ex->refill_submit_n);
+    if (ex->refill_asked)
+      fprintf(stderr, "libtinynv:   %llu stalls asked to be measured, %llu got a head timestamp, %llu were paired - so "
+                      "the average below\n            is over that last group, not over every stall.\n",
+              (unsigned long long)ex->refill_asked, (unsigned long long)ex->refill_armed_n,
+              (unsigned long long)(ex->refill_n + ex->refill_bad));
+    if (ex->refill_stuck)
+      fprintf(stderr, "libtinynv:   the tail timestamp did not advance on %llu refills - the report being read is not "
+                      "the one\n            the finished work wrote, so nothing below is a measurement of idleness.\n",
+              (unsigned long long)ex->refill_stuck);
+    if (ex->refill_bad)
+      fprintf(stderr, "libtinynv:   %llu refill measurements were discarded as not physical (zero, or over 100 ms). If "
+                      "that is most\n            of them the two timestamps are not on the same clock and the average "
+                      "below means nothing.\n", (unsigned long long)ex->refill_bad);
+    if (ex->refill_n)
+      fprintf(stderr, "libtinynv:   the engine sat idle %.1f us on average across %llu refills (worst %.1f us), which "
+                      "is its own clock\n            between finishing a batch and starting the one the host built "
+                      "after standing still.\n",
+              (double)ex->refill_ns / 1e3 / (double)ex->refill_n, (unsigned long long)ex->refill_n,
+              (double)ex->refill_max_ns / 1e3);
+    fprintf(stderr, "libtinynv: the profile costs two clock reads per phase and about 1%% of a launch; it is measuring\n"
+                    "libtinynv: itself as well as the driver, so read the shares rather than the absolute total.\n");
+  }
+  tinynv_vmap_free(&ex->g->mm, &ex->slm);
+  for (int i = 0; i < 2; i++) tinynv_vmap_free(&ex->g->mm, &ex->stage[i]);
+  if (ex->mirror.size) tinynv_vmap_free(&ex->g->mm, &ex->mirror);
+  for (int r = 0; r < 2; r++) {
+    if (ex->region[r].mem.size) tinynv_vmap_free(&ex->g->mm, &ex->region[r].mem);
+    free(ex->region[r].shadow);
+    free(ex->region[r].last_delivered);
+  }
+  tinynv_vmap_free(&ex->g->mm, &ex->sem);
+  if (ex->kring.size) tinynv_vmap_free(&ex->g->mm, &ex->kring);
+  for (int i = 0; i < ex->graph_pool_n; i++) { tinynv_vmap_free(&ex->g->mm, &ex->graph_pool[i].mem); tinynv_vmap_free(&ex->g->mm, &ex->graph_pool[i].mirror); }
+  if (ex->ka_flag.size) tinynv_vmap_free(&ex->g->mm, &ex->ka_flag);
+  free(ex->kslot);
+  free(ex->krow);
+  free(ex->kindex);
+  memset(ex, 0, sizeof(*ex));
+}

@@ -1,0 +1,9 @@
+[tinycudart] tinynv-null (no gpu): presenting the RTX 5090 profile (sm_120, 170 SMs, 32 GB) so ggml dispatches as it will on the target
+  Device 0: tinynv-null (no gpu), compute capability 12.0, VMM: no, VRAM: 32607 MiB
+tinynv: no gpu opened, running as a null device: memory is host memory and launches are reported, not executed
+build: ad6c668 (1)
+bf16 GEMM launches, counted (same model and flags):
+   8 [trace] launch tinyblas_gemm_bf16_tc2s_tn m=256 n=256 k=2048 out=0
+   8 [trace] launch tinyblas_gemm_bf16_tc2s_tn m=2048 n=256 k=2048 out=0
+   4 [trace] launch tinyblas_gemm_bf16_tc2s_tn m=11008 n=256 k=2048 out=0
+   2 [trace] launch tinyblas_gemm_bf16_tc2s_tn m=2048 n=256 k=11008 out=0

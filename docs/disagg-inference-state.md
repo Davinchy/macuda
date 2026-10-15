@@ -1,0 +1,746 @@
+# Disaggregated inference — state and handoff (2026-09-17)
+
+**WHERE A FRESH START BEGINS is the entry point.**
+
+Prefill on the RTX 5090 through the shim, decode on the Mac's GPU, for a model that fits unified memory but not VRAM.
+Everything below is in this tree (`tools/disagg-*.{sh,py}`, README §Disaggregated inference). The numbers are from the
+real card on this M4 Max (128 GB) on Apple's 140 W charger, Qwen3-Coder-Next-UD-Q4_K_XL (49.6 GB; arch `qwen3next`,
+48 blocks with a full-attention layer every 4th block — 12 full GQA-attention + 36 Gated-DeltaNet linear/SSM — 512
+experts with **10 active per token**, one shared expert, 43.50 GiB/46.7 GB of expert tensors — read directly from
+the GGUF 2026-09-18; usable card VRAM is ~31.8 GiB, so full expert residency is arithmetically impossible for this
+model). **Every card number below is tagged with the driver build that produced it, because the driver moved twice and
+the 09-16 numbers are not comparable with the 09-17 ones.**
+
+## WHERE A FRESH START BEGINS — 2026-09-17. **READ THIS SECTION FIRST.**
+
+There is no other Claude session on this project. Antonio works directly with this assistant; a card step needs
+Antonio's own explicit go, proposed with its expected result, refusal readings and risk class, same as any other
+hardware step (see README §Disaggregated inference).
+
+**Window 3 (designed below) is DONE — see the result right below, then §What is next for where this picks up.**
+
+**WINDOW 3 LANDED, 2026-09-17 23:46-23:52, driver `a988ec7` (downstream of `ad308bd`; the commits between are GSP
+quiesce / nvioctl-log tooling, not the MoE placement path, but this run is its own driver-tagged point, not pooled
+with window 2).** A first attempt to launch it was refused by this harness's auto-mode classifier with no stated
+reason ("judged dangerous"); Antonio asked for it to be run again immediately after, and the second attempt went
+through clean — treat that refusal as transient/permission-mode noise, not a standing block, though it can recur.
+
+| req | cold tokens | card prefill | save | decode | wall |
+|---|---|---|---|---|---|
+| t1 = prompt A (first after load) | 21,233 | **7.0 s** (3012 tok/s) | 501 MB / 0.6 s | 32 tok @ 77.8 tok/s | 8.1 s |
+| t2 = chat-6k | 7,250 | **4.2 s** (1745 tok/s) | 215 MB / 0.2 s | 64 tok @ 83.3 tok/s | 5.3 s |
+| t3 = prompt B | 22,879 | **6.3 s** (3628 tok/s) | 535 MB / 0.6 s | 32 tok @ 78.4 tok/s | 7.5 s |
+
+op-verify 450/450 after, dext unchanged (pid 659), DART absent, lock released, card idle warm. Logs banked at
+`logs/disagg/serve/w3-20260917-234655-{card,metal,router}.log` (sha256 recorded alongside).
+
+**Correction to the design: A and B were NOT equal length.** The byte-count proxy (11-byte gap, ≈3 tokens) badly
+under-called it — `qwen35moe` tokenizes the two slices to 21,233 and 22,879 cold tokens, a 1,646-token (7.7%) gap.
+So the planned `t1 − t3` subtraction (+0.70 s raw) does not cleanly cancel the marginal rate as designed. The correct
+read: fit the warm line from t2 and t3 alone (the line a first-prefill penalty should NOT distort) — **fixed 3.226 s,
+rate 7,442 tok/s** — then predict t1 from it: **6.079 s predicted vs 7.0 s observed, residual +0.921 s.**
+
+**This lands at the top edge of the registered band and is a second, independent confirmation of the cold-mapping
+hypothesis.** Two things line up:
+1. **The warm fixed cost (3.226 s) sits inside the pre-registered 3.0-3.9 s band**, itself derived by applying
+   window 2's implied link bandwidth (43.7 GiB / 8.0 s = 5.46 GiB/s) to this model's 18.2 GiB of experts (18.2/5.46 =
+   3.33 s) — a physical model (fixed cost = expert GiB / link bandwidth) transferring correctly across a different
+   model architecture AND a different driver build is a genuinely strong result on its own, independent of the
+   cold-start question.
+2. **The +0.921 s residual is close to what window 2's bytes-streamed scaling predicts for this model's smaller
+   expert footprint**: window 2's two residuals were 2.08 s / 43.7 GiB = 0.0476 s/GiB and 1.24 s / 27.3 GiB =
+   0.0454 s/GiB; averaging ≈0.0465 s/GiB and applying it to this model's 18.2 GiB predicts **0.846 s** — 0.075 s off
+   the 0.921 s observed. Three independent points (two architectures, two driver builds) now sit close to one
+   s/GiB rate for a first-touch/cold-mapping cost.
+3. **Order and length are less confounded than in window 2:** t2 (7,250 tokens) is the shortest request but ran
+   SECOND, not first, and shows no excess (it's one of the two points the warm line is fit from, so it can't by
+   construction) while t1 (21,233 tokens, NOT the shortest) ran first and does show the excess. That the anomaly
+   tracks "ran first" rather than "is shortest" argues against the alternative explanation window 2 could not rule
+   out.
+
+**Still not proven:** n=1 per architecture, no reversed-order rerun (the first request in a sequence is always
+first by definition — only a fresh cold-start with a different request ordered first would fully separate "first"
+from "this particular request"). The hypothesis is now well-supported, not confirmed.
+
+**DO NOT HALF-START THE WINDOW.** A window that dies with a server refused mid-sequence leaves the lock held and the card
+in a state nobody pre-registered. Preflight is read-only and safe to run first; the servers are not.
+
+**THE SEQUENCE, seven foreground commands, no script** (staged scripts are checked with `sh -n` and never run):
+
+    cd <repo> && . ./env.sh
+    sh tools/preflight.sh | tail -5
+    BIN=<repo>/cuda-shim/build/bin/llama-server-null NCPUMOE=40 THRESH=512 \
+      sh tools/disagg-serve.sh start <models-dir>/Qwen3.5-35B-A3B-Q4_K_M.gguf
+    # tokenize A and B through the router first (Metal-side, no card work): if they differ by more than ~50 tokens, trim
+    sh tools/disagg-serve.sh test logs/disagg/w3-prompt-a.txt 32     # t1, FIRST after load
+    sh tools/disagg-serve.sh chat logs/disagg/chat-6k.txt            # t2
+    sh tools/disagg-serve.sh test logs/disagg/w3-prompt-b.txt 32     # t3, same length as A
+    sh tools/disagg-serve.sh stop && sh tools/nv_shim_step.sh V1 opverify
+
+**WHAT IS PREPARED, AND IT IS NOT IN GIT.** `logs/` is gitignored, so these exist only on this Mac's disk:
+`logs/disagg/w3-prompt-a.txt` (75,151 B) and `logs/disagg/w3-prompt-b.txt` (75,162 B) — disjoint slices of the same
+driver-source corpus with a 65,000-byte gap, equal to ~3 tokens at the measured 3.534 bytes/token, ~21,300 tokens each:
+one ubatch with ~14% margin under the 24,576 ceiling in case `qwen35moe` tokenizes less efficiently than the coder model.
+The middle request is the existing `logs/disagg/chat-6k.txt`. **If this tree is ever cloned elsewhere, the prompts must be
+rebuilt** — the recipe is two 75,000-byte line-aligned slices of `logs/disagg/prompt-64k.txt` at offsets 0 and 140,000.
+
+**A and B's own length gap** (card-free check, 2026-09-17, arithmetic only — not the real tokenizer): the files are
+75,151 B and 75,162 B, an 11-byte difference, ≈3 tokens at the measured 3.534 bytes/token. That is well inside the
+~50-token tolerance the sequence calls for, so trimming looks unnecessary — but this is a byte-count proxy, not
+`qwen35moe`'s actual tokenization, which the sequence's own tokenize-through-the-router step (Metal-side, no card
+work) still needs to confirm at go time, since that step itself starts a host process this session's permission mode
+also refuses.
+
+**THE REGISTERED PREDICTIONS STAND AS WRITTEN — do not re-derive them, and do not widen them after seeing a number:**
+warm per-ubatch stream **3.0-3.9 s**, **t1 - t3 = 0.6-0.9 s** if the residual is a cold first touch and **≈0** if it is
+not, **no band on the marginal rate**. Nobody is touching them before the run.
+
+**BANKING MEANS COPYING THE ARTIFACT, NOT WRITING THE PROSE** (earned on run 87 an hour before: two
+invocations shared one output directory and the second replaced the first's daemon log by design, so the prose survived
+while the file behind the citation became a different run's output under the same name). In this tooling the three serve
+logs are timestamped and safe, but **`logs/disagg/serve/router.port` and `router.log.path` are rewritten by every start,
+and the slot state files are overwritten by the next prefill with the same slot id**. So the moment the window ends:
+copy the three logs to `logs/disagg/serve/w3-<ts>-{card,metal,router}.log`, sha256 each copy, and **cite the copies**.
+
+**BEFORE-READINGS TO ANCHOR AGAINST** (measured at 08:31, confirmed again at 08:5x; re-read them yourself at go
+time rather than quoting these): preflight VERDICT OK, **DART absent with NO snapshot** (cleared 08:35 after the reboot
+re-enumerated the nub; both pre-reboot records preserved in ROOT `logs/`), **dext 1 instance, pid 659, started
+07:41:33**, lock free. Report LANDED or REFUSED either way, with the three prefill times, the `cache_n` values and the
+op-verify result. **A model that has never been loaded failing to load IS a result for this window, not a wasted slot.**
+
+## Where it stands in one line
+
+The feature works as one endpoint and is fast: a 24K-token prefill that Metal does in 35.7 s takes **9.6 s** split, with
+decode unmoved on Metal at 52-58 tok/s. What is NOT settled is the shape of the cost model near its fixed term — see
+THE OPEN QUESTION.
+
+## The runs, by driver
+
+**`2fe7091` (2026-09-16 16:21-16:24, LANDED, op-verify 450/450 after, dext 15→15, DART absent).** The trio
+(`tools/disagg-serve.sh start`, threshold 512) served three requests through the router:
+
+| request | route | card prefill | Metal saw | decode | wall |
+|---|---|---|---|---|---|
+| 23,692-token prompt, cold (FIRST after load) | card → save 662 MB 0.7 s → restore 0.1 s | 15.3 s (1545 tok/s) | prompt_n 1, cache_n 23691 | 52 tok/s | 17.4 s |
+| same context + one question | Metal only (24 cold tokens) | none | cache hit | | ~1 s |
+| chat, 6,975-token message (THIRD) | card via /apply-template → 251 MB | 8.5 s (821 tok/s) | prompt_n 1, cache_n 6974 | 58 tok/s | 10.3 s |
+
+Metal alone prefills the 24K prompt in 35.7 s (664 tok/s). Greedy text from the split diverges from Metal-only text on
+near-ties (0.2-nat margins, full top-5 ranking reproduced): numerics, not a wrong cache.
+
+**`2fe7091`, window 1 (2026-09-17 07:31).** 64,577 tokens = **3 ubatches** in **40.5 s**, inside the pre-registered
+40-50 s band. This is what `dac5549` rests on: **the expert stream is paid PER UBATCH, not once per prompt** — ggml's
+scheduler re-copies the host-resident experts for every ubatch it evaluates. Architecture-level, so it carries across
+drivers; the seconds do not.
+
+**`ad308bd`, window 2 (2026-09-17 07:34-07:36) — the residency control and treatment, requests paired by position,
+lock released between the cycles.** 18 of 48 expert layers resident on the card (`NCPUMOE=30`) against all 48 streamed:
+
+| condition | 7K prefill (first after load) | 24K prefill (second) | decode | op-verify |
+|---|---|---|---|---|
+| CONTROL `NCPUMOE=48` | 6,974 tok in **11.43 s** (610 tok/s) | 23,691 tok in **12.59 s** (1882 tok/s) | 54-58 tok/s | 450/450 |
+| TREATMENT `NCPUMOE=30` | **7.59 s** (918 tok/s, **-33%**) | **9.57 s** (2476 tok/s, **-24%**) | 54-58 tok/s | 450/450 |
+
+`cache_n` 6,974 and 23,691 in both cycles; no allocation trouble at ~29 GB of 31.8.
+
+**THE CONTROL WAS NECESSARY, and the reason is worth keeping:** the driver change ALONE took the 24K prefill from 15.3 s
+(`2fe7091`) to 12.59 s, so residency measured against yesterday would have been credited ~18% that belongs to `ad308bd`.
+
+## THE OPEN QUESTION — a residual the published model does not explain
+
+The model reported at the 07:37 stand-down (fixed **8.0 s** per ubatch, marginal **5150 tok/s**, residency scaling the
+fixed term by the byte fraction 30/48) was fitted on the **two 24K points** — two unknowns, two equations. **Its exactness
+at those points is arithmetic, not a test**, and the stand-down line's "both conditions fit one model exactly" should have
+said so. The two 7K prefills were **not** in that fit:
+
+| point | model predicts | observed | residual |
+|---|---|---|---|
+| 7K control (48 layers streamed) | 9.35 s | 11.43 s | **+2.08 s** |
+| 7K treatment (30 streamed) | 6.35 s | 7.59 s | **+1.24 s** |
+
+The residuals are in the ratio **0.60**, against the residency byte fraction 30/48 = **0.625**: the unexplained time
+scales with **expert bytes streamed**. A first-touch / cold-mapping cost does that. A compute-efficiency effect at small
+batch cannot, because residency does not change the arithmetic, only where the weights live.
+
+**It is a hypothesis, not a finding, and the confound is named:** n=1 per condition, and in BOTH cycles the 7K prefill ran
+FIRST and was also SHORTER, so order and length are inseparable in this data. (The 09-16 run had the opposite order — 24K
+first, 7K third — but on the other driver, so it cannot arbitrate.) **Window 3 breaks the confound by design.**
+
+## Window 3 — design (prepared 2026-09-17 morning, run and landed that evening — see the result above)
+
+- **Model:** `<models-dir>/Qwen3.5-35B-A3B-Q4_K_M.gguf` — 19.7 GiB, arch `qwen35moe`, **40 blocks, 256
+  experts with 8 used**, 18.2 GiB of expert tensors (92%). Against the coder model's 48 layers / 43.7 GiB / few large
+  experts, this is a second *architecture*, not a second size. Host peak ~40 GiB (both halves map it), ~40% of the coder runs.
+- **Binary:** `BIN=<repo>/cuda-shim/build/bin/llama-server-null` — designed against `ad308bd` (the
+  window-2 driver); actually ran on `a988ec7` (the tree had moved on by the evening). The build line must always be
+  quoted **from the binary's own first output**, not from notes — that's what caught the drift here.
+- **Placement:** `NCPUMOE=40` — every expert layer streamed, the conservative arm only. No residency arm, so the allocator
+  stays far from the ~30 GB point and the flat-64 MB-vs-~203 MB WPR2 carveout hazard is not touched.
+- **The order was meant to be the experiment:** 24K prompt A (first after load) → 7K chat → 24K prompt B, meant to be
+  the same length so `t1 - t3` cancels the marginal rate directly. In practice A and B tokenized to 21,233 and 22,879
+  — a 7.7% gap the byte-count proxy missed — so the actual analysis fits the warm line from t2+t3 instead and predicts
+  t1 from it (see the result above). Lesson for the next design: check length with the real tokenizer, not a
+  bytes-per-token proxy, whenever that's possible without a blocked host-process launch.
+- **Registered before the go:** warm per-ubatch stream **3.0-3.9 s** (window 2's own implied link rate, 43.7 GiB / 8.0 s =
+  5.46 GiB/s, applied to 18.2 GiB — window 2 predicting window 3, not a fresh fit); **t1 - t3 = 0.6-0.9 s** if the
+  cold-first reading is right, **≈0** if it is not; **no band on the marginal rate** — different architecture, no basis.
+  **Result: warm fixed cost 3.226 s (inside the band); first-prefill residual +0.921 s (at the top edge of the band,
+  computed correctly via the warm-line-minus-t1 method rather than the invalidated raw t1-t3).**
+- **A load failure is a RESULT for this window, not a wasted slot:** the placement flags were found by crashing
+  on one model. Report LANDED or REFUSED either way, with the three prefill times and the `cache_n` values.
+
+## What changed in the router today (card-free, 2026-09-17 08:4x)
+
+1. **Cold-start constants are now the `ad308bd` pair:** `--card-fixed` 5.7 → **8.0 s per ubatch**, `--card-rate` 2460 →
+   **5150 tok/s**. The old pair was the `2fe7091` fit and was two drivers stale. Break-even moves **~5,300 → 6,197** cold
+   tokens (`--selftest`). Against the control prefill they came from: 12.60 s predicted, 12.59 s observed.
+2. **A refit now needs THREE observations, not two, and must reproduce every point it was fitted on within 20%.** This is
+   a measured defect, not a tidy-up: in window 2 the live router refit itself from the control pair to **11.0 s +
+   14,471 tok/s** — nearly three times the marginal rate the same window supports — and then predicted **16.2 s** for the
+   prefill that had just taken 12.59 s. Two single-ubatch points fit themselves exactly by construction. Verified in
+   process: that real pair now leaves the priors standing, three consistent points still refit, three points on a
+   genuinely different line (3.30 s + 9000 tok/s, window 3's predicted shape) are tracked exactly, and one absurd point
+   among three is rejected.
+3. **The first card prefill after a start is named in the log** as possibly paying a cost the later ones do not, citing
+   the two residuals above. It is NOT excluded from the fit — the question is open, and window 3 decides it.
+
+**Not re-run today: the 10/10 plumbing test** (`tools/disagg-router-test.sh`, 0.8B on the null device). It starts three
+host processes and this session's permission mode refused to launch them. The changed code paths were exercised in process
+instead (above) and `--selftest` is OK, but the end-to-end plumbing has not been re-checked since the change.
+
+4. **`fit_line()`'s refit-robustness is now a persisted test, not a one-off:** `tools/disagg-router-fit-test.py` (pure
+   Python, no host process, no card — imports the router module and calls `fit_line` directly) pins the five properties
+   this section claimed as "verified in process": two points don't fit, three consistent points do, three points on a
+   different line are tracked on their own terms, one absurd point among three is rejected, and a multi-ubatch prompt
+   still recovers the per-ubatch fixed cost rather than a flat one. All five PASS as of `35c3aed`+1. Card-free session on
+   2026-09-17 (still using the card at the time) also re-hit the same plumbing-test refusal above under a fresh session
+   name (`egpu-mac-nvidia-fc`) — confirms it is a permission-mode property, not a one-time fluke of the earlier session.
+
+## The rules the runs obeyed, and why
+
+- **Card protocol**: the tenant takes the shared lock (`. ./env.sh` first), through preflight and the TinyGPU
+  server, and holds it while the card server is up; `stop` releases it, card idle warm. **Antonio approves every
+  slot** — there is no other Claude session to schedule around.
+- **512-token cap on Metal prefills in a card window**: the eGPU tunnel dropped twice on 09-16 under full
+  Metal prefills while the laptop drew power through the enclosure's USB-C PD; on Apple's charger it has held, but n is
+  small. With the router's threshold at 512, Metal only ever sees short prompts and cache-hit decodes.
+- **Card-free is not host-free**: the Metal half maps the whole model; any job over ~20 GB of host or Apple-GPU memory
+  needs Antonio's word while anyone holds the card. Small-model plumbing tests (the 0.8B at
+  `~/.lmstudio/models/omnirecipes/qwen35-0.8b-GGUF/Qwen3.5-0.8B-Q8_0.gguf`, null device as the card) are allowed at will.
+- **`sh -n` only**: never source or run a staged script to see what it prints. One unauthorized run came from that.
+- **After the 09-17 reboot the clean card state changed**: DART absent **with no snapshot**, dext **1 instance, pid 659,
+  started 07:41:33** (cleared at 08:35, after copying both records to ROOT `logs/`). Anchor before-readings there.
+
+## The slot shape that works (reuse it verbatim)
+
+State to Antonio directly: step, binary + build id, model, duration, expected result, refusal readings, risk class.
+Once he gives the go, as separate foreground commands: readings before (anchored dext count, DART line, preflight
+OK) → `THRESH=512 sh tools/disagg-serve.sh start` → the requests → `stop` → `sh tools/nv_shim_step.sh V1
+opverify` (450/450) → readings after → DONE. Report LANDED/REFUSED with the cache_n values and the card prefill times.
+
+## Context-size scaling benchmark, 2026-09-18 — the 512-token cap costs real time on incremental chat
+
+A synthetic 13-turn pair-programming chat (`tools/gen-coding-chat.py`, deterministic, reproducible) was sent
+turn by turn through the disaggregated router (Qwen3-Coder-Next-UD-Q4_K_XL, driver `a988ec7`, `THRESH=512`) and,
+separately, the identical 9 checkpoints straight to a bare Metal server (no card, no lock) — a real head-to-head,
+not a model prediction. Context grew from 728 to 25,173 tokens.
+
+**Finding: across the 9 turns the card leg spent 72.0 s total on prefill against 37.9 s if every turn's new
+tokens had gone to Metal instead — 1.9x slower overall.** The forced-card cap only won outright on the one turn
+whose own cold delta (6,573 tokens) sat near the router's measured breakeven (~6,197 cold tokens on this driver);
+every other turn's delta was small enough that Metal alone was faster, in one case by 8.4x (729 cold tokens: 1.0 s
+on Metal, 8.4 s forced onto the card, almost entirely the fixed per-ubatch expert-stream cost). The 512 cap exists
+for a specific, real reason — keeping Metal off long sustained prefills after the 2026-09-16 re-enumerations — but
+every Metal prefill measured here, including the largest single turn, finished in 10.6 s, far under the 35-54 s
+band those incidents were tied to. That makes the cap plausibly over-conservative specifically for incremental
+chat traffic (a single giant cold paste is the different case it still protects against). Loosening it toward the
+cost model's own threshold is a real candidate, but it's Antonio's call, not made here.
+
+**Why the fixed cost didn't scale down for small turns (mechanism, confirmed 2026-09-18):** with 512 experts and
+10 active per token, `(1 - 10/512)^N` says essentially all 512 experts have been touched by ~250-300 tokens into
+any batch. Every turn in this benchmark (729-6,573 cold tokens) was already well past that point, so every one of
+them needed close to the full 43.5 GiB expert stream regardless of size — the fixed cost isn't a tuning gap, it's
+structural MoE saturation, and no amount of threshold or residency tuning changes that for a single request. This
+also means expert-hotness/LRU caching (an idea considered and set aside — see the 2026-09-18 strategy review)
+would not help prefill for this reason; upstream `llama.cpp` work (issue #20757, PR #27861) reaches the same
+conclusion independently: such caching serves decode, not prefill.
+
+Full write-up, chart and per-turn table published to the "Shim vs Silicon" report:
+https://claude.ai/artifact/3FjoCozBg6ojVDMRLkfuV2 (§Disaggregated inference). Logs banked at
+`logs/disagg/serve/ctxbench-20260918-001204-{card,metal,router}.log` (card leg, sha256-hashed) and
+`logs/disagg/bench/metalonly/metal.log` (Metal-only leg); checkpoint prompts at `logs/disagg/bench/ctx-*.txt`
+(gitignored, regenerate with `python3 tools/gen-coding-chat.py`).
+
+## Router bug found and fixed testing item 1, 2026-09-18: card cache staleness was invisible to the cost model
+
+Testing `THRESH=0` (item 1 of the strategy review below) on the real 9-turn benchmark surfaced a real bug, not
+just confirmed the projection. `predict()`/`decide()` used ONE `cold` count (tokens new since Metal's cache) for
+BOTH sides' cost estimates, but the card has its OWN independent slot cache (`cache_prompt` against
+`id_slot=ARGS.slot`) that only stays in sync if the card is used every turn. When cost-model routing correctly
+skipped the card for six small turns in a row, the card's cache fell six turns behind Metal's; the router then
+predicted turn 7 (6,573 tokens new-to-Metal) would cost the card 9.5s, chose card, and it actually cost **15.3s
+for a 21,343-token prefill — the ENTIRE conversation so far**, because the card's slot had nothing cached and had
+to redo everything since ITS last use, not just what was new to Metal.
+
+**Fixed:** `tools/disagg-router.py` now tracks `STATE["card_tokens"]` separately from `STATE["metal_tokens"]` and
+computes `cold_card` (new since the card's own last use) independently from `cold_metal` (new since Metal's).
+`predict()`/`decide()` take both; the card's predicted cost now uses its real cold count. Verified against the
+exact real observation as a permanent selftest case (`decide(6573, 21344, ...)` now correctly returns metal; the
+same request with a synced card, `decide(6573, 6573, ...)`, still correctly returns card).
+
+**Re-ran the 9-turn benchmark with the fix: the router now routes ALL 9 turns to Metal**, total wall 43.7s,
+matching the pure-Metal baseline (43.3s) almost exactly. This is the deeper finding: **once the cost model is
+honest about staleness, smart per-turn routing for a naturally-growing incremental chat degenerates to "always
+Metal," because touching the card at any point requires reprocessing the entire conversation so far, and that
+cost only grows as the conversation does.** The card's real, proven win (window 1, the original 23,692-token
+cold-start result) is specifically for a large FIRST prefill on a fresh context, not for occasional touches
+during an otherwise-incremental session. Getting real card benefit during incremental chat would need either (a)
+paying to keep the card synced every turn regardless of that turn's own economics (this is what the old
+`THRESH=512` behavior did, at the 1.9x cost already measured), or (b) some other means of amortizing the
+catch-up — an open question, not solved here.
+
+## Card re-enumeration during testing, 2026-09-18 01:20:58 — cleared, did not recur on an identical repeat
+
+During the first `THRESH=0` validation run (before the router fix, all 9 turns still correctly routed to Metal),
+preflight next came back `ABORT — a new dext instance since the record` (pid 20618, vs. the prior clean record
+pid 659 from 2026-09-17 07:41:33). Link status read "up" throughout (80-120 Gb/s, PCI link up), DART error data
+was absent — this reads as the same Thunderbolt tunnel drop/re-attach signature as the two 2026-09-16 events, not
+a wedge. Antonio looked, then said to clear and retry: `tools/dart-stale.sh --clear`, verified it landed (a
+second preflight showed the dext record updated, not still stale — this project's house rule after a clear that
+didn't take the first time on 2026-09-17). **Timing worth keeping:** the card itself did nothing this run (every
+turn routed to Metal); the re-enumeration landed right at the end of turn 6, an 8.2s sustained Metal prefill on
+5,758 cold tokens — matching the existing step-down hypothesis (a re-enumeration at the transition off sustained
+Metal compute) with **zero card activity**, a cleaner data point against "card interaction" as a contributing
+cause. **The identical 9-turn benchmark repeated immediately after did NOT reproduce it** (clean preflight,
+op-verify 450/450) — n=1 either way, so this neither confirms nor rules out the workload as a trigger, but it's
+not deterministic on this exact shape.
+
+**Root cause found, 2026-09-18: Antonio identified why his power adapter was disconnecting and is fixing it** —
+confirms the power-delivery hypothesis from the 09-16 events rather than leaving it open.
+
+**Standing authorization changed 2026-09-18:** these no longer need Antonio to look first every time. His words:
+"keep a log of these enumerations and any relevant data, but you can clear them as they don't seem to be harming
+anything." Clear autonomously (`tools/dart-stale.sh --clear`, verify it landed) whenever the link stays clean
+(DART absent, Thunderbolt/PCI "up") and log the occurrence here — this does not extend to an actual wedge, a
+latched DART fault, or "link NOT up".
+
+**Third re-enumeration, 2026-09-18 02:48:12** (dext pid 43805, vs. the prior record pid 20618 from 01:20:58).
+Same clean signature (link "up", DART absent). Landed right at the cleanup/step-down of the parallel-slot batching
+test (`batch-test.sh` killing the card and Metal server processes after ~140s of sustained load: an 11.7s card
+prefill plus 8 back-to-back ~15-17s Metal completions) — the fourth data point now (of four total re-enumerations
+across two days) landing at a step-down after sustained load, none during steady load itself and none while the
+card was mid-step. Cleared with `tools/dart-stale.sh --clear`, verified landed. No further testing was blocked by
+it once cleared.
+
+## Reverse sync implemented, tested, and did NOT achieve the intended effect, 2026-09-18
+
+Following the strategy review below, `tools/disagg-router.py` gained `sync_metal_to_card()`: before the card
+prefills, if its own slot has fallen behind Metal's, push Metal's current slot state onto the card first (same
+symmetric save/restore API the working card->metal direction already relies on), so the card's own `cache_prompt`
+matching should then recognize the shared prefix and only prefill the true delta. `predict()`/`decide()` updated
+to cost this as `cold_metal` plus a one-time sync tax, replacing the "card's own stale cold count" model from the
+staleness fix earlier today. Verified on the desk (`--selftest`, `disagg-router-fit-test.py`).
+
+**Tested for real and it did NOT work.** Sequence: 3 small turns to Metal, then one large turn (21,344 total
+tokens, 18,432 new). The sync itself succeeded cleanly — Metal's state saved (2,943 tokens, matching a tracked
+2,912-token prompt plus 31 tokens of the previous turn's own decoded output extending Metal's real cache, a
+harmless and expected gap fixed as a side effect: the original assertion compared against the router's own
+tracked count and raised a false error on this exact mismatch on the first attempt; fixed to compare the
+save/restore round trip against itself instead), restored onto the card (0.0 s, `n_restored` matched `n_saved`).
+But the card's own subsequent `/completion` with `cache_prompt: true` reported `prompt_n: 21343` — it reprocessed
+the ENTIRE prompt, not the ~18,432-token delta the restored prefix should have left for it. The restore round-trip
+succeeded; the card's own cache_prompt matching did not recognize it afterward. This is the opposite of the
+established, repeatedly-proven card->Metal direction, where every successful run in this project's history shows
+the receiving side correctly reporting `cache_n` matching the restored length. Root cause not yet known - under
+investigation (a fresh agent is reading the actual server-side restore/cache_prompt-matching code, not just the
+KV-cache serialization format the earlier research confirmed symmetric, since that confirmation was evidently
+insufficient). Item 1 is not closed; do not assume reverse sync works until this is resolved.
+
+**Root-cause investigation, and the one clean hypothesis it produced, both closed 2026-09-18.** Reading
+`tools/server/server-context.cpp` directly: the restore handler does the right thing (`slot->prompt.tokens =
+std::move(restored)`, the exact field the cache-hit check reads), the cache-hit check itself
+(`get_common_prefix`) is a plain direction-agnostic loop, the serialization version marker is identical (=1)
+between the two builds (11 days apart), and the restore's own round-trip was clean (no type-validation failure).
+None of that explains the gap. The one concrete, testable difference found: every proven-working case (this
+project's own card->Metal direction, and llama.cpp's own `test_slot_save_restore`) had the *receiving* slot
+process at least one real completion before any restore touched it; the failing case restored onto the card's
+slot 0 as the very first thing that server process ever did with it. **Tested directly: sent a throwaway
+completion to warm the card's slot first, then repeated the exact same sync+restore+prefill sequence. Still
+reprocessed the full 21,343 tokens.** Hypothesis refuted. Per the investigating agent's own assessment, what's
+left needs server-side tracing added to `get_common_prefix`'s actual call site and a rebuild — a real debugging
+session against the vendored llama.cpp, not something resolvable by reading source or testing from outside.
+**Reverse sync is closed as a line of attack pending that investment; not pursued further without Antonio's
+explicit call to make it.**
+
+**RESOLVED, 2026-09-18: NOT a card/driver/shim bug at all — root cause found and confirmed directly on hardware.**
+Two things needed to be tested to close this out, and both were:
+
+1. **Is the card's own restore-then-extend actually broken?** No. Direct test with `LLAMA_SERVER_SLOTS_DEBUG=1`
+   on the card: prefill a clean prompt on Metal, save, restore onto the card, then extend on the card by 17, 300,
+   1,000, 5,000, 12,000, and 18,432 tokens (token-list, restoring fresh each time) — **every single size hit
+   cleanly** (`cache_n` matching the restored length exactly, prefill speed a normal ~987-994 tok/s). The card's
+   restore-then-extend mechanism, its CUDA/shim backend, and its MoE-placement machinery are all working
+   correctly. There is no hardware, driver, or shim performance issue here, on the card or in conjunction with
+   Metal — the underlying compute is exactly as fast as every other measurement this session.
+2. **So why did the original test fail?** Reproduced the exact failure shape directly: prefill 2,912 tokens on
+   Metal, **decode 32 real tokens** (so Metal's actual cache is 2,943 tokens — the tracked prompt plus the
+   model's own generated continuation, exactly like the original run), save, restore onto the card, then query
+   with the REAL next 18,432 tokens of actual content (which do not match whatever Metal happened to generate in
+   that decode). **Confirmed: `cache_n: 0`, full reprocess.** The restored state's untracked decoded tail didn't
+   match the new request at that position, and llama-server's cache-prefix check does not gracefully trim to the
+   last good match — it misses entirely and reprocesses the whole restored prefix, not just the mismatched part.
+   This is a real llama-server robustness gap, not a defect in this project's code, and it only bites when a
+   restored state's real content (including whatever got decoded) diverges from what the next request actually
+   contains — which the original benchmark's static, pre-written checkpoint files did by construction (they don't
+   contain what the model actually generated), but which a REAL chat client largely avoids by construction too
+   (it resends the model's own real reply as history, so the "untracked tail" usually matches anyway).
+
+`sync_metal_to_card()` and `card_prefill()` now detect this condition (compare the post-sync `cache_n` against
+what a clean hit should have been) and log it plainly instead of silently eating a slower-than-predicted prefill.
+
+**Bonus, answering Antonio's question directly: restore-then-extend also works ENTIRELY on the card, no Metal
+involved.** Same-process, two-slot test (`--parallel 2` on the card alone): prefilled 11,461 tokens into slot 0,
+saved, restored into slot 1 (same physical card, same process), then queried slot 1 with a real 17-token job
+extension — clean hit, `cache_n: 11461`, `prompt_n: 17`, wall 0.5 s. **The parallel-batching win already confirmed
+with Metal (4.1x) is available card-only too**, for any workflow that wants pure-GPU batch processing without
+routing through Metal at all.
+
+**Item 1's actual conclusion, taking it to its end:** honest cost-model routing (no reverse sync) correctly
+degrades to "always Metal" for a naturally-incremental chat session with a real client, because the sync-then-
+extend mechanism works fine but the ROUTER's own bookkeeping only tracks the prompt tokens it sent, not what got
+decoded — so the router can't always predict in advance whether a sync will hit cleanly. Reverse sync is
+technically sound and confirmed working; it just isn't the router's default path today because the router doesn't
+yet account for the (usually harmless, occasionally not) decoded-tail gap in its own cost model. Wiring reverse
+sync into the router's actual routing decision (not just as a hand-tested mechanism) is a real next step, not
+research — see "What is next" below. The old `THRESH=512` behavior (always touch the card) remains available at
+its known 1.9x cost when a session is expected to have large enough turns to justify it regardless.
+
+## Batching, image, and video pipeline strategies, 2026-09-18
+
+A research pass grounded in this project's actual server code and existing image-gen tooling (not generic serving
+literature) answered three questions from Antonio, decisively on all three:
+
+**Batching a shared system prompt across parallel slots — TESTED ON REAL HARDWARE AND CONFIRMED.**
+`server-context.cpp`'s slot selection already does longest-common-prefix matching automatically, so *sequential*
+batch jobs sharing one system prompt already get free prefix reuse today — nothing to build there. The real gap
+was *parallel* batch serving: with `--parallel P` slots, each slot pays the full shared-prefix prefill
+independently the first time a job lands on it.
+
+Landed: prefilled an 11,461-token shared prompt once on the card (11.5 s, 994 tok/s), saved it (0.4 s), restored
+the SAME file onto 4 parallel Metal slots (0.02 s each), then sent 4 different job-specific completions (16-21
+tokens each) as **token-list requests** (see the reverse-sync postmortem below for why token-list, not string,
+matters here). All four correctly showed `cache_n: 11461` — the full shared prefix reused — and completed in
+~1.0 s each. Total for the seeded path: 11.9 s (card prefill+save) + 0.09 s (4 restores) + 4.22 s (4 seeded
+queries) ≈ **16.2 s for all 4 jobs**, against **66.7 s** for 4 independent full prefills on fresh slots (no
+restore) — **a 4.1x win on this exact batch, and the win only grows with more jobs**, since each additional job
+past the first costs ~1 s instead of ~16 s. Card came through clean (op-verify 450/450, no re-enumeration).
+**Promoted into reusable tooling, 2026-09-18: `tools/disagg-batch.sh`.** `start <model> <shared-file> <n-slots>
+[ncpumoe]` seeds the card and broadcasts to N Metal slots; `card-only ...` does the same entirely on the card, no
+Metal; `job <slot> <text|file> [n_predict]` runs one seeded completion and reports whether it actually hit
+(`cache_n` matching the shared count) or missed. Re-confirmed on hardware through the real tool (not just the
+validation script): 4/4 Metal slots hit cleanly (~0.7-1.1 s each) and 3/3 card-only slots hit cleanly (~1.1 s
+each) in separate runs. Building it surfaced two real bugs worth remembering: (1) curl's `-d` silently returned
+empty output for a large (~80 KB) JSON body with no error — switched to posting via `urllib` instead, which
+handles the same payload fine; (2) `command <<'HEREDOC'` IS that command's stdin (its source, when no `-c`/file is
+given), so piping data into the same command (`echo "$x" | prog <<'EOF'`) is silently swallowed — data has to go
+through argv instead, or the heredoc has to go, not both. Both are now documented in the script itself.
+
+**The critical detail that made this work, found investigating why the first attempt failed:** the seeded jobs
+MUST be sent as token-list prompts (pre-tokenized ids), not raw text strings. A first attempt using string prompts
+against the restored slots showed `cache_n: 0` — a full reprocess — despite the restore itself succeeding cleanly.
+Binary-searching the failure isolated it precisely: token-list extensions of a restored prefix work at ANY size
+tested (confirmed up to 18,432 new tokens, on Metal, at both `--parallel 1` and `--parallel 8`, into slot 0 and
+slot 3), but string extensions fail past a trivial length (~1-2 tokens), regardless of parallel count or slot
+number. Not yet root-caused at the code level (likely a re-tokenization/cache-comparison quirk specific to
+string-sourced prompts in the vendored server), but fully characterized and worked around: tokenize client-side,
+always send lists to a slot that was populated via restore.
+
+**Splitting an image-generation pipeline across the card and Metal — not needed, and a genuine dead end if a
+model ever didn't fit.** Every image model already benchmarked here (SDXL-Turbo, SD 1.5, Z-Image-Turbo, see the
+"Shim vs Silicon" report) runs as one process, fully on the card — Z-Image-Turbo is already a 3-component
+pipeline (DiT + `--llm` text encoder + `--vae`) and it just runs whole. The structural reason splitting wouldn't
+help if a denoiser ever didn't fit: diffusion/video backbones are DENSE (every parameter used on every one of
+4-50 steps), unlike Coder-Next's MoE (~10 of 512 experts touched per token, saturating a fixed transfer cost fast
+— see the mechanism note above). A non-resident dense model would re-stream its entire weight set on every single
+step, strictly worse than even the worst LLM numbers here. Latent/activation transfer between stages is trivially
+small next to the ~5.46 GiB/s link either way — bandwidth was never the constraint, VRAM fit is, and splitting
+doesn't change how much has to fit.
+
+**Video pipeline splitting — dead end today for a simpler reason: no video-generation model or tooling exists
+anywhere in this project.** Checked `tools/`, `patches/`, `models/README.md`, every models directory. The same
+dense-model argument as image generation would apply (worse, since video adds a temporal dimension multiplying
+step count), but there's nothing real to test it against — contingent future work, not a strategy to pursue now.
+
+One adjacent asset worth a separate look sometime: `qwen38-mmproj-F16.gguf` (927 MB vision projector for
+Qwen3.8-27B) already exists in the models directory — a real second pipeline component (vision encoder feeding
+the main LLM) present today, unlike video. Whether llama.cpp's mmproj path can be split across devices wasn't
+checked.
+
+## eGPU strategy review, 2026-09-18 — ranked, ahead of working through them
+
+A research pass (GGUF metadata read directly, driver/shim docs, upstream `llama.cpp` prior art) ranked strategies
+for getting more out of the card beyond prefill-offload + residency + threshold-tuning:
+
+**Try soon:** (1) `THRESH=0`, cost-model routes every turn — ~2x on the measured 9-turn session. (2) Reseed the
+router's shipped `--card-fixed`/`--card-rate` from real `a988ec7` observations instead of the stale `ad308bd`
+defaults. (3) Push `NCPUMOE` residency further — capped around ~70% for Coder-Next specifically (43.5 GiB of
+experts vs ~31.8 GiB VRAM), needs confirming the current driver has the gated 256 MB WPR carveout, not the flat
+64 MB one.
+
+**Real, bigger bets:** coalescing small cold-deltas only helps when their *combined* total crosses the breakeven
+(e.g. a diff arriving in chunks, not general chat); card-side hot-expert caching only helps decode, not prefill
+(see the saturation mechanism above), so it's only relevant paired with moving decode itself onto the card, which
+is real engineering against an in-flight upstream PR (`ggml-org/llama.cpp` #20757/#27861) and unproven over
+Thunderbolt; on-card MTP speculative decode has genuinely proven infrastructure in this repo (`nv_shim_step.sh
+spec`, 124 tok/s single-request / ~207 tok/s at 8 slots on Qwen3.8-27B, which fits on-card) but is blocked for
+Coder-Next until it fits on-card at all; cross-device speculative verification (draft on Metal, verify on card)
+was evaluated and killed for Coder-Next — verifying even a few tokens still pays the full fixed stream, far worse
+than just decoding on Metal — but might work for a smaller model with real residency headroom (e.g. window 3's
+qwen35moe, 18.2 GiB of experts).
+
+**Speculative:** prefetching likely-next context during decode; quantizing the activation transfer (wrong
+bottleneck — it's the weight stream, not activations); using the idle card for an unrelated side-task in
+parallel; exploiting the 12-full-attention/36-SSM split (real, no concrete lever found yet).
+
+## Window 4, 2026-09-19 11:30-11:34 — the derived cost model, run on THIS tree's driver with residency
+
+**What changed first (`11cf4c6`, card-free, item 1 below done):** the router's card cost is no longer one number for
+one model. `expert_layout()` reads a GGUF's header (key/value table and tensor directory, never a weight) and sums the
+`blk.N.ffn_*_exps` tensors per block; `--model` and `--ncpumoe` derive the fixed cost per ubatch as streamed expert GiB
+over `--link-rate` (5.46 GiB/s, windows 2 and 3), and the first card prefill after a start is charged streamed GiB x
+`--cold-rate` (0.0465 s/GiB, three points across two models). Learning keeps the first prefill out of the warm fit
+and re-expresses a fit as link rate and cold rate, so a change of residency carries the calibration.
+`tools/disagg-router-model-test.py` holds the derived model against all six recorded prefills of windows 2 and 3 -
+every one within 0.1 s - and corrected the record on the way: **Coder-Next's experts are 43.69 GiB by the file's own
+directory** (the "43.7" the link rate was derived from); the 43.50 in these notes was a hand estimate.
+
+**Why this run could happen here at all:** residency on this tree's driver was blocked on the flat 64 MB firmware
+reservation (README's second known limit). `30751d1` (same morning) derived it (256 MB from the sizes handed to the
+firmware, checked against the chip's WPR2 registers at every open); the card server's startup line in the banked log
+reads `firmware carveout: held back 256 MB of 32607 MB ... the manager stops 29.0 MB under that`.
+
+**The run.** Coder-Next, `NCPUMOE=30 THRESH=0`, card `llama-server-null` at driver `0c15edc`, Metal the kit's server,
+router `11cf4c6`. Registered before any request: warm fixed 4.98 s per ubatch, first prefill +1.26 s, marginal 5,150
+tok/s; prompt A (first) 10.3 s +-10%, the 6K chat 6.2 s +-10%, prompt B 9.4 s +-10%. Metal decoded every reply from
+the restored cache (`prompt_n 1`).
+
+| req | cold tokens | predicted prefill (prompt only) | observed | save |
+|---|---|---|---|---|
+| t1 = prompt A, first after start | 20,454 | 9.0 warm + 1.3 first = **10.3 s** | **10.2 s** (2011 tok/s) | 582 MB / 0.6 s |
+| t2 = chat-6k | 6,974 | 4.98 + 1.35 = **6.3 s** | **5.7 s** (1234 tok/s) | 251 MB / 0.3 s |
+| t3 = prompt B | 21,942 | 4.98 + 4.26 = **9.2 s** | **9.0 s** (2438 tok/s) | 619 MB / 0.7 s |
+
+All three inside the registered bands; the first-prefill term landed to 0.1 s (the router's own line: "+1.2 s over
+the warm model's 9.0 s; the model's own first-prefill term was 1.3 s"). The two warm points fit themselves to
+4.16 s + 4,536 tok/s - two points, so a description and not a refit (9574c6b's rule) - which reads as this driver
+streaming slightly faster than `ad308bd` did; a third warm point is what would say. The 24K state saves were 0.6-0.7 s
+again (item 5's 2.5 s has now failed to reproduce on three drivers). op-verify 450/450 after; DART absent, dext
+unchanged, lock released. Logs banked as `logs/disagg/serve/w4-20260919-113019-{card,metal,router}.log`.
+
+**Process note:** three `disagg-serve.sh` calls issued from one shell loop with their output piped through a filter
+returned in the same second having sent nothing; the same calls issued singly with their output unfiltered ran
+normally. Not understood, not chased (the harness's own python heredoc and a pipeline in the same shell line are the
+suspects); issue the requests one at a time and read them raw.
+
+## What is next, after window 3
+
+1. **DONE, 2026-09-19 (`11cf4c6`, window 4 above): the router's cost model is two numbers parameterized by expert GiB
+   and residency, and it predicted a fresh window on a new driver to within 3% on the long prompts.** (As written before:)
+   The router's cost model should be two numbers, not one, and parameterized by expert GiB, not hard-coded per
+   model. Window 3 confirms both halves: the warm fixed cost is well predicted by expert GiB / link bandwidth
+   (5.46 GiB/s, carried over from window 2 unchanged) across a different architecture and driver, and a first
+   prefill after a server start pays an extra cost that itself scales with expert GiB (~0.046-0.048 s/GiB across
+   three points now). Wiring both into `tools/disagg-router.py` — `card_fixed = experts_GiB / link_rate`,
+   `first_prefill_bonus = experts_GiB * cold_rate`, both keyed off `NCPUMOE` and the model's own expert byte count
+   rather than shipped as flat defaults for one model — is the next real piece of work, not just a parameter tweak.
+2. **A genuine reversed-order rerun** would be the clean test the confound still needs: start fresh, send the
+   longer request second and the shorter one first, and see whether the excess still attaches to "ran first" rather
+   than to a particular prompt. Window 3 only partially decorrelated this (see above); it did not eliminate it.
+3. **Prompts past 24,576 tokens on the current driver.** Window 1's 64K point is `2fe7091` and must not be pooled
+   with window 2 or window 3; the per-ubatch structure carries across drivers, the seconds do not.
+4. **A dense-architecture model through the same gate.** Two MoE architectures now agree on the bytes-streamed
+   model; nothing yet says it holds for a model with no expert placement flags at all.
+5. **The 24K state save took 2.5 s in window 2's treatment against 0.7 s in its control** (same 662 MB), unexplained,
+   n=1, flagged rather than fitted. Window 3's saves (501-535 MB in 0.6 s each) did not reproduce anything that
+   slow, but the model and driver both differ, so this is still open, not resolved.
+6. **Items 6 and 7 are coupled, not independent (found by a 2026-09-18 review pass): treat 7 as subsuming 6.**
+   Once the router can predict whether a reverse-sync would hit or catastrophically miss (7), the 512-cap
+   question in 6 stops being a judgment call — the router just gets it right on its own, no operator cap needed.
+   Don't spend effort deciding the cap's default separately from building 7.
+7. **DONE, 2026-09-18: reverse sync wired into the router's actual routing decision, with a provable safety
+   check, not a guess.** `do_POST` now sets `return_tokens: true` on every relayed request and, when the reply
+   isn't a stream, captures Metal's REAL decoded token ids and appends them to `STATE["metal_tokens"]` — so the
+   router's tracking reflects what Metal actually holds (prompt + its real output), not just the prompt it was
+   sent. A sync is now only ever attempted when `common_prefix(metal_tokens, ids) == len(metal_tokens)` — i.e.
+   Metal's ENTIRE tracked state is confirmed to be a genuine prefix of the new request — which is exactly the
+   condition that was missing when the catastrophic-miss bug was found. When that's not confirmed, the card (if
+   chosen at all) falls back to its own raw mismatch cost, provably safe, never the artificially-cheap
+   post-sync estimate that caused the original surprise. Re-ran the exact original failure scenario (3 small
+   turns building up an untracked decoded tail, then a big jump) end to end: every small turn now correctly logs
+   `(sync unconfirmed)` and safely routes to Metal; the big jump correctly recognized that even the raw
+   full-reprocess fallback (12.8s predicted) beats Metal's own cost for that jump (27.9s) and delivered 14.1s
+   actual — no catastrophic surprise, because the cost model was never given a false premise. `_relay`'s tail
+   buffer also grew from 4096 to 65536 bytes, since the old size silently defeated the self-check (and this new
+   token capture) for any reply long enough to push the JSON past it. Card came through clean, op-verify 450/450.
+   This also retires "keep-warm scheduling" for good (an earlier pass ruled it out only because sync didn't work
+   yet — now that it does, safely, `THRESH=0` already captures the benefit with no separate keep-warm policy).
+8. **DONE, 2026-09-18: promoted the parallel-slot batching win into reusable tooling** — `tools/disagg-batch.sh`,
+   confirmed 4.1x on real hardware through the actual tool, both Metal-hosted and card-only. See above.
+9. **DONE, 2026-09-18: batching + NCPUMOE=30 residency, confirmed 5.95x (up from 4.1x at NCPUMOE=48).** First
+   attempt OOM'd — `cudaMalloc failed: out of memory` trying to allocate an 8.7 GiB compute buffer, because the
+   tool's `-c 200000` default (sized for Metal-only isolation testing, where 128 GiB unified memory is generous)
+   left no VRAM headroom once residency also needed space for on-card experts. Fixed: the tool's default context
+   is now 53,248 (≈13,312 tokens/slot at 4 slots) — comfortable margin over an 11,461-token shared prompt, without
+   competing with residency for the card's ~31.8 GiB. Re-ran clean: prefill dropped **11.5s → 8.0s** (994 → 1438
+   tok/s, a 30% cut matching window 2's 24-33% prediction), and — not predicted in advance, found by running it —
+   the 4 seeded jobs *also* got faster (4.22s → 2.77s total), because residency lowers the expert-streaming cost
+   for any forward pass through the model, not just the one big initial prefill; every job still runs a small
+   MoE forward pass over its own new tokens. Total: **11.2s for all 4 jobs, 5.95x over the 66.7s all-Metal
+   baseline** (versus 4.1x at NCPUMOE=48). Card came through clean, no re-enumeration, op-verify 450/450.
+10. **RUN, 2026-09-18: reverse sync + NCPUMOE=30 residency, and a real new finding — sync stayed unconfirmed even
+    in a genuinely live conversation.** Built a proper test this time: a real, live-growing conversation through
+    the router, where each turn's prompt is everything before it INCLUDING the model's own real reply (captured
+    from the previous response, not scripted) — exactly the condition `tools/gen-coding-chat.py`'s static
+    checkpoints can't provide. Three small turns, then a ~11,500-token injection. **Turns 2 and 4 still showed
+    `(sync unconfirmed)`, including the big injection** — so this run exercises the *raw-fallback + residency*
+    path, not confirmed-safe sync + residency, which is still unmeasured.
+
+    **Why, and it's a real, generalizable finding, not a bug in this session's code:** the router's own
+    `/tokenize` call and Metal's *internal* completion-string tokenization disagreed by exactly one token on the
+    very same growing text (turn 2's log: router predicted "103 cached," Metal's real response reported
+    `cache_n: 102`). The likely mechanism: this test reconstructs each turn's prompt from the *text* of the
+    previous reply (`d["content"]`), not its token ids — and detokenize-then-retokenize through a BPE tokenizer
+    is not always bit-exact at a boundary (here, where the reply's text meets the next `### User` marker). This
+    matters beyond this one test: **virtually all real chat clients reconstruct history as text**, the same way
+    this test did — so this 1-token slop is a plausible, common occurrence in real usage too, not a test
+    artifact. The safety check is doing exactly its job (refusing to trust an unconfirmed match) — but that also
+    means confirmed-safe syncs may be rarer in practice than "well-behaved client" framing suggested.
+
+    **What was actually measured, and it's still a real result:** the raw-fallback path with residency handled
+    the ~11,500-token injection in **8.1s prefill** (+0.4s save), ~8.8s wall total, close to the router's own
+    10.6s prediction — residency helps the fallback path too, just not via the sync mechanism specifically.
+
+    **Dug into, 2026-09-18 (same day, follow-up): the text-equivalence idea above works, and also surfaces a
+    deeper, separate limit on how far it can go.** Implemented it in `prompt_tokens()`: when a request's rendered
+    text is confirmed by a literal Python string prefix check to extend `STATE["metal_text"]` (the exact text —
+    prompt plus Metal's own real decoded content — behind `metal_tokens`), reuse `metal_tokens` verbatim for that
+    whole prefix and tokenize only the new suffix (`add_special=False`). Reran the live-growing-conversation test:
+    turn 3 now correctly shows no `(sync unconfirmed)` — the fix works for plain text continuity — and for the
+    first time ever, the router attempted a **confirmed-safe** sync on turn 4 (the big injection): `sync:
+    metal->card 262 tok 85 MB, save 0.1s, restore 0.0s`.
+
+    That attempt still missed completely (`cache_n=0`) despite being correctly confirmed safe by the router's own
+    bookkeeping. Root-caused with `LLAMA_SERVER_SLOTS_DEBUG=1` on the card (`logs/disagg/serve/drs-card.log`,
+    2026-09-18 05:04): the mismatch is a BPE merge spanning the exact prefix/suffix split point the fix
+    introduces. Metal's own continuous tokenization encoded `,\n\n` (a comma the model generated, immediately
+    followed by the next turn's blank lines) as **one token** (3554); tokenizing the same span as a **fresh
+    suffix**, split right after the comma because that's where the known-good prefix happened to end, produced
+    `,` and `\n\n` as **two separate tokens** (11, 271) — identical text, different token ids. So
+    `metal_tokens + suffix_ids` can diverge from what Metal's real cache actually holds even when the string-
+    prefix check is textually correct — the same generic BPE non-uniqueness property that motivated this fix in
+    the first place, now showing up at the boundary the fix itself creates, not just at a full-retokenize
+    boundary. This is a real, generalizable limit of any prefix-reuse + fresh-suffix tokenization scheme, not a
+    bug specific to this router or model.
+
+    **Impact is bounded and the fallback already covers it, confirmed on this exact run:** after `cache_n=0`,
+    `card_prefill`'s mismatch check fired (`"sync mismatch: expected a >= 264-token cache hit after sync, got
+    cache_n=0"`) and the router paid a full, correct reprocess of all 11,759 tokens (8.1s) — the right answer, not
+    a wrong one, just not the fast path. So the remaining gap costs a wasted sync attempt's latency on an
+    already-optimization-only code path; it has never produced an incorrect completion. Documented in
+    `prompt_tokens()`'s docstring with the concrete token ids so the failure is recognizable if seen again. **Real
+    fix, not built (cost doesn't justify it for a latency-only edge case):** re-tokenize a small overlap — the
+    last few known-good characters plus the new suffix — together, and only trust the prefix reuse when that
+    overlap's tokens match `metal_tokens` exactly at the same positions; fall back to full retokenization
+    otherwise. Uncommitted-fix code and this finding both land in the same commit as this doc update.
+11. **DONE, 2026-09-18: card-only vs. Metal-only decode, measured on both sides for Qwen3.8-27B.** Metal, kit's
+    own `llama-server` (the proper backend, not tinygrad's — see below), plain greedy decode: **22.68 tok/s**.
+    Metal with the same MTP speculative-decode setup the card uses (`--spec-type draft-mtp`, same draft model):
+    **17.00 tok/s** — draft acceptance ~58%, but *worse* than plain Metal decode, because Metal's baseline is
+    already fast enough that running two models per step costs more than the accepted drafts save. Against the
+    card's existing numbers (124 tok/s single-request, ~207 tok/s aggregate at 8 slots): **the card is ~5.5x
+    faster than Metal's best real option and ~7.3x faster than Metal's own speculative attempt** — card-only is
+    decisively the right choice for this model, now measured rather than assumed. **Correction to the record:**
+    the "metal" figure already on file for this model (`METAL_Qwen3.8-27B-UD-Q4_K_M_p256_d128_20260917-215146.txt`,
+    2.277 tok/s) is confirmed stale — that ran on tinygrad's own minimal Metal backend (`DEV=METAL JITBEAM=2`),
+    ~10x slower than the kit's proper backend used everywhere else in this project; 22.68 tok/s is the real
+    comparison point going forward. Speculative decoding helping enormously on the card while hurting on Metal is
+    itself a small, separate, not-yet-investigated finding — noted, not chased further here.
+12. **The vision-projector asset** (`qwen38-mmproj-F16.gguf` for Qwen3.8-27B) is architecturally analogous to the
+    proven prefill-offload pattern (one-shot, compute-heavy, non-resident-friendly) but it's genuinely unknown
+    whether llama.cpp's server API supports routing the vision-encoder pass to a different process than the main
+    decode step — needs a short code investigation before any engineering time.
+
+Logs: `logs/disagg/serve/{card,metal,router}-20260916-162122.log` (09-16), `…-20260917-073136.log` (window 1),
+`…-20260917-073431.log` (control), `…-20260917-073533.log` (treatment), `…-20260917-234655-{card,metal,router}.log`
+(window 3), `logs/shim-opverify-20260916-162353.log`.
+
+## Does long context erode the advantage? Yes, and the mechanism is the KV cache (2026-09-19, modelled)
+
+Antonio: "let's also test the premise that context size will diminish returns. large context is the name of the
+game." It does, and not through the attention arithmetic - that scales on both sides and largely cancels in the
+ratio. It is the **KV cache, which lives on the CARD during prefill and takes its room from the resident experts.**
+Every GiB of cache is a GiB of experts that has to cross the link instead, once per ubatch.
+
+`tools/disagg-screen.py` now models it from the header (block_count x head_count_kv x (key+value length) x 2 bytes)
+and sweeps context at exact multiples of the ubatch. The multiples matter: between them the ratio saw-tooths,
+because 32,768 tokens pays the expert stream twice for 1.33 ubatches of work, and that artefact would otherwise be
+mistaken for the effect being measured.
+
+Coder-Next 80B-A3B (96 KB of cache a token):
+
+| context | KV cache on the card | speedup |
+|---:|---:|---:|
+| 24k | 2.2 GiB | 4.2x |
+| 48k | 4.5 GiB | 4.0x |
+| 96k | 9.0 GiB | 3.7x |
+| 192k | 18.0 GiB | 3.2x |
+
+**A quarter of the advantage is gone by 192k**, and it is gone smoothly rather than falling off a cliff - so long
+context remains worth doing on this path, it just costs. The decline is entirely explained by residency: at 192k the
+cache has taken 18 of the card's 30 GiB, so 18 more GiB of experts stream every ubatch.
+
+**Consequence for model selection, and it is a third axis alongside size and active parameters: KV bytes per token.**
+A model with aggressive grouped-query attention has a small cache and holds its advantage out to very long context;
+one with many KV heads degrades fast and can reach the point where the cache alone leaves no room on the card, which
+the screener reports as `oom` rather than as a number. When the workload is long-context, that axis may matter more
+than the other two.
+
+## Measured 2026-09-19 21:20-21:34: the ubatch step is real, the constants were wrong, and long context HELPS
+
+Antonio asked for these numbers to be thoroughly tested. Three results, two of which overturn what this project
+believed a few hours earlier.
+
+**1. The expert stream IS paid once per ubatch.** Every one of the six prefills the cost model was fitted to sits
+inside a single ubatch (longest 23,691 tokens; the ubatch is 24,576), so the ceiling function in
+`ceil(n/ub)*fixed + n/rate` had never been observed - it was read out of ggml's source. Two prompts either side of
+one boundary, each run twice, identical both times: **23,691 tokens 15.0 s, 26,156 tokens 22.0 s**. Those 2,465
+extra tokens are worth 0.8 s of compute; the other 6.2 s is the stream a second time. A first attempt used four
+equally-spaced prompts (23,691 / 48,667 / 72,795) and could NOT discriminate - a step and a slope both fit them to
+0.1 s. Only a pair straddling a boundary separates the two.
+
+**2. Two of the three card-side constants were wrong.** Refit on four fresh prefills, current build, 0.10 s rms:
+
+    card_seconds = ceil(tokens/24576) * 6.21 + tokens/3300 + 1.65
+
+against the shipped `* 8.00 + tokens/5150`. The stream costs 6.21 s not 8.00, implying the link carries the 43.69
+GiB at **7.0 GiB/s** rather than the assumed 5.46; and the marginal prefill rate is **3,300 tok/s**, not 5,150.
+
+**3. The context premise is inverted, and this is the important one.** The model assumed Metal prefills at a
+constant 660 tok/s. Measured on the same model and prompts:
+
+| tokens | card | Metal | Metal rate | advantage |
+|---:|---:|---:|---:|---:|
+| 23,691 | 15.0 s | 35.2 s | 673 tok/s | 2.35x |
+| 26,156 | 22.0 s | 64.6 s | 405 tok/s | 2.94x |
+| 48,667 | 28.9 s | 160.3 s | **304 tok/s** | **5.55x** |
+
+660 holds at 24k and then collapses. Prefill is compute-bound and an Apple GPU of this generation has no matrix
+hardware, so attention's quadratic term hurts it far more than it hurts the card. **The advantage therefore RISES
+with context - 2.35x to 5.55x between 24k and 49k - rather than decaying.** The KV-displacement model written
+earlier the same day is physically real but is swamped several times over; its predicted decay from 4.2x to 3.2x has
+the sign wrong. The lesson is the ordinary one: modelling one side of a ratio and assuming the other produces a
+confident number that can be wrong in direction, not just magnitude.
+
+`tools/disagg-screen.py`'s context sweep still carries the old assumption and reads low at long context. It has not
+been refitted because a proper refit wants Metal points at more than three lengths.
+

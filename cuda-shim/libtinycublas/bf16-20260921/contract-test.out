@@ -1,0 +1,44 @@
+# test/cublas_contract.c on the null device (env -u TINYNV_SOCKET -u TINYNV_PCI), 2026-09-21 20:20:07
+## this branch (81b9826, make test's row)
+[tinycudart] libtinynv build 81b9826
+tinynv: no gpu opened, running as a null device: memory is host memory and launches are reported, not executed
+served (SUCCESS on the null device, where launches are reported, not executed):
+  ok   bf16 x bf16 -> f32, COMPUTE_32F (ggml's bf16)    GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+  ok   bf16 x bf16 -> bf16, COMPUTE_32F                 GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+  ok   f16 x f16 -> f16, COMPUTE_16F (ggml's f16)       GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+  ok   f16 x f16 -> f32, COMPUTE_32F                    GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+  ok   f32 x f32 -> f32, COMPUTE_32F_FAST_TF32          GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+refused (NOT_SUPPORTED = 15):
+  ok   f16 x bf16 (mismatched A/B)                      GemmEx 15, StridedBatchedEx 15, BatchedEx 15 (want 15)
+  ok   bf16 x f16 (mismatched A/B)                      GemmEx 15, StridedBatchedEx 15, BatchedEx 15 (want 15)
+  ok   f32 x f16 (mismatched A/B)                       GemmEx 15, StridedBatchedEx 15, BatchedEx 15 (want 15)
+  ok   bf16 with COMPUTE_16F                            GemmEx 15, StridedBatchedEx 15, BatchedEx 15 (want 15)
+  ok   f16 COMPUTE_16F with an f32 C                    GemmEx 15, StridedBatchedEx 15, BatchedEx 15 (want 15)
+  ok   f32 with COMPUTE_64F                             GemmEx 15, StridedBatchedEx 15, BatchedEx 15 (want 15)
+  ok   f32 with COMPUTE_32I                             GemmEx 15, StridedBatchedEx 15, BatchedEx 15 (want 15)
+  ok   bf16 with COMPUTE_32F_FAST_TF32                  GemmEx 15, StridedBatchedEx 15, BatchedEx 15 (want 15)
+
+13 row(s), 0 failure(s)
+rc 0
+
+## the control: the same test linked against main 715b281's libtinycublas (it must fail; libtinynv from this tree)
+[tinycudart] libtinynv build 2dbc56f
+tinynv: no gpu opened, running as a null device: memory is host memory and launches are reported, not executed
+served (SUCCESS on the null device, where launches are reported, not executed):
+  ok   bf16 x bf16 -> f32, COMPUTE_32F (ggml's bf16)    GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+  ok   bf16 x bf16 -> bf16, COMPUTE_32F                 GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+  ok   f16 x f16 -> f16, COMPUTE_16F (ggml's f16)       GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+  ok   f16 x f16 -> f32, COMPUTE_32F                    GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+  ok   f32 x f32 -> f32, COMPUTE_32F_FAST_TF32          GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 0)
+refused (NOT_SUPPORTED = 15):
+  FAIL f16 x bf16 (mismatched A/B)                      GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 15)
+  FAIL bf16 x f16 (mismatched A/B)                      GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 15)
+  FAIL f32 x f16 (mismatched A/B)                       GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 15)
+  FAIL bf16 with COMPUTE_16F                            GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 15)
+  FAIL f16 COMPUTE_16F with an f32 C                    GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 15)
+  FAIL f32 with COMPUTE_64F                             GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 15)
+  FAIL f32 with COMPUTE_32I                             GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 15)
+  FAIL bf16 with COMPUTE_32F_FAST_TF32                  GemmEx 0, StridedBatchedEx 0, BatchedEx 0 (want 15)
+
+13 row(s), 8 failure(s)
+rc 1

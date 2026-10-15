@@ -1,0 +1,87 @@
+=== host: pop-os Wed Sep 23 04:54:01 AM CST 2026; NVIDIA GeForce RTX 3090, 1 MiB, 0 %
+gemm.cu bbb21c8d5c671761 test 0c96438abde17d3e
+--- burst1 #1
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 1 stream(s), no sync between launches
+  BURST PASS: all 8 outputs R <= 2 (worst 0.118), counters all zero
+RESULT: PASS - burst1
+--- burst1 #2
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 1 stream(s), no sync between launches
+  BURST PASS: all 8 outputs R <= 2 (worst 0.118), counters all zero
+RESULT: PASS - burst1
+--- burst1 #3
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 1 stream(s), no sync between launches
+  BURST PASS: all 8 outputs R <= 2 (worst 0.118), counters all zero
+RESULT: PASS - burst1
+--- burst2 #1
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 2 stream(s), no sync between launches
+  burst[0] on stream 1: R 4.43e+05
+  burst[1] on stream 2: R inf (non-finite)
+  burst[2] on stream 1: R inf (non-finite)
+  burst[3] on stream 2: R 4.81e+05
+  burst[4] on stream 1: R 5.39e+05
+  burst[5] on stream 2: R inf (non-finite)
+  burst[6] on stream 1: R inf (non-finite)
+  burst[7] on stream 2: R 4.84e+05
+  BURST FAIL: 8 of 8 outputs over R 2 (worst inf), 0 counter(s) nonzero
+RESULT: FAIL - burst2
+--- burst2 #2
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 2 stream(s), no sync between launches
+  burst[0] on stream 1: R 4.43e+05
+  burst[1] on stream 2: R inf (non-finite)
+  burst[2] on stream 1: R inf (non-finite)
+  burst[3] on stream 2: R 4.81e+05
+  burst[4] on stream 1: R 5.39e+05
+  burst[5] on stream 2: R inf (non-finite)
+  burst[6] on stream 1: R inf (non-finite)
+  burst[7] on stream 2: R 4.84e+05
+  BURST FAIL: 8 of 8 outputs over R 2 (worst inf), 0 counter(s) nonzero
+RESULT: FAIL - burst2
+--- burst2 #3
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 2 stream(s), no sync between launches
+  burst[0] on stream 1: R 4.43e+05
+  burst[1] on stream 2: R inf (non-finite)
+  burst[2] on stream 1: R inf (non-finite)
+  burst[3] on stream 2: R 5.07e+05
+  burst[4] on stream 1: R 4.9e+05
+  burst[5] on stream 2: R inf (non-finite)
+  burst[6] on stream 1: R inf (non-finite)
+  burst[7] on stream 2: R 4.84e+05
+  BURST FAIL: 8 of 8 outputs over R 2 (worst inf), 0 counter(s) nonzero
+RESULT: FAIL - burst2
+--- burst2 #4
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 2 stream(s), no sync between launches
+  burst[0] on stream 1: R 4.43e+05
+  burst[1] on stream 2: R inf (non-finite)
+  burst[2] on stream 1: R inf (non-finite)
+  burst[3] on stream 2: R 5.09e+05
+  burst[4] on stream 1: R 4.9e+05
+  burst[5] on stream 2: R inf (non-finite)
+  burst[6] on stream 1: R inf (non-finite)
+  burst[7] on stream 2: R 4.84e+05
+  BURST FAIL: 8 of 8 outputs over R 2 (worst inf), 0 counter(s) nonzero
+RESULT: FAIL - burst2
+--- burst2 #5
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 2 stream(s), no sync between launches
+  burst[0] on stream 1: R 4.35e+05
+  burst[1] on stream 2: R inf (non-finite)
+  burst[2] on stream 1: R inf (non-finite)
+  burst[3] on stream 2: R 4.81e+05
+  burst[4] on stream 1: R 5.39e+05
+  burst[5] on stream 2: R inf (non-finite)
+  burst[6] on stream 1: R inf (non-finite)
+  burst[7] on stream 2: R 4.84e+05
+  BURST FAIL: 8 of 8 outputs over R 2 (worst inf), 0 counter(s) nonzero
+RESULT: FAIL - burst2
+no_reset lines changed: 1
+--- no_reset mutant, burst1
+BURST: entered - 8 split GEMMs m=2048 n=32 k=2048 S=8, one workspace, 1 stream(s), no sync between launches
+  burst[0] on stream 1: R 0.0958
+  burst[1] on stream 1: R inf (non-finite)
+  burst[2] on stream 1: R inf (non-finite)
+  burst[3] on stream 1: R inf (non-finite)
+  burst[4] on stream 1: R inf (non-finite)
+  burst[5] on stream 1: R inf (non-finite)
+  burst[6] on stream 1: R inf (non-finite)
+  burst[7] on stream 1: R inf (non-finite)
+  BURST FAIL: 7 of 8 outputs over R 2 (worst inf), 32 counter(s) nonzero
+RESULT: FAIL - burst1

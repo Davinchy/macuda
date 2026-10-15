@@ -1,0 +1,6 @@
+Mon Sep 21 08:37:37 PM CST 2026
+NVIDIA GeForce RTX 3090, 580.126.18
+Build cuda_13.0.r13.0/compiler.36424714_0
+ddcacf3c52df09c01d3f32bae7a99b523006f5cbdcb9fd8b8bf7320bd14b36b8  gemm_sm86.cubin
+ddedbafabbd252fb7766b8904faa3feff87ca13f82be96ebb580a4626bef3a7d  gemm_sm120.cubin
+b5b2da1a4ebb8ea68dcb006babde6e8722b4af9caaea5bb01f9503830b3d397d  gemm_committed.cubin

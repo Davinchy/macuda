@@ -1,0 +1,133 @@
+// The kernel descriptor: what a launch actually is.
+//
+// A launch is not a command stream. The command stream carries two methods - here is a descriptor, go run it - and
+// everything about the kernel lives in a 384 byte block in memory that those two methods point at. Grid and block
+// dimensions, where the code is, where its constant buffers are, how many registers each thread wants, which caches to
+// invalidate first, and which semaphore to release when it finishes: all of it is bitfields in that block, and several
+// of them do not start on a byte boundary.
+//
+// The field positions come from the generator, never from reading a header, for the same reason the registers do. What
+// is transcribed from the python oracle is the far smaller question of which fields a launch sets and to what, and that
+// is what test_qmd compares byte for byte.
+#ifndef TINYNV_QMD_H
+#define TINYNV_QMD_H
+#include <stdint.h>
+#include "nv_regs.h"
+
+#define TINYNV_QMD_CONSTBUFS 8
+// The descriptor occupies 384 bytes but sits in a 256-aligned slot, and constant buffer 0 follows it in the same one.
+#define TINYNV_QMD_SLOT_BYTES ((TINYNV_QMD_BYTES + 0xff) & ~0xff)
+#define TINYNV_QMD_RELEASES 2
+// Constant buffer 0 holds the driver's own parameters and then the kernel's. Blackwell's driver params reach index 223,
+// so the buffer is at least this long whatever the kernel asks for.
+// The most shared memory one block can have, measured on a GB202 rather than quoted: 100,352 bytes was written and read
+// back word for word, and 131,200 - what ggml's flash attention asks for - was accepted into the descriptor and then
+// never scheduled. A carveout the hardware cannot provide is not refused; the launch simply never completes.
+//
+// This is the single place that number lives. The descriptor's configuration ladder tops out here, the refusal above it
+// quotes it, and tinynv_device_props reports it, so the driver and anything built on it cannot disagree about it. It is
+// a per-block figure and not the memory a core has: consumer Blackwell has 128 KB of L1 and shared per core and makes
+// this much of it available to a block. 228 KB is Hopper and does not belong here.
+#define TINYNV_SMEM_MAX_PER_BLOCK (100 * 1024)
+
+#define TINYNV_QMD_CBUF0_MIN_DWORDS 224
+// Ampere keeps the driver's parameters at the START of the bank instead, so it needs only twelve dwords: the two
+// windows and the trap address, at [6:12]. From the oracle, and confirmed against descriptors captured off a 3060.
+#define TINYNV_QMD_V3_CBUF0_MIN_DWORDS 12
+// Where the launch geometry lives inside those driver parameters, measured on a 5090 rather than read from a header:
+// blockDim at word 216 and gridDim at word 220, each three words. See tinynv_qmd_cbuf0.
+#define TINYNV_CBUF0_NTID 216
+#define TINYNV_CBUF0_NCTAID 220
+// And Ampere's, which are at the very bottom of the bank: blockDim at dword 0 and gridDim at dword 3, leaving dwords
+// 6..11 for the two windows and the trap address exactly where the oracle puts them, with nothing overlapping.
+//
+// MEASURED, not assumed, and not from a header. The dims kernel loads its own geometry from constant bank 0 at offsets
+// the compiler chose, so the offsets are IN ITS SASS: nvdisasm of spike/dims.cu built for sm_86 stores c[0x0][0xc] to
+// p[0] (gridDim.x) and c[0x0][0x0] to p[3] (blockDim.x), and computes its block index from c[0x0][0xc] and c[0x0][0x10]
+// as gridDim.x and .y. The same reading of the sm_120 build returns 0x360 and 0x370 - dwords 216 and 220, the two
+// numbers above, which were originally found by filling the region with markers on real hardware. A method that
+// reproduces the known answer for one architecture is a method worth trusting for the other.
+#define TINYNV_QMD_V3_CBUF0_NTID 0
+#define TINYNV_QMD_V3_CBUF0_NCTAID 3
+
+typedef struct {
+  uint8_t b[TINYNV_QMD_BYTES];
+  // Which bits each field has claimed. Nothing on the GPU reads this; it is here because a byte-for-byte comparison
+  // against a reference built the same way cannot catch two fields being written over each other - the reference makes
+  // the identical mistake and the bytes still agree. A claim on a bit that was already claimed is counted here instead.
+  uint8_t claimed[TINYNV_QMD_BYTES];
+  uint32_t overlaps;
+  // Which descriptor generation this block is. ZERO IS BLACKWELL, deliberately: every caller builds one of these with
+  // memset(0), so the default is the layout this driver had before Ampere existed and no existing call site changes.
+  // The buffer above is sized for the larger of the two, so one array serves both.
+  uint8_t v3;
+} tinynv_qmd_t;
+
+// a field, named by the two bit positions the generator emitted for it
+#define TINYNV_QMD_F(name) TINYNV_QMD_##name##_LO, TINYNV_QMD_##name##_HI
+
+int tinynv_qmd_set(tinynv_qmd_t *q, uint32_t lo, uint32_t hi, uint64_t v);
+uint64_t tinynv_qmd_get(const tinynv_qmd_t *q, uint32_t lo, uint32_t hi);
+
+// What the program itself fixes, the same for every launch of it. Sizes are in bytes; this shifts them where the field
+// wants them shifted, so a caller never has to know which fields are named for a shift.
+typedef struct {
+  uint32_t regs;             // registers per thread, from the cubin
+  uint32_t shmem;            // shared memory the kernel asks for, already rounded the way the oracle rounds it
+  uint32_t slm_per_thread;   // local memory per thread, a property of the device rather than the kernel
+  uint32_t prog_size;        // the kernel's code size, which bounds how much of it is worth prefetching
+  uint32_t sass_version;     // tinynv_sass_version() of the device's sm_version
+  uint32_t barriers;         // hardware barriers the program needs (EIATTR_NUM_BARRIERS); 0 = not declared, granted 1
+  uint32_t constbuf_size[TINYNV_QMD_CONSTBUFS]; // 0 for a bank the program does not use
+  int constbuf_used[TINYNV_QMD_CONSTBUFS];
+  // What the descriptor makes the engine do at the kernel's tail, both the oracle's choice unless a measurement mode
+  // asks otherwise (exec.c, TINYNV_QMD_MEMBAR / TINYNV_QMD_INVALIDATE): the scope of the memory barrier at the end
+  // of the grid (TINYNV_QMD_MEMBAR_* below), and which caches the launch invalidates on entry.
+  int membar;       // TINYNV_QMD_MEMBAR_SYS (the oracle's L1_SYSMEMBAR), _GPU (L1_MEMBAR) or _NONE
+  int invalidate;   // TINYNV_QMD_INVALIDATE_ALL (the oracle's five), _CB0 (only constant bank 0) or _NONE
+} tinynv_qmd_program_t;
+enum { TINYNV_QMD_MEMBAR_SYS = 0, TINYNV_QMD_MEMBAR_GPU = 1, TINYNV_QMD_MEMBAR_NONE = 2 };
+enum { TINYNV_QMD_INVALIDATE_ALL = 0, TINYNV_QMD_INVALIDATE_CB0 = 1, TINYNV_QMD_INVALIDATE_NONE = 2 };
+
+// What changes per launch: the shape, and the addresses that are only known once memory is allocated.
+typedef struct {
+  uint32_t grid[3], block[3];
+  uint64_t program_addr;
+  uint64_t constbuf_addr[TINYNV_QMD_CONSTBUFS];
+  int constbuf_set[TINYNV_QMD_CONSTBUFS];
+} tinynv_qmd_launch_t;
+
+uint32_t tinynv_sass_version(uint32_t sm_version);
+
+int tinynv_qmd_program(tinynv_qmd_t *q, const tinynv_qmd_program_t *p);
+int tinynv_qmd_launch(tinynv_qmd_t *q, const tinynv_qmd_launch_t *l);
+// Releases a semaphore when the kernel finishes. There are two slots; this takes the first free one and returns which,
+// or -1 when both are taken and the caller has to fall back on a release in the command stream.
+int tinynv_qmd_release(tinynv_qmd_t *q, uint64_t addr, uint64_t payload, int timestamp);
+// Forget both release slots, so that a release attached earlier can be replaced. TINYNV_KERNEL_PROFILE stamps every
+// descriptor as it is built and only learns which one is the chain's tail at the flush, where that slot has to carry
+// the timeline instead. Fields are replaced, not OR-ed, so the descriptor is exactly as if it had never released.
+int tinynv_qmd_release_clear(tinynv_qmd_t *q);
+// Set the scope of the barrier at the end of the grid after the fact (TINYNV_QMD_MEMBAR_*): a descriptor that
+// releases the timeline must publish its writes system-wide whatever the measurement mode asked of the others.
+int tinynv_qmd_membar(tinynv_qmd_t *q, int membar);
+// Check one link of a chain: that it releases `want_payload`, and that it schedules the descriptor at `next_va` - or
+// nothing at all, when next_va is zero and this is the last link. Returns 0, or -1 with *why set to a reason.
+// `releases` says which shape this chain is in: 1 for the shipping one, where every link reports its own completion,
+// and 0 for a link in a tail-only chain, which must NOT release - a check that accepted either would prove nothing
+// about the shape actually built, and the two have different failure modes.
+int tinynv_qmd_link_check(const tinynv_qmd_t *q, int releases, uint64_t want_payload, uint64_t next_va,
+                          const char **why);
+// Chains one launch onto another: the previous descriptor starts this one itself, so the second launch costs no methods.
+// Chain `prev` to the descriptor at `next_qmd_addr`, so finishing schedules it. `prefetch` fetches that descriptor
+// early: what the oracle does, and the first thing to turn off when a chain is not being scheduled at all.
+int tinynv_qmd_chain(tinynv_qmd_t *prev, uint64_t next_qmd_addr, int prefetch);
+
+// Constant buffer 0's driver parameters, which are where a kernel finds the windows its shared and local memory live in.
+// Returns how many dwords were written, or 0 if the buffer is too short for them.
+// `grid` and `block` may be NULL, which leaves the geometry words zero - which is what the python oracle produces, and
+// what the byte-for-byte comparisons against it therefore expect.
+uint32_t tinynv_qmd_cbuf0(uint32_t *out, uint32_t cap, int v3, uint64_t shared_window, uint64_t local_window,
+                          const uint32_t grid[3], const uint32_t block[3]);
+
+#endif
