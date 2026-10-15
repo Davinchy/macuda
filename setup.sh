@@ -10,6 +10,9 @@
 # Environment: LLAMA_SRC / SD_SRC name a local clone to copy from instead of GitHub; JOBS caps the parallel build (default:
 # all cores). The device compile needs nvcc, which is Linux-only: set TINYCC_HOST / TINYCC_KEY to use a Linux box over ssh,
 # or leave them unset and it runs in a CUDA container on this Mac (see cuda-shim/build/tinycc, and install.sh).
+# PORTABLE BINARIES for another Mac: GGML_NATIVE=OFF GGML_CPU_ARM_ARCH=armv8.4-a+dotprod (every Apple Silicon chip; native
+# on an M4 adds i8mm and SME, which an M1 does not have) LLAMA_OPENSSL=OFF (no Homebrew OpenSSL dylib to carry along)
+# MACOSX_DEPLOYMENT_TARGET=14.0 (the default is this Mac's macOS). Re-run llama, then link, after changing them.
 # ARCH picks the card the shim, CUDA and link steps build for: sm_120a (the default: Blackwell, the RTX 50 series) keeps
 # today's layout exactly - build/shim, build/bin, libggml-cuda.a. Any other (sm_89 for Ada, the RTX 40 series; sm_86 for
 # Ampere) builds beside it, never over it: build/shim-<arch>, libggml-cuda.<arch>.a, build/bin-<arch>, with that
@@ -58,8 +61,8 @@ llama() {
   # CPU-only, static, no Metal: the shim replaces the CUDA backend at link time, and every other backend must be absent
   mkdir -p llama.cpp/build-null
   cmake -S llama.cpp -B llama.cpp/build-null -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-    -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=ON -DGGML_NATIVE=ON -DLLAMA_CURL=OFF \
-    -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_OPENSSL=ON > llama.cpp/build-null/cmake.log 2>&1 || { tail -20 llama.cpp/build-null/cmake.log; exit 1; }
+    -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=ON -DGGML_NATIVE=${GGML_NATIVE:-ON} ${GGML_CPU_ARM_ARCH:+-DGGML_CPU_ARM_ARCH=$GGML_CPU_ARM_ARCH} -DLLAMA_CURL=OFF \
+    -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_OPENSSL=${LLAMA_OPENSSL:-ON} > llama.cpp/build-null/cmake.log 2>&1 || { tail -20 llama.cpp/build-null/cmake.log; exit 1; }
   cmake --build llama.cpp/build-null -j"$JOBS" --target test-backend-ops llama-bench llama-simple llama-speculative-simple llama-server llama-mtmd-cli \
     > llama.cpp/build-null/build.log 2>&1 || { tail -30 llama.cpp/build-null/build.log; exit 1; }
   echo "llama.cpp/build-null built"
@@ -72,7 +75,7 @@ sd() {
     && git -C stable-diffusion.cpp apply ../patches/stable-diffusion.cpp-upstream-ggml.patch && echo "patch applied" || echo "patch already applied (or does not apply — check git -C stable-diffusion.cpp status)"
   mkdir -p stable-diffusion.cpp/build-null
   cmake -S stable-diffusion.cpp -B stable-diffusion.cpp/build-null -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_SHARED_LIBS=OFF \
-    -DGGML_METAL=OFF -DGGML_NATIVE=ON > stable-diffusion.cpp/build-null/cmake.log 2>&1 || { tail -20 stable-diffusion.cpp/build-null/cmake.log; exit 1; }
+    -DGGML_METAL=OFF -DGGML_NATIVE=${GGML_NATIVE:-ON} ${GGML_CPU_ARM_ARCH:+-DGGML_CPU_ARM_ARCH=$GGML_CPU_ARM_ARCH} > stable-diffusion.cpp/build-null/cmake.log 2>&1 || { tail -20 stable-diffusion.cpp/build-null/cmake.log; exit 1; }
   cmake --build stable-diffusion.cpp/build-null -j"$JOBS" --target sd-cli > stable-diffusion.cpp/build-null/build.log 2>&1 || { tail -30 stable-diffusion.cpp/build-null/build.log; exit 1; }
   echo "stable-diffusion.cpp/build-null built"
 }
