@@ -273,6 +273,9 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	   { TINYNV_FAITHFUL=1 $(BUILD)/test_dev $(TRACE) > $(BUILD)/start-reset.out 2>&1; \
 	     if grep -q 'first divergence: line 4: the recording asks bar:-1 at 0x4 (2 bytes) and we never did' $(BUILD)/start-reset.out && grep -q 'card reset anyway' $(BUILD)/start-reset.out; then echo "start reset: in effect (the replay diverges where the reset it adds begins), good"; \
 	     else echo "  FAIL: the default open did not diverge at the start reset - is the reset-on-every-open in this build?"; grep 'divergence' $(BUILD)/start-reset.out | head -3; exit 1; fi; }; \
+	   { TINYNV_UNLOAD=1 TINYNV_FAITHFUL=1 $(BUILD)/test_dev $(TRACE) > $(BUILD)/start-reset-unload.out 2>&1; \
+	     if grep -q 'replay (faithful): [0-9]* of [0-9]* recorded operations reproduced, 0 tolerated, 0 divergences' $(BUILD)/start-reset-unload.out && grep -q 'opens cold without a reset' $(BUILD)/start-reset-unload.out; then echo "start reset: TINYNV_UNLOAD=1 opens cold, the recorded boot exactly (no reset on a board whose reset-on-open does not come back), good"; \
+	     else echo "  FAIL: under TINYNV_UNLOAD=1 a genuine-zero open still reset the card (or the replay diverged)"; grep -E 'divergence|reset' $(BUILD)/start-reset-unload.out | head -3; exit 1; fi; }; \
 	 elif [ -n "$$TINYNV_ALLOW_NO_TRACE" ]; then echo "  (no trace at $(TRACE), skipped by TINYNV_ALLOW_NO_TRACE)"; \
 	 else echo "  no trace at $(TRACE): the whole boot replay would not run. Record one with tools/nv_trace.py, or set TINYNV_ALLOW_NO_TRACE=1 to skip it deliberately."; exit 1; fi
 	@# and that no control this driver sends carries a pointer, at any nesting depth. A pointer in an rm control's

@@ -9,6 +9,7 @@
 // and the two contradictions. The reason strings are checked too, not only the mode - the startup line is what every
 // report of a hang is read against, and a line that names the wrong cause is worse than one that says nothing.
 #include "exec.h"
+#include "dev.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -310,6 +311,33 @@ int main(void) {
     CHECK(tinynv_exec_idle(NULL) != 0, "idling a NULL exec was reported as success");
   }
   printf("  an exec that was never initialised refuses to idle instead of faulting inside the teardown\n");
+
+  // Whether an open resets the card first (dev.c). The two cases that matter most pull against each other: a chain-of-trust
+  // card a previous owner left with WPR2 = 0 MUST reset (the DART latch), and a card whose own run unloaded it - every
+  // VBIOS-boot card by default, a chain-of-trust card under TINYNV_UNLOAD=1 - must NOT, because there the reset-on-open
+  // is the operation that does not come back.
+  {
+    static const struct { uint32_t wpr2; const char *sr, *ul; int cot, want; const char *what; } rr[] = {
+      {0x07f49000u, NULL, NULL, 1, 1, "firmware resident on a chain-of-trust card resets"},
+      {0x07f49000u, "0", "1", 0, 1, "firmware resident resets whatever the knobs say - gsp-rm cannot boot over it"},
+      {0xffffffffu, NULL, NULL, 1, 0, "all ones never resets (the window is not decoding)"},
+      {0xffffffffu, "1", NULL, 1, 0, "all ones never resets even when a reset is asked for"},
+      {0, NULL, NULL, 1, 1, "a genuine zero on a chain-of-trust card resets - the card a previous owner left"},
+      {0, NULL, NULL, 0, 0, "a genuine zero on a VBIOS-boot card opens cold - it unloads at exit by default"},
+      {0, NULL, "1", 1, 0, "a genuine zero under TINYNV_UNLOAD=1 opens cold - that board's reset does not come back"},
+      {0, NULL, "0", 1, 1, "TINYNV_UNLOAD=0 is not the cold-open flow"},
+      {0, "0", NULL, 1, 0, "TINYNV_START_RESET=0 restores the old rule"},
+      {0, "1", "1", 0, 1, "TINYNV_START_RESET=1 forces the reset over both the knob and the family"},
+      {0, "", NULL, 1, 1, "an empty TINYNV_START_RESET is not an answer"},
+    };
+    for (size_t i = 0; i < sizeof(rr) / sizeof(*rr); i++) {
+      int got = tinynv_dev_start_reset_rule(rr[i].wpr2, rr[i].sr, rr[i].ul, rr[i].cot);
+      CHECK(got == rr[i].want, "start reset for WPR2 %#x, TINYNV_START_RESET=%s, TINYNV_UNLOAD=%s, chain of trust %d: got %d, "
+            "want %d (%s)", rr[i].wpr2, rr[i].sr ? rr[i].sr : "(unset)", rr[i].ul ? rr[i].ul : "(unset)", rr[i].cot, got,
+            rr[i].want, rr[i].what);
+    }
+  }
+  printf("  start reset: a card a previous owner left resets, a card our own run unloaded opens cold\n");
 
   // Last statement in main, for the reason spelled out at the end of test_rm_free.c: that file's guard sat
   // partway through main, the file grew past it, and two hundred lines of checks stopped counting without

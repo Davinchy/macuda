@@ -28,6 +28,8 @@ typedef struct {
 } tinynv_dev_t;
 
 int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci);
+// Whether an open resets the card first; see dev.c. wpr2 is NV_PFB_PRI_MMU_WPR2_ADDR_HI as first read.
+int tinynv_dev_start_reset_rule(uint32_t wpr2, const char *start_reset, const char *unload, int chain_of_trust);
 int tinynv_dev_mmu_init(tinynv_dev_t *d);
 void tinynv_dev_quiesce(tinynv_dev_t *d);
 uint32_t tinynv_rd32(tinynv_dev_t *d, uint64_t off);

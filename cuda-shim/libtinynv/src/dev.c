@@ -118,6 +118,26 @@ static int warm_reset(tinynv_dev_t *d, tinynv_pci_t *pci, uint32_t wpr2_hi) {
   return 0;
 }
 
+// Whether an open resets the card first. Pure, so test_exec_mode drives it; `chain_of_trust` is whether the card boots
+// through the FSP (architecture 0x1a and later, the 5090) and is only consulted for a genuine zero with no knob set.
+//
+//   firmware resident (WPR2 neither 0 nor all ones)  always: gsp-rm cannot be booted over a live region
+//   all ones                                          never: a window that is not decoding (the loop warm_reset names)
+//   a genuine zero, TINYNV_START_RESET set            it decides: 0 no, anything else yes
+//   a genuine zero, TINYNV_UNLOAD=1                   no. On a chain-of-trust card that knob says its reset-on-open does
+//                                                     not come back (GB203 in a Razer Core X: GSP_INIT_DONE
+//                                                     NV_ERR_TIMEOUT after it), so it unloads at exit and opens cold
+//   a genuine zero, a VBIOS-boot card (Ampere, Ada)   no. Those unload at exit by default, so the zero is our own clean
+//                                                     teardown - and a reset-on-open is exactly what failed on the 3060
+//   a genuine zero, a chain-of-trust card             yes: the DART case above, a card a previous owner left behind
+int tinynv_dev_start_reset_rule(uint32_t wpr2, const char *start_reset, const char *unload, int chain_of_trust) {
+  if (wpr2 == 0xffffffff) return 0;
+  if (wpr2 != 0) return 1;
+  if (start_reset && *start_reset) return *start_reset != '0';
+  if (unload && !strcmp(unload, "1")) return 0;
+  return chain_of_trust;
+}
+
 int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   memset(d, 0, sizeof(*d));
   d->pci = pci;
@@ -139,8 +159,18 @@ int tinynv_dev_early_init(tinynv_dev_t *d, tinynv_pci_t *pci) {
   // VM session, 1 of 1 stayed clean (10-15). So a genuine zero resets too. All ones still does NOT: that is a window
   // that is not decoding, and resetting on it is the self-sustaining loop described above. TINYNV_START_RESET=0
   // restores the old rule (reset only when a firmware is resident).
-  const char *sr = getenv("TINYNV_START_RESET");
-  d->start_reset = d->wpr2_was_up || (wpr2 == 0 && !(sr && *sr == '0'));
+  const char *sr = getenv("TINYNV_START_RESET"), *ul = getenv("TINYNV_UNLOAD");
+  int unload_flow = ul && !strcmp(ul, "1");
+  // The family, asked only when it decides something: a genuine zero with neither knob said. One register read the
+  // recorded boot never made - so the replays, which run under TINYNV_START_RESET=0, never make it either.
+  int cot = 0;
+  if (wpr2 == 0 && !(sr && *sr) && !unload_flow)
+    cot = NV_GET(tinynv_rd32(d, NV_PMC_BOOT_42), NV_PMC_BOOT_42, ARCHITECTURE) >= 0x1a;
+  d->start_reset = tinynv_dev_start_reset_rule(wpr2, sr, ul, cot);
+  if (wpr2 == 0 && !d->start_reset && !(sr && *sr))
+    fprintf(stderr, "tinynv: no resident firmware and %s, so the card opens cold without a reset (TINYNV_START_RESET=1 "
+                    "forces one)\n", unload_flow ? "TINYNV_UNLOAD=1 (this board unloads at exit)"
+                                               : "a VBIOS-boot card (it unloads at exit by default)");
   if (d->start_reset && warm_reset(d, pci, d->wpr2_was_up ? wpr2 : 0)) return -1;
 
   // Bus mastering AND the memory window. The window was the backend's business, settled when it opened the device - but
