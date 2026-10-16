@@ -151,6 +151,7 @@ sh setup.sh sd
 sh setup.sh shim
 DEFS_EXTRA=-DGGML_CUDA_USE_GRAPHS sh setup.sh cuda
 sh setup.sh link
+sh setup.sh split              # optional: Metal + CUDA in one process (the *-mc binaries)
 ```
 
 `setup.sh llama` pins llama.cpp to `ad6c668` and applies upstream fix `2f53959`. `setup.sh sd` pins stable-diffusion.cpp to `59c23bc`, uses llama.cpp's ggml and applies the integration patch in [patches/](patches/). `LLAMA_SRC` and `SD_SRC` can identify local source clones. The scripts manage those dependency checkouts; preserve local edits before rebuilding them.
@@ -162,6 +163,8 @@ sh setup.sh link
 `TINYCC_REUSE_FATBIN=1` reuses device fatbins left in `/tmp` for a host-only rebuild. Use it only when the GPU source and device compilation settings are unchanged. The runtime's copy kernels and cuBLAS-compatible GEMM kernel ship as committed cubins; their source files record the compilation commands.
 
 **Application linking.** llama.cpp first builds as a CPU-only static tree in `build-null`. The link scripts add the CUDA backend, compatibility libraries and LLVM demangler. The resulting `*-null` binaries use the driver's null device until `TINYNV_SOCKET` selects a live TinyGPU server. The suffix does not mean they are restricted to offline execution.
+
+**Metal + CUDA in one process.** `sh setup.sh split` configures the same llama.cpp checkout a second time with Metal on (`llama.cpp/build-metal-null`) and links `llama-server-mc` and `llama-bench-mc` against the shim. One process then sees both GPUs, and `-dev CUDA0,MTL0 -sm layer -ts <card>,<mac>` splits a model's layers between the eGPU and the Mac GPU. This runs models larger than Metal's working set: GLM-5.3-Flash UD-IQ3_XXS (112 GiB) runs with 13 of its 46 layers on an RTX 5090. Each Metal↔CUDA crossing costs about 0.3 ms per decode step over Thunderbolt, so use a few large contiguous layer ranges. CUDA graphs are off by default in these binaries; `MACUDA_SPLIT_GRAPHS=1` turns them on (see the limitations below). `tools/decode_bench.py` measures decode against any running server (greedy, cached prefill, token ids kept so two builds can be compared for exactness). On the pinned tree, Qwen3.8-Flash-Next IQ3_S at `-ts 27,21` decodes at 50.9 / 40.1 / 49.7 tok/s (short / 8K / edit prompts).
 
 **Build provenance.** `libtinynv` embeds its Git commit, with `-dirty` for an uncommitted tree or `nogit` outside a checkout. The runtime prints the ID at startup, and the runner checks it before hardware access. Use that ID to associate a result with its build. Historical results and corrections remain in the [driver design record](docs/driver/libtinynv-design.md) and [19 September handoff](docs/handoff-2026-09-19.md).
 
@@ -281,6 +284,7 @@ Placement flags and saving state one token early are required by this implementa
 
 - **Application coverage:** the compatibility libraries implement the interfaces used by the tested applications. GGUF support in upstream llama.cpp alone does not establish compatibility with this stack.
 - **Remaining decode overhead:** profiling identifies host turnaround and roughly 1.7 µs of driver work per launch as optimisation targets. Qwen3.5 35B-A3B reaches 91% of reference decode throughput in the latest listed batch.
+- **CUDA graphs in the Metal + CUDA split:** on Qwen3.8-Flash-Next (MoE + Gated DeltaNet) at `-ts 27,21` with graphs on, `llama-server-mc` hits a deterministic MMU fault in a captured `mul_mat_vec_q` node. It happens on the first request whose prompt is already fully cached (the recurrent-checkpoint restore path). The same model and split on upstream llama.cpp a30fb49 (October 2026) runs graphs-on without the fault, with token-identical output, so this looks like a ggml bug in the pinned tree that was later fixed. Graphs gave Flash-Next no speedup there either. The split binaries therefore default graphs off. Qwen3.8-27B split 40/24 runs correctly with graphs and 16% faster (38.8 vs 33.3 tok/s): set `MACUDA_SPLIT_GRAPHS=1` for models validated that way.
 - **Experimental graph replay:** CUDA runtime graph support is implemented. Resident driver-level replay is a separate, opt-in path; it has not established a performance improvement in the recorded tests.
 - **Unsupported operator cases:** `test-backend-ops` MUL_MAT with mxfp4/nvfp4 can hang the card. Treat these as dedicated hardware investigations, not routine validation workloads.
 - **Pinned upstream fix:** older llama.cpp revisions can corrupt the arm64 rope work buffer during operator tests. `setup.sh llama` applies the required `2f53959` fix.

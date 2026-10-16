@@ -4,6 +4,7 @@
 # tree could not build itself and said so only at the first `make`.
 build/*
 !build/*.sh
+!build/mc-defaults.c
 !build/tinycc
 # a rule with a slash in it is anchored here, so nested build directories need saying separately - the old bare
 # `build/` had covered them by matching any directory of that name at any depth

@@ -7,6 +7,8 @@
 #   sh setup.sh shim       make libtinynv.a + libtinycudart.a + libtinycublas.a (no GPU needed)
 #   sh setup.sh cuda       compile ggml's CUDA backend: device code through nvcc, host code through clang
 #   sh setup.sh link       link the *-null binaries against the shim (needs cuda-shim/build/libggml-cuda.a from the step above)
+#   sh setup.sh split      Metal + CUDA in ONE process: a static Metal llama.cpp tree (llama.cpp/build-metal-null) linked
+#                          against the same shim and archive -> build/bin/*-mc (split a model across the eGPU and the Mac GPU)
 # Environment: LLAMA_SRC / SD_SRC name a local clone to copy from instead of GitHub; JOBS caps the parallel build (default:
 # all cores). The device compile needs nvcc, which is Linux-only: set TINYCC_HOST / TINYCC_KEY to use a Linux box over ssh,
 # or leave them unset and it runs in a CUDA container on this Mac (see cuda-shim/build/tinycc, and install.sh).
@@ -101,13 +103,21 @@ link_one() {
     exit 1
   fi
 }
-link() {
-  if [ -n "$SUF" ]; then
-    export GGML_ARCHIVE="$R/cuda-shim/build/libggml-cuda.$ARCH.a" SHIM_DIR="$R/cuda-shim/build/shim$SUF"
-    test -f "$GGML_ARCHIVE" || { echo "no $GGML_ARCHIVE: build it with  ARCH=$ARCH sh setup.sh cuda"; exit 1; }
-    test -f "$SHIM_DIR/nv/libtinynv.a" || { echo "no $SHIM_DIR: build it with  ARCH=$ARCH sh setup.sh shim"; exit 1; }
+# The archive and shim libraries for ARCH, named explicitly. libggml-cuda.a is a symlink to whichever card was built
+# LAST, so after an  ARCH=sm_86 sh setup.sh cuda  on a tree that never built the default, a plain link silently put
+# Ampere kernels into a Blackwell binary (2026-10-16). A tree from before the per-architecture archives has a real
+# libggml-cuda.a file for sm_120a; that is still accepted.
+card_libs() {
+  GGML_ARCHIVE="$R/cuda-shim/build/libggml-cuda.$ARCH.a"
+  if [ ! -f "$GGML_ARCHIVE" ] && [ -z "$SUF" ] && [ -f cuda-shim/build/libggml-cuda.a ] && [ ! -L cuda-shim/build/libggml-cuda.a ]; then
+    GGML_ARCHIVE="$R/cuda-shim/build/libggml-cuda.a"
   fi
-  test -f cuda-shim/build/libggml-cuda.a || [ -n "$SUF" ] || { echo "no cuda-shim/build/libggml-cuda.a: build it with  sh setup.sh cuda  (nvcc in a container here, or on TINYCC_HOST)"; exit 1; }
+  SHIM_DIR="$R/cuda-shim/build/shim$SUF"; export GGML_ARCHIVE SHIM_DIR
+  test -f "$GGML_ARCHIVE" || { echo "no libggml-cuda.$ARCH.a: build it with  ${SUF:+ARCH=$ARCH }sh setup.sh cuda  (nvcc in a container here, or on TINYCC_HOST)"; exit 1; }
+  test -f "$SHIM_DIR/nv/libtinynv.a" || { echo "no $SHIM_DIR: build it with  ${SUF:+ARCH=$ARCH }sh setup.sh shim"; exit 1; }
+}
+link() {
+  card_libs
   # Built here too, not only in the cuda step: it is cheap, it is the object every link below needs, and a tree that
   # has the archive but not this one used to fail seven times over and still report success.
   test -f cuda-shim/build/ggml-backend-reg.cuda.o || sh cuda-shim/build/build-backend-reg.sh
@@ -120,8 +130,28 @@ link() {
   fi
   ls -1 "build/bin$SUF"
 }
+# Metal + CUDA in one process (cuda-shim/build/link-null-metal.sh): the same llama.cpp checkout configured a second time
+# with Metal on, then the server and llama-bench linked with the shim. Not part of "all": the CPU-only binaries are the
+# shim's own tests, and this is a use of them. ARCH works as for link (bin-<arch>/*-mc); measured on Blackwell.
+split() {
+  card_libs
+  mkdir -p llama.cpp/build-metal-null
+  cmake -S llama.cpp -B llama.cpp/build-metal-null -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+    -DGGML_METAL=ON -DGGML_NATIVE=${GGML_NATIVE:-ON} ${GGML_CPU_ARM_ARCH:+-DGGML_CPU_ARM_ARCH=$GGML_CPU_ARM_ARCH} -DLLAMA_CURL=OFF \
+    -DLLAMA_OPENSSL=${LLAMA_OPENSSL:-ON} > llama.cpp/build-metal-null/cmake.log 2>&1 || { tail -20 llama.cpp/build-metal-null/cmake.log; exit 1; }
+  cmake --build llama.cpp/build-metal-null -j"$JOBS" --target llama-server llama-bench \
+    > llama.cpp/build-metal-null/build.log 2>&1 || { tail -30 llama.cpp/build-metal-null/build.log; exit 1; }
+  L=$R/llama.cpp/build-metal-null sh cuda-shim/build/build-backend-reg.sh cuda-metal
+  cd cuda-shim
+  for t in 'tools/server llama-server' 'tools/llama-bench llama-bench'; do
+    d=${t%% *}; n=${t##* }
+    rm -f "$R/cuda-shim/build/bin$SUF/$n-mc"
+    sh build/link-null-metal.sh "$d" "$n" "$R/cuda-shim/build/bin$SUF/$n-mc" 2>&1 | grep -vE 'duplicate|warning' | tail -1
+    test -f "$R/cuda-shim/build/bin$SUF/$n-mc" || { echo "LINKING FAILED for $n-mc"; exit 1; }
+  done
+}
 case "$step" in
   all)   deps; llama; sd; shim; cuda; link ;;
-  deps)  deps ;; llama) llama ;; sd) sd ;; shim) shim ;; cuda) cuda ;; link) link ;;
-  *) echo "usage: sh setup.sh [all|deps|llama|sd|shim|cuda|link]"; exit 2 ;;
+  deps)  deps ;; llama) llama ;; sd) sd ;; shim) shim ;; cuda) cuda ;; link) link ;; split) split ;;
+  *) echo "usage: sh setup.sh [all|deps|llama|sd|shim|cuda|link|split]"; exit 2 ;;
 esac

@@ -14,7 +14,9 @@ tdir="$1"; name="$2"; out="$3"; linktxt="$L/$tdir/CMakeFiles/$name.dir/link.txt"
 # GGML_ARCHIVE and SHIM_DIR name one architecture's ggml-cuda archive and shim libraries explicitly (setup.sh sets them
 # from ARCH); unset, the plain libggml-cuda.a symlink and build/shim are used, as before.
 GA=${GGML_ARCHIVE:-$G/libggml-cuda.a}; SD=${SHIM_DIR:-$S/build/shim}
-extra="$G/ggml-backend-reg.cuda.o $GA $SD/libtinycudart.a $SD/libtinycublas.a $SD/nv/libtinynv.a /opt/homebrew/opt/llvm/lib/libLLVMDemangle.a"
+# REG names the registry object: the CUDA-only one by default; link-null-metal.sh passes the CUDA+Metal one
+REG=${REG:-$G/ggml-backend-reg.cuda.o}
+extra="$REG $GA $SD/libtinycudart.a $SD/libtinycublas.a $SD/nv/libtinynv.a /opt/homebrew/opt/llvm/lib/libLLVMDemangle.a"
 # The link line is CMake's, recorded when llama.cpp was configured - which means it carries the EXACT Homebrew Cellar
 # paths of the machine that configured it. On this machine openssl@3 is 3.6.2 and the recorded line wants 3.6.4, so four
 # of the five targets failed with "no such file or directory: .../3.6.4/lib/libcrypto.dylib" and the fifth, which does
