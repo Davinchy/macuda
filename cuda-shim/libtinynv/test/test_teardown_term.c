@@ -97,6 +97,20 @@ STOP(tinynv_gsp_sensors_init, int, tinynv_gpu_t *g, uint64_t poll_mask, uint32_t
 STOP(tinynv_gsp_sensors_read, int, tinynv_gpu_t *g, tinynv_rusd_t *out)
 STOP(tinynv_tlsf_used, uint64_t, const tinynv_tlsf_t *a)
 STOP(tinynv_tlsf_size, uint64_t, const tinynv_tlsf_t *a)
+// The tensor-unlock world (postboot read and runtime gate): the child never boots and never
+// requests the unlock, so every one of these is a wrong turn. Without the stubs this witness cannot even LINK
+// against the current tinynv.c ; a stale binary can hide classifier regressions.
+STOP(tensor_unlock_option_parse, int, const char *v)
+STOP(tensor_unlock_status, const char *, const tensor_unlock_result_t *r)
+STOP(tensor_unlock_stage_name, const char *, int stage)
+STOP(tensor_unlock_bundle_dir, const char *, void)
+STOP(tensor_unlock_signals_install, void, tensor_unlock_sigstate_t *s)
+STOP(tensor_unlock_signals_restore, void, tensor_unlock_sigstate_t *s)
+STOP(tensor_unlock_recovery_hold, int, const tensor_unlock_result_t *r, const char *who)
+STOP(tensor_unlock_run, int, tinynv_pci_t *p, const char *dir, tensor_unlock_result_t *out)
+STOP(tensor_unlock_state_classify, void, tensor_unlock_state_t *s)
+volatile sig_atomic_t tensor_unlock_abort;
+const tensor_unlock_pins_t tensor_unlock_pins;
 
 // ---- the witness ----------------------------------------------------------------------------------------------
 static pid_t child_leaves_through_exit(int errfd) {

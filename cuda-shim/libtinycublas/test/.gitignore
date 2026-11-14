@@ -1,0 +1,4 @@
+# build outputs of this test directory (the shim libraries live in cuda-shim/build/)
+bf16_unlock_gemm
+*.dSYM/
+*.o
