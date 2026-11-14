@@ -1,0 +1,311 @@
+{
+  "manifest_version": 1,
+  "bundle_id": "ad102-610.43.03-four-plm",
+  "scope": "experimental RTX 4090 tensor unlock; generated firmware assets are not redistributed; see docs/driver/rtx4090-tensor-unlock/spec.md",
+  "upstream": {
+    "repository": "https://github.com/JustAResearcher/gpu-unlock-ada",
+    "commit": "8855e7bca8ff142204e02301331fd56b26699819",
+    "commit_date": "2026-10-25 02:27:23 +1100",
+    "version": "1.1.1",
+    "selection_evidence": "docs/evidence/rtx4090-pr1-matched/metadata.json at upstream commit f5d96e9f9d1023785e5e11f718fb8a8e13278f8a records source_commit == this pin, device 10de:2684, matched stock/unlocked GEMM + numerical validation on NVIDIA 615.78.08",
+    "vendored_files_sha256": {
+      "UPSTREAM-LICENSE": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+      "UPSTREAM-NOTICE.md": "ba51777dff822efa09e6f924cf702e7de47fe2a14101cca3573ad3db35445797",
+      "ada-610.43.03.json": "a856a4ad8accfd5d2220d9604f90e7299eda89426503da213c968a05fc0d0c18",
+      "artifacts-610.43.03.json": "d4b5921296df40a60921460e53c635f469356346da15cbfa0569b7b5b86d524e",
+      "extract_boot_assets.py": "fd1572d5a94d651b0834256917953e0bac90d0a20626c87271535ddf4de6d2ce",
+      "fetch_artifacts.py": "f59f1a0ddde298e0e1b29ac128c5f1bbb353f25111e195f63870d9a7ad846ec0",
+      "generate_v67.py": "d39fa34f2da9854316d64116ea13a92fe087f1121d7862dda85ed4d1841d920d",
+      "licenses/CMP40HX-MIT.txt": "1126322e2cc8d165adc4c792eeb195717de2bcc7b39be1ce77959d78e87ef685",
+      "licenses/GPL-2.0.txt": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+      "licenses/NVIDIA-MIT.txt": "fdeba0dc20cc705443771b5ca293292e3437abb2bb3021b6a0c65f0203b1db91"
+    },
+    "audited_not_vendored_sha256": {
+      "kernel/gpu_unlock/unlock_610.c": "5e263b8bb42bbba5903a6d1b3d8aba2fc1f92365169e4ca64fe1405d89f54318",
+      "kernel/gpu_unlock/firmware_pins_610.h": "82125d437e7c866e2583c4a93d77679d2ea72be3151f444afa16fd0342a221c8",
+      "kernel/gpu_unlock/gfw_eval.c": "5a36666290df66edc703611086a36adb148cdb953babf4529d114c9ef098e1b6"
+    }
+  },
+  "frozen_input_comparison": {
+    "reference": "docs/driver/rtx4090-tensor-unlock/inputs.md",
+    "payload_sha256_equals_elias_4ec490d_measured": true,
+    "generate_v67_py_identical_to_elias_4ec490d": true,
+    "zagitta_7eb51bc_refactor_payload_cd1ed437_rejected": "different signature image, never hardware-measured (inputs.md F1); never combined with this recipe",
+    "derived_asset_pins_equal_frozen_inputs": true,
+    "input_artifact_pins_equal_frozen_inputs": true,
+    "package_container_substituted": "original CachyOS x86_64_v3 container unavailable (404); Arch Linux Archive x86_64 container pinned instead; extracted members byte-identical to frozen pins (see input_substitutions)"
+  },
+  "recipe": {
+    "id": "ad102-four-plm-v67-610.43.03",
+    "generator": "upstream/generate_v67.py:build_ad102_payload",
+    "payload_filename": "v67-ad102-610.43.03-four-plm.bin",
+    "ordered_writes": [
+      {
+        "name": "WPR_CFG",
+        "address": "0x001fa7cc",
+        "value": "0xfffff0ff",
+        "address_offset": "0x0000f960",
+        "value_offset": "0x0000f948"
+      },
+      {
+        "name": "FBPA",
+        "address": "0x009a0148",
+        "value": "0xffffffff",
+        "address_offset": "0x0000f984",
+        "value_offset": "0x0000f974"
+      },
+      {
+        "name": "WPR",
+        "address": "0x001fa7c4",
+        "value": "0xffffffff",
+        "address_offset": "0x0000f9a8",
+        "value_offset": "0x0000f998"
+      },
+      {
+        "name": "FEAT_OVR_PLM",
+        "address": "0x00823804",
+        "value": "0xffffffff",
+        "address_offset": "0x0000f9cc",
+        "value_offset": "0x0000f9bc"
+      }
+    ],
+    "mailbox0_marker": "0x67b00001",
+    "mailbox0_marker_offset": "0x0000f9e0",
+    "cleanup_entry": "0x0000771e",
+    "cleanup_entry_offset": "0x0000f9fc",
+    "stack_map": {
+      "active_canary_dmem": "0x0000ff4c",
+      "active_canary_payload_offset": "0x0000f94c",
+      "initial_return_slot_dmem": "0x0000ff50",
+      "initial_return_slot_payload_offset": "0x0000f950",
+      "initial_return_gadget": "0x000021b2",
+      "reference_canary_dmem": "0x00005f50"
+    },
+    "provenance": {
+      "name": "TOTORONG/AD103_win_unlocker",
+      "url": "https://huggingface.co/TOTORONG/AD103_win_unlocker",
+      "revision": "51df9c17ec89eb8486df52cc9079dde4bd1f9974",
+      "license": "GPL-2.0-only (generator SPDX and repository LICENSE)",
+      "files": [
+        {
+          "path": "source/firmware-tools/ad102_payload.py",
+          "sha256": "4ad4fa566e367bc8547f56293d2b4aa8522b09d39712309ee9b32d2ee48ad70d"
+        },
+        {
+          "path": "USB/RTX4080-EXPERIMENT/ASSETS/v67-ad102-610.43.03-four-plm.bin",
+          "sha256": "44c36b2d6b3424e53e18f3e55db85c833655de071ce66ce42749588a4a7dc8cb"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b"
+        }
+      ],
+      "adaptation": "Deterministic payload constants only; upstream interpreter, narrative and disassembly are not copied."
+    },
+    "selectors": {
+      "SS0": {
+        "offset": "0x0082381c",
+        "value": "0x88888888"
+      },
+      "SS1": {
+        "offset": "0x00823820",
+        "value": "0x8"
+      }
+    },
+    "effective_readout": {
+      "offset": "0x00823818",
+      "mask": "0x07ffffff",
+      "gate": "all nine 3-bit fields zero when unlocked; checked before-firmware, after-payload, selectors-applied, pre-FLR, post-FLR (upstream ad102_readout)"
+    },
+    "permissions": [
+      {
+        "name": "WPR_CFG",
+        "offset": "0x001fa7cc",
+        "expected": "0xfffff0ff",
+        "required": true
+      },
+      {
+        "name": "FBPA",
+        "offset": "0x009a0148",
+        "expected": "0xffffffff",
+        "required": false,
+        "observed_cold": "0xffffff0f"
+      },
+      {
+        "name": "WPR",
+        "offset": "0x001fa7c4",
+        "expected": "0xffffffff",
+        "required": true
+      },
+      {
+        "name": "FEAT",
+        "offset": "0x00823804",
+        "expected": "0xffffffff",
+        "required": true
+      }
+    ],
+    "completion": "SEC2 reset asserted+released, reloaded, started, CPUCTL halted, RESET_PLM low byte 0xff, MAILBOX0 == marker; marker alone is never success"
+  },
+  "device_allowlist": [
+    {
+      "vendor": "0x10de",
+      "device": "0x2684",
+      "chip": "AD102",
+      "pmc_boot_0_arch": "0x192",
+      "name": "NVIDIA GeForce RTX 4090 (desktop only)",
+      "note": "upstream also admits 0x2705 (AD103 4070 Ti SUPER); macuda narrows to 0x2684 per spec"
+    }
+  ],
+  "inputs": [
+    {
+      "name": "NVIDIA open kernel modules source archive",
+      "url": "https://download.nvidia.com/XFree86/NVIDIA-kernel-module-source/NVIDIA-kernel-module-source-610.43.03.tar.xz",
+      "checksum_url": "https://download.nvidia.com/XFree86/NVIDIA-kernel-module-source/NVIDIA-kernel-module-source-610.43.03.tar.xz.sha256sum",
+      "filename": "NVIDIA-kernel-module-source-610.43.03.tar.xz",
+      "sha256": "7e118923c7a23edc36114d63273a46e3e04e9af98695a42203e7ac2dfe9fc1dc",
+      "license": "GPL-2.0 OR MIT"
+    },
+    {
+      "name": "nvidia-utils binary package used for exact firmware extraction (Arch Linux Archive x86_64 container)",
+      "url": "https://archive.archlinux.org/packages/n/nvidia-utils/nvidia-utils-610.43.03-1-x86_64.pkg.tar.zst",
+      "filename": "nvidia-utils-610.43.03-1-x86_64.pkg.tar.zst",
+      "sha256": "c3367ff68632ac7daf6ca50ef7cbdd1cb5d09f7fe0b26125b312c73e52a34cf4",
+      "version": "610.43.03-1",
+      "member_pins": {
+        "usr/lib/firmware/nvidia/610.43.03/gsp_ga10x.bin": "572373620a37418f24dc16b5031c39338778c3257e48e8408de9a57291b24f3a",
+        "usr/share/licenses/nvidia-utils/LICENSE": "c692fb14ad4f499c6aee1b9e144e6905148c420e6225b17cb2937366c1e507ad"
+      },
+      "note": "container substitution recorded in input_substitutions; extracted members verified byte-identical to the frozen pins"
+    }
+  ],
+  "generated_source_pins": {
+    "g_bindata_kgspGetBinArchiveBooterLoadUcode_AD102.c": "0504f640bc36d03c3b617b1d80cf6eee1c8022cdfffb52ed22405aaa316a1460",
+    "g_bindata_kgspGetBinArchiveGspRmBoot_AD102.c": "da110719ed6b680f26f3f7158f6731d1ff20fa859857238e23ac4935bd4cd91c"
+  },
+  "assets": {
+    "booter_load_ad102.bin": {
+      "size": 57672,
+      "sha256": "6ee05b20e1dc244c08c052f36ef28469b8d09f4955d1fe33e48a179e11a7fd49"
+    },
+    "gsp_boot_ad102.bin": {
+      "size": 36864,
+      "sha256": "45d6335a8185d6ff13e8d1484cea73f68d3d13aa1c19dc080ed1c3482dd5bac0"
+    },
+    "gsp_boot_desc_ad102.bin": {
+      "size": 84,
+      "sha256": "83f8f3f1f5f9496e0ea8fc7103c2beb64d0b6de2f5ffe725f13514de5a95fa42"
+    },
+    "v67-ad102-610.43.03-four-plm.bin": {
+      "size": 64000,
+      "sha256": "44c36b2d6b3424e53e18f3e55db85c833655de071ce66ce42749588a4a7dc8cb"
+    },
+    "gsp_ga10x.bin": {
+      "size": 84277400,
+      "sha256": "572373620a37418f24dc16b5031c39338778c3257e48e8408de9a57291b24f3a"
+    }
+  },
+  "booter_geometry": {
+    "magic": "0x314c5442",
+    "bundle_version": 1,
+    "header_bytes": 72,
+    "image_size": 56832,
+    "os_code_offset": 0,
+    "os_code_size": 256,
+    "os_data_offset": 32256,
+    "os_data_size": 24576,
+    "application_count": 1,
+    "app_code_offset": 256,
+    "app_code_size": 32000,
+    "app_data_offset": 256,
+    "app_data_size": 0,
+    "signature_patch_offset": 32272,
+    "ucode_id": 3,
+    "engine_id": 1,
+    "signature_count": 2,
+    "signature_total_bytes": 768,
+    "signature_bytes_each": 384
+  },
+  "gsp_boot_descriptor": {
+    "version": 5,
+    "manifest_offset": 0,
+    "data_offset": 2048,
+    "code_offset": 18432,
+    "image_size": 36864,
+    "note": "code_offset/data_offset/manifest_offset are descriptor words 12/10/8, the fields gpu_unlock_boot_desc_parse() returns"
+  },
+  "payload_layout": {
+    "size": 64000,
+    "fill_dword": "0x0000019c",
+    "patched_words": {
+      "0x1100": "0x00000007",
+      "0xf948": "0xfffff0ff",
+      "0xf950": "0x000021b2",
+      "0xf960": "0x001fa7cc",
+      "0xf968": "0x000033fc",
+      "0xf974": "0xffffffff",
+      "0xf97c": "0x0000256f",
+      "0xf980": "0x00007a02",
+      "0xf984": "0x009a0148",
+      "0xf98c": "0x000033fc",
+      "0xf998": "0xffffffff",
+      "0xf9a0": "0x0000256f",
+      "0xf9a4": "0x00007a02",
+      "0xf9a8": "0x001fa7c4",
+      "0xf9b0": "0x000033fc",
+      "0xf9bc": "0xffffffff",
+      "0xf9c4": "0x0000256f",
+      "0xf9c8": "0x00007a02",
+      "0xf9cc": "0x00823804",
+      "0xf9d4": "0x000033fc",
+      "0xf9e0": "0x67b00001",
+      "0xf9e8": "0x0000256f",
+      "0xf9ec": "0x00007a02",
+      "0xf9f8": "0x000031b5",
+      "0xf9fc": "0x0000771e"
+    },
+    "rule": "every little-endian u32 must equal fill_dword except exactly the patched_words offsets, which must equal their pinned values; any other deviation rejects the asset"
+  },
+  "gsp_elf": {
+    "signature_section": ".fwsignature_ad10x",
+    "signature_offset": 84267118,
+    "signature_size": 4096,
+    "fwimage_offset": 64,
+    "fwimage_size": 84226048
+  },
+  "notices": {
+    "NVIDIA-LICENSE": {
+      "sha256": "c692fb14ad4f499c6aee1b9e144e6905148c420e6225b17cb2937366c1e507ad",
+      "source": "extracted from pinned nvidia-utils package: usr/share/licenses/nvidia-utils/LICENSE"
+    },
+    "UPSTREAM-LICENSE": {
+      "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+    },
+    "UPSTREAM-NOTICE.md": {
+      "sha256": "ba51777dff822efa09e6f924cf702e7de47fe2a14101cca3573ad3db35445797"
+    },
+    "licenses/GPL-2.0.txt": {
+      "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+    },
+    "licenses/NVIDIA-MIT.txt": {
+      "sha256": "fdeba0dc20cc705443771b5ca293292e3437abb2bb3021b6a0c65f0203b1db91"
+    },
+    "licenses/CMP40HX-MIT.txt": {
+      "sha256": "1126322e2cc8d165adc4c792eeb195717de2bcc7b39be1ce77959d78e87ef685"
+    }
+  },
+  "runtime_separation": "this 610.43.03 unlock bundle is separate from the unchanged 570.144 runtime bundle (cuda-shim/libtinynv/tools/fetch_firmware.sh); sequential compatibility on AD102 is an open live-verification item",
+  "limits": "payload-byte reproduction and upstream single-card Linux evidence do not establish macuda/Thunderbolt behavior; no hardware validation exists in this repo yet",
+  "input_substitutions": [
+    {
+      "date": "2026-11-12",
+      "original_url": "https://archive.cachyos.org/archive/cachyos-v3/nvidia-utils-610.43.03-1-x86_64_v3.pkg.tar.zst",
+      "original_sha256": "e17e7c92eeffa178b0fe1f40eb17a47095f8fc3ce4a77bf115cf5bd5a4df86e9",
+      "original_filename": "nvidia-utils-610.43.03-1-x86_64_v3.pkg.tar.zst",
+      "status": "original CachyOS archive container purged (HTTP 404 at archive.cachyos.org on 2026-11-12; only 610.57.04 remains); mirror.cachyos.org serves an HTML placeholder, not the package",
+      "replacement_url": "https://archive.archlinux.org/packages/n/nvidia-utils/nvidia-utils-610.43.03-1-x86_64.pkg.tar.zst",
+      "replacement_sha256": "c3367ff68632ac7daf6ca50ef7cbdd1cb5d09f7fe0b26125b312c73e52a34cf4",
+      "justification": "same pkgname/pkgver 610.43.03-1; extracted gsp_ga10x.bin (84277400 bytes) and NVIDIA-LICENSE verified byte-identical to the frozen member pins before use; all derived bundle asset hashes remain the frozen pins",
+      "verified_by": "tools/rtx4090-unlock/prepare_bundle.py + validate_bundle.py; provenance documented in docs/driver/rtx4090-tensor-unlock/assets.md"
+    }
+  ]
+}

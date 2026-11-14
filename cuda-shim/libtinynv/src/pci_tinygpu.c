@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -33,16 +34,30 @@ typedef struct {
   // reply (the socket carries one conversation), so rpc() drains it into pending_val and rd32_recv finds it there.
   int pending, pending_done;
   uint32_t pending_val;
+  // A receive timeout (or any short transfer) leaves the conversation desynchronized: half a reply may still arrive
+  // later. The connection is poisoned, every later operation fails fast, and the caller must treat the device state
+  // as unknown (the unlock transaction enters its recovery path). Never silently retried on the same socket.
+  int broken;
   int ndma;
   struct { void *va; size_t size; } dma[MAX_DMA];
   uint64_t bar_size[TINYNV_MAX_BARS];
 } tg_t;
 
 
-static int xfer_all(int fd, void *buf, size_t len, int sending) {
+static int xfer_all(tg_t *tg, void *buf, size_t len, int sending) {
+  if (tg->broken) return tinynv_fail("tinygpu: connection is broken (an earlier transfer failed); refusing further use");
   for (size_t off = 0; off < len;) {
-    ssize_t n = sending ? send(fd, (char *)buf + off, len - off, 0) : recv(fd, (char *)buf + off, len - off, 0);
-    if (n <= 0) return tinynv_fail("tinygpu: connection closed after %zu of %zu bytes", off, len);
+    ssize_t n = sending ? send(tg->fd, (char *)buf + off, len - off, 0) : recv(tg->fd, (char *)buf + off, len - off, 0);
+    // A catchable signal (SIGINT/SIGTERM -> the unlock's abort flag) interrupted the transfer before ANY byte moved.
+    // Retrying is safe — nothing was consumed, the conversation stays in sync — and it matters: poisoning a healthy
+    // socket here would make the recovery unwind's best-effort quiesce (BME clear) fail fast on a broken connection.
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      tg->broken = 1;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return tinynv_fail("tinygpu: receive timed out after %zu of %zu bytes (server wedged?); connection poisoned", off, len);
+      return tinynv_fail("tinygpu: connection closed after %zu of %zu bytes", off, len);
+    }
     off += (size_t)n;
   }
   return 0;
@@ -54,42 +69,49 @@ static uint32_t tg_take_pending(tg_t *tg) {
   resp_t rp;
   uint32_t v = 0xffffffffu;
   tg->pending = 0;
-  if (xfer_all(tg->fd, &rp, sizeof(rp), 0)) return v;
+  if (xfer_all(tg, &rp, sizeof(rp), 0)) return v;
   if (rp.status != 0) {
     char msg[256];
     size_t n = rp.resp0 < sizeof(msg) ? (size_t)rp.resp0 : sizeof(msg);
-    if (n) xfer_all(tg->fd, msg, n, 0);
+    if (n) xfer_all(tg, msg, n, 0);
     return v;
   }
-  xfer_all(tg->fd, &v, 4, 0);
+  xfer_all(tg, &v, 4, 0);
   return v;
 }
 // one request, one reply. payload is appended to the request; readout is the bulk data that follows the reply.
 static int rpc(tg_t *tg, resp_t *rp, uint8_t cmd, uint32_t bar, uint64_t a0, uint64_t a1, uint64_t a2,
                const void *payload, size_t payload_len, void *readout, size_t readout_len, int *fd_out) {
+  if (tg->broken) return tinynv_fail("tinygpu: connection is broken (an earlier transfer failed); refusing further use");
   if (tg->pending) { tg->pending_val = tg_take_pending(tg); tg->pending_done = 1; }
   req_t rq = {.cmd = cmd, .dev_id = 0, .bar = bar, .arg0 = a0, .arg1 = a1, .arg2 = a2};
-  if (xfer_all(tg->fd, &rq, sizeof(rq), 1)) return -1;
-  if (payload_len && xfer_all(tg->fd, (void *)payload, payload_len, 1)) return -1;
+  if (xfer_all(tg, &rq, sizeof(rq), 1)) return -1;
+  if (payload_len && xfer_all(tg, (void *)payload, payload_len, 1)) return -1;
 
   if (fd_out) { // the reply carries a descriptor for the shared memory the server just created
     *fd_out = -1;
     char cbuf[CMSG_SPACE(sizeof(int))];
     struct iovec iov = {.iov_base = rp, .iov_len = sizeof(*rp)};
     struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof(cbuf)};
-    ssize_t n = recvmsg(tg->fd, &msg, 0);
-    if (n != (ssize_t)sizeof(*rp)) return tinynv_fail("tinygpu: short reply (%zd bytes)", n);
+    ssize_t n;
+    do { n = recvmsg(tg->fd, &msg, 0); } while (n < 0 && errno == EINTR); // same rule as xfer_all: no byte moved
+    if (n != (ssize_t)sizeof(*rp)) {
+      tg->broken = 1;
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return tinynv_fail("tinygpu: receive timed out waiting for a dma reply; connection poisoned");
+      return tinynv_fail("tinygpu: short reply (%zd bytes)", n);
+    }
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c))
       if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(fd_out, CMSG_DATA(c), sizeof(int));
-  } else if (xfer_all(tg->fd, rp, sizeof(*rp), 0)) return -1;
+  } else if (xfer_all(tg, rp, sizeof(*rp), 0)) return -1;
 
   if (rp->status != 0) { // the message follows the reply, resp0 bytes of it
     char msg[256] = "unknown error";
     size_t n = rp->resp0 < sizeof(msg) - 1 ? (size_t)rp->resp0 : sizeof(msg) - 1;
-    if (n && !xfer_all(tg->fd, msg, n, 0)) msg[n] = 0;
+    if (n && !xfer_all(tg, msg, n, 0)) msg[n] = 0;
     return tinynv_fail("tinygpu: command %u failed: %s", cmd, msg);
   }
-  if (readout_len && xfer_all(tg->fd, readout, readout_len, 0)) return -1;
+  if (readout_len && xfer_all(tg, readout, readout_len, 0)) return -1;
   return 0;
 }
 
@@ -126,10 +148,11 @@ static uint32_t tg_rd32(tinynv_mmio_t *m, uint64_t off) {
 // writes may go between; another request first drains it (rpc above).
 static int tg_rd32_send(tinynv_mmio_t *m, uint64_t off) {
   tg_t *tg = m->ctx;
+  if (tg->broken) return tinynv_fail("tinygpu: connection is broken; refusing further use");
   if (tg->pending) { tg->pending_val = tg_take_pending(tg); tg->pending_done = 1; }
   tg->pending_done = 0;
   req_t rq = {.cmd = CMD_MMIO_READ, .bar = (uint32_t)m->bar, .arg0 = m->off + off, .arg1 = 4};
-  if (xfer_all(tg->fd, &rq, sizeof(rq), 1)) return -1;
+  if (xfer_all(tg, &rq, sizeof(rq), 1)) return -1;
   tg->pending = 1;
   return 0;
 }
@@ -142,7 +165,7 @@ static uint32_t tg_rd32_recv(tinynv_mmio_t *m) {
 static void tg_wr32(tinynv_mmio_t *m, uint64_t off, uint32_t v) {
   tg_t *tg = m->ctx;
   req_t rq = {.cmd = CMD_MMIO_WRITE, .bar = (uint32_t)m->bar, .arg0 = m->off + off, .arg1 = 4};
-  if (!xfer_all(tg->fd, &rq, sizeof(rq), 1)) xfer_all(tg->fd, &v, 4, 1);
+  if (!xfer_all(tg, &rq, sizeof(rq), 1)) xfer_all(tg, &v, 4, 1);
 }
 static void tg_rd_block(tinynv_mmio_t *m, uint64_t off, void *dst, size_t n) {
   resp_t rp;
@@ -151,7 +174,7 @@ static void tg_rd_block(tinynv_mmio_t *m, uint64_t off, void *dst, size_t n) {
 static void tg_wr_block(tinynv_mmio_t *m, uint64_t off, const void *src, size_t n) {
   tg_t *tg = m->ctx;
   req_t rq = {.cmd = CMD_MMIO_WRITE, .bar = (uint32_t)m->bar, .arg0 = m->off + off, .arg1 = n};
-  if (!xfer_all(tg->fd, &rq, sizeof(rq), 1)) xfer_all(tg->fd, (void *)src, n, 1);
+  if (!xfer_all(tg, &rq, sizeof(rq), 1)) xfer_all(tg, (void *)src, n, 1);
 }
 
 static int tg_bar_map(tinynv_pci_t *p, int bar, uint64_t off, uint64_t size, tinynv_mmio_t *out) {
@@ -253,6 +276,16 @@ int tinynv_pci_open_tinygpu(const char *sock_path, tinynv_pci_t *out) {
   int buf = 64 << 20;
   setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+  // A wedged server must not block recv forever (transport-audit O9/D6): every read is a round trip the server
+  // answers immediately, so a generous ceiling costs nothing on the normal path. A timeout poisons the connection
+  // (xfer_all); it is a failure with containment, never a success and never a silent retry. 0 disables the ceiling.
+  long timeout_s = 30;
+  const char *t = getenv("TINYNV_SOCKET_TIMEOUT_S");
+  if (t && *t) timeout_s = strtol(t, NULL, 10);
+  if (timeout_s > 0) {
+    struct timeval tv = {.tv_sec = timeout_s, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  }
 
   tg_t *tg = calloc(1, sizeof(tg_t));
   tg->fd = fd;

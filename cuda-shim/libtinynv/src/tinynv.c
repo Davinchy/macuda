@@ -14,6 +14,8 @@
 #include "exec.h"
 #include "qmd.h"
 #include "internal.h"
+#include "tensor_unlock.h"
+#include "unlock610/gfw_eval.h" // the AD102 FEAT/readout/selector BAR0 offsets (pinned recipe manifest)
 #include "mmu.h"
 #include "nv_regs.h"
 #include "fw_layout.h"
@@ -39,6 +41,10 @@ struct tinynv_device {
   // the gpu itself, brought up the first time something needs it rather than at init: opening the device should not
   // boot a card, and a shim that only asks what device is present should not pay for one
   int booted;
+  // TINYNV_TENSOR_UNLOCK=1 was requested and the pre-boot transaction succeeded (applied-and-verified or
+  // verified-existing). The override must then be re-verified after the runtime firmware boot, before any work queue
+  // exists. 0 (the default) means the whole unlock path below is inert: no assets, no allocations, no unlock MMIO.
+  int unlock_active;
   // Set when a boot got past the pci open and then failed. `booted` stays set so the card is still put down on the way
   // out, but nothing else may proceed: before this, the second call after a failed init_hw returned 0 and the shim went
   // on to describe (name from the pci id, cc 0) and allocate against a card whose firmware never came up (2026-09-17).
@@ -268,11 +274,72 @@ static void catch_the_ways_out(void) {
   for (size_t i = 0; i < sizeof(g_caught) / sizeof(*g_caught); i++) sigaction(g_caught[i], &sa, &g_prev[i]);
 }
 
+// The runtime integration gate: the opt-in pre-boot unlock transaction, run BEFORE tinynv_gpu_open so no
+// persistent device/MMU/allocator state exists yet (transport-audit D1). Returns 0 to proceed with the normal boot
+// (*active=1 only when the option is on AND the override is established), 1 for a contained refusal (the open must
+// fail), 3 after an uncontained failure whose recovery hold the owner confirmed with a physical power-off (the open
+// must also fail; the card is off). Exclusivity: the installed TinyGPU server admits ONE client, and this process
+// already holds that connection - a second client cannot reach the card while the transaction runs. The project
+// gpu-lock protocol remains the runner's job (tools/rtx4090-live.sh), as for every other GPU session.
+int tinynv_tensor_unlock_gate(tinynv_pci_t *pci, int *active) {
+  *active = 0;
+  const char *env = getenv("TINYNV_TENSOR_UNLOCK");
+  int opt = tensor_unlock_option_parse(env);
+  if (opt < 0)
+    return tinynv_fail("TINYNV_TENSOR_UNLOCK must be 0 or 1 (got '%s'); the unlock is refused", env), 1;
+  if (opt == 0) return 0; // the default path: nothing below runs, nothing unlock-specific is read or touched
+  if (!pci || !pci->live || strcmp(pci->name, "usb4"))
+    return tinynv_fail("TINYNV_TENSOR_UNLOCK=1 is supported only on the TinyGPU transport (the validated path); "
+                       "backend '%s' is unsupported", pci ? pci->name : "(none)"), 1;
+  const char *bundle = tensor_unlock_bundle_dir();
+  fprintf(stderr, "libtinynv: tensor-unlock: requested (TINYNV_TENSOR_UNLOCK=1), bundle %s, payload pin %.16s…\n",
+          bundle, tensor_unlock_pins.payload.sha256);
+  // Catchable termination during the transaction must land in the containment cleanup, not kill the process under
+  // possibly-live firmware. Flag-only handlers; the normal boot installs its own teardown handlers after this window.
+  tensor_unlock_sigstate_t sigs;
+  tensor_unlock_signals_install(&sigs);
+  tensor_unlock_abort = 0;
+  tensor_unlock_result_t r;
+  int rc = tensor_unlock_run(pci, bundle, &r);
+  fprintf(stderr, "libtinynv: tensor-unlock: status=%s identity=%04x:%04x chip=%#x last-ok=%s failed-at=%s elapsed=%.2f s\n",
+          tensor_unlock_status(&r), r.identity & 0xffff, r.identity >> 16, r.chip,
+          tensor_unlock_stage_name(r.last_ok), tensor_unlock_stage_name(r.failed_at), r.elapsed_s);
+  fprintf(stderr, "libtinynv: tensor-unlock: cold feat=%#x ss0=%#x ss1=%#x; final feat=%#x ss0=%#x ss1=%#x; "
+                  "dma allocated=%d freed=%d recovery-required=%d\n",
+          r.feat_entry, r.ss0_entry, r.ss1_entry, r.feat_final, r.ss0_final, r.ss1_final,
+          r.ndma_alloc, r.ndma_freed, r.recovery_required);
+  if (r.first_error[0]) fprintf(stderr, "libtinynv: tensor-unlock: first-error: %s\n", r.first_error);
+  if (r.recovery_required) {
+    // Keep the process, socket and mappings alive; no normal boot, no GPU work, no disconnect until power-off.
+    fprintf(stderr, "libtinynv: tensor-unlock: normal initialization is STOPPED; holding ownership for recovery\n");
+    fflush(stderr);
+    tensor_unlock_recovery_hold(&r, "libtinynv");
+    tensor_unlock_signals_restore(&sigs);
+    return tinynv_fail("tensor-unlock recovery: an uncontained failure was resolved by an enclosure power-off; "
+                       "power the enclosure on and reopen to try again"), 3;
+  }
+  tensor_unlock_signals_restore(&sigs);
+  if (rc)
+    return tinynv_fail("tensor-unlock %s: %s", tensor_unlock_status(&r), r.first_error), 1;
+  *active = 1;
+  return 0;
+}
+
 static int device_boot(tinynv_device_t d) {
   if (d->boot_failed) return tinynv_fail("the gpu did not finish booting and this process will not try again: %s", d->boot_error);
   if (d->booted) return 0;
   if (d->torn_down) return tinynv_fail("the gpu has been put down for good; this process cannot use it again");
   if (!d->has_pci) return tinynv_fail("no gpu: this is the null device");
+  // The opt-in unlock transaction, before any normal device state exists. Off by default: with the option absent or
+  // 0 this call reads one environment variable and returns, and the boot below is byte-for-byte the recorded path.
+  { int ua = 0, grc = tinynv_tensor_unlock_gate(&d->pci, &ua);
+    if (grc) {
+      d->boot_failed = 1;
+      snprintf(d->boot_error, sizeof d->boot_error, "%s", tinynv_last_error());
+      fprintf(stderr, "libtinynv: boot stage failed: %s\n", d->boot_error);
+      return -1;
+    }
+    d->unlock_active = ua; }
   if (tinynv_gpu_open(&d->gpu, &d->pci)) return -1;
   d->booted = 1; // from here the card is live and must be put down even if a later stage fails
   atexit(put_the_card_down);
@@ -283,6 +350,24 @@ static int device_boot(tinynv_device_t d) {
 #define BOOT_STAGE(call) do { if (call) { d->boot_failed = 1; snprintf(d->boot_error, sizeof d->boot_error, "%s", tinynv_last_error()); \
     fprintf(stderr, "libtinynv: boot stage failed: %s\n", d->boot_error); return tinynv_fail("%s", d->boot_error); } } while (0)
   BOOT_STAGE(tinynv_gpu_boot_firmware(&d->gpu));
+  // With the unlock requested, the override must be re-read after the runtime firmware boot
+  // (which includes every unmake_boot retry reset) and BEFORE any application work queue exists. A stale software
+  // success flag is never reused: this is a fresh hardware read through the booted device's own BAR0 window.
+  if (d->unlock_active) {
+    tensor_unlock_state_t us;
+    if (tensor_unlock_postboot(d, &us) || !us.valid || !us.unlocked) {
+      d->boot_failed = 1;
+      snprintf(d->boot_error, sizeof d->boot_error,
+               "tensor-unlock failed-after-start: the override did not survive the runtime boot "
+               "(chip=%#x feat=%#x readout=%#x ss0=%#x ss1=%#x valid=%d)",
+               us.chip, us.feat, us.readout, us.ss0, us.ss1, us.valid);
+      fprintf(stderr, "libtinynv: boot stage failed: %s\n", d->boot_error);
+      return tinynv_fail("%s", d->boot_error);
+    }
+    fprintf(stderr, "libtinynv: tensor-unlock: post-boot verified (feat=%#x readout=%#x ss0=%#x ss1=%#x): the override "
+                    "survived every initialization reset and the runtime firmware boot\n",
+            us.feat, us.readout, us.ss0, us.ss1);
+  }
   BOOT_STAGE(tinynv_gsp_init_objects(&d->gpu) || tinynv_gsp_init_channel(&d->gpu) || tinynv_gsp_init_gr_context(&d->gpu) ||
              tinynv_gsp_open_client(&d->gpu) || tinynv_gsp_init_queues(&d->gpu));
   // Does the memory manager stop below what the firmware owns? The firmware has placed its write-protected region by
@@ -381,6 +466,13 @@ static tinynv_alloc_t *find_alloc(tinynv_device_t d, uint64_t va) {
 tinynv_status_t tinynv_init(void) {
   pthread_mutex_lock(&g_lock);
   if (g_inited) { pthread_mutex_unlock(&g_lock); return TINYNV_OK; }
+  // Strict opt-in parsing (spec): any nonempty value other than 0/1 is refused here, before a device is named or
+  // opened, so a typo can never silently benchmark a stock card as unlocked.
+  { const char *tu = getenv("TINYNV_TENSOR_UNLOCK");
+    if (tensor_unlock_option_parse(tu) < 0) {
+      pthread_mutex_unlock(&g_lock);
+      return tinynv_fail("TINYNV_TENSOR_UNLOCK must be 0 or 1 (got '%s'); refusing to start", tu), TINYNV_ERR_INVALID;
+    } }
   memset(&g_dev, 0, sizeof(g_dev));
   // a real device when one can be opened. the socket is how macOS reaches the gpu; TINYNV_PCI names a linux device instead
   const char *sock = getenv("TINYNV_SOCKET");
@@ -989,6 +1081,25 @@ int tinynv_device_wpr2_range(tinynv_device_t d, uint64_t *base, uint64_t *limit,
   *limit = (uint64_t)(hi >> 4) << 12;
   *vram = d->gpu.dev.vram_size;
   *managed_end = d->gpu.mm.pa.base + d->gpu.mm.pa.size;
+  return 0;
+}
+
+// The tensor-unlock handoff readout : FEAT/readout/SS0/SS1 as the live runtime firmware leaves them.
+// Read-only, on the booted device's existing BAR0 window - the same path tinynv_device_wpr2_range uses. It never
+// boots implicitly (the caller's cudaMalloc/cublasCreate already did) and never writes: a verification must not
+// change what it verifies. FEAT == 0xffffffff is the recipe's OPEN value, so all-ones is only an accessibility
+// error on the OTHER registers; the chip id is the canary that separates "unlocked" from "dead bus".
+// error-pattern reads are classified in tensor_unlock_state_classify (offline-tested there).
+int tensor_unlock_postboot(tinynv_device_t d, tensor_unlock_state_t *out) {
+  if (!d || !out) return -1;
+  memset(out, 0, sizeof(*out));
+  if (!d->has_pci || !d->booted || d->boot_failed) return -1;
+  out->chip = tinynv_rd32(&d->gpu.dev, 0);
+  out->feat = tinynv_rd32(&d->gpu.dev, GU_FEAT_PLM_OFFSET);
+  out->readout = tinynv_rd32(&d->gpu.dev, GU_FEAT_READOUT_1_OFFSET);
+  out->ss0 = tinynv_rd32(&d->gpu.dev, GU_FEAT_SS0_OFFSET);
+  out->ss1 = tinynv_rd32(&d->gpu.dev, GU_FEAT_SS1_OFFSET);
+  tensor_unlock_state_classify(out);
   return 0;
 }
 

@@ -16,6 +16,8 @@ endif
 # absolute, from the source tree: a relative firmware path finds the images from one directory and not from another,
 # which turns a missing fetch into a test that passes without testing anything
 CFLAGS  += -DTINYNV_FW_DEFAULT_DIR=\"$(abspath third_party/firmware)\"
+# the prepared AD102 unlock bundle: deterministic discovery, never downloaded at device open
+CFLAGS  += -DTINYNV_UNLOCK_DEFAULT_DIR=\"$(abspath third_party/unlock-610.43.03)\"
 PYTHON  ?= python3
 # NVIDIA's own headers, fetched by tools/fetch_nv_headers.sh and never committed (see .gitignore)
 NVSRC   := third_party/open-gpu-kernel-modules-81fe4fb417c8ac3b9bdcc1d56827d116743892a5
@@ -55,7 +57,8 @@ $(BUILD)/src/build_id.o: always
 
 UNAME := $(shell uname -s)
 SRCS  := src/err.c src/build_id.c src/qmd.c src/image.c src/arena.c src/exec.c src/cubin.c src/sha256.c src/fw.c src/dev.c src/mmu.c src/tlsf.c src/pt.c src/gpu.c src/gsp.c src/flcn.c src/vbios.c src/submit.c \
-         src/tinynv.c src/pci_replay.c src/pci_tinygpu.c
+         src/tinynv.c src/pci_replay.c src/pci_tinygpu.c \
+         src/tensor_unlock.c src/unlock610/prep_610.c src/unlock610/layout_610.c src/unlock610/vbios_610.c src/unlock610/gfw_eval.c
 ifeq ($(UNAME),Linux)
 SRCS  += src/pci_sysfs.c
 endif
@@ -87,6 +90,32 @@ $(BUILD)/test_headers: test/test_headers.c src/nv_structs.h
 	  -DTINYNV_HDR_STRUCTS=$$(grep -c '^SAME_SIZE(' test/test_headers.c) \
 	  -DTINYNV_HDR_FIELDS=$$(grep -c '^SAME_AT(' test/test_headers.c) \
 	  -DTINYNV_HDR_CONSTS=$$(grep -c '^_Static_assert(' test/test_headers.c) $< -o $@
+
+# The unlock transaction's offline suite: a register-level fake AD102 behind tinynv_pci_t, synthetic assets and a
+# synthetic board ROM. Proves control flow and every stage gate, never hardware completion (plan Phase 3).
+$(BUILD)/test_tensor_unlock: test/test_tensor_unlock.c test/fake_ad102.h $(BUILD)/libtinynv.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc $< $(BUILD)/libtinynv.a -o $@
+
+$(BUILD)/test_socket_timeout: test/test_socket_timeout.c $(BUILD)/libtinynv.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc $< $(BUILD)/libtinynv.a -o $@
+
+# The wire-protocol mock server for the end-to-end probe recovery and signal tests: the same fake AD102 the
+# unit suite uses, behind the installed transport's socket semantics. Unused fake helpers are shared code, not dead
+# code, so -Wunused-function is off for this one object.
+$(BUILD)/mock_ad102_server: test/mock_ad102_server.c test/fake_ad102.h $(BUILD)/libtinynv.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc -Wno-unused-function $< $(BUILD)/libtinynv.a -o $@
+
+# The harness that drives the runtime integration gate (tinynv_tensor_unlock_gate) over the wire.
+$(BUILD)/runtime_unlock_harness: test/runtime_unlock_harness.c $(BUILD)/libtinynv.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc $< $(BUILD)/libtinynv.a -o $@
+
+# the real probe binary, built by its own Makefile (no GPU is touched by building it)
+../../tools/rtx4090-probe/build/rtx4090-probe: $(BUILD)/libtinynv.a
+	$(MAKE) -C ../../tools/rtx4090-probe
 
 $(BUILD)/test_arena: test/test_arena.c src/arena.c
 	@mkdir -p $(dir $@)
@@ -141,7 +170,7 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # already wins over the environment, so this changes nothing about how they run - it removes the possibility that a
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
-test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_teardown_term $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+test: $(BUILD)/test_tensor_unlock $(BUILD)/test_socket_timeout $(BUILD)/mock_ad102_server $(BUILD)/runtime_unlock_harness ../../tools/rtx4090-probe/build/rtx4090-probe $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_teardown_term $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@# FIRST, before any test runs: do the tests in this directory still report what they find? On 2026-09-15
 	@# test_rm_free.c exited 0 with FAIL printed - it consulted its failure count at line 117 of a 318-line main, the
 	@# file grew past that guard, and the whole C4b decision plus the rows proving the read-only fix landed below it.
@@ -156,6 +185,17 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@# next accumulating file the day it is written. It runs first because a suite whose verdicts are discarded makes
 	@# everything after it unreadable.
 	$(PYTHON) tools/exit_status_lint.py --strict
+	@# the AD102 unlock transaction against the fake card: every stage gate, every failure path, no GPU. When the
+	@# prepared bundle is present its real bytes are hash/geometry-checked too (offline); absent, that arm says SKIPPED.
+	@$(BUILD)/test_tensor_unlock $(abspath third_party/unlock-610.43.03)
+	@# the socket receive ceiling, poisoning and EINTR retry, against a self-contained wire mock (no tinygrad needed)
+	@$(PYTHON) test/test_socket_timeout.py $(BUILD)/test_socket_timeout
+	@# the REAL probe binary end-to-end against the wire mock: recovery hold, signal handling, lock exclusivity.
+	@# Mock only — SIGKILL/crash/server death are the documented O14 limitation and are NOT covered here.
+	@$(PYTHON) test/test_probe_recovery.py ../../tools/rtx4090-probe/build/rtx4090-probe $(BUILD)/mock_ad102_server $(abspath third_party/unlock-610.43.03)
+	@# The runtime integration gate end-to-end against the same wire mock: default-off inertness, strict
+	@# option parsing, applied/verified-existing/unsupported, and the library recovery hold. Mock only, same O14 limit.
+	@$(PYTHON) test/test_runtime_unlock.py $(BUILD)/runtime_unlock_harness $(BUILD)/mock_ad102_server $(abspath third_party/unlock-610.43.03)
 	@# AND whether what is about to run was built from what is in the tree. The make here is GNU Make 3.81 (Apple's
 	@# 2006 build), which compares mtimes to the SECOND while APFS records nanoseconds - so a source edited inside the
 	@# same second its object was compiled is "not newer" and is NOT rebuilt, silently. That defeats every negative
