@@ -1,6 +1,6 @@
 // Does the card come down when the process aborts?
 //
-// ggml's CUDA_CHECK calls ggml_abort, which calls abort(), which raises SIGABRT and never runs an atexit handler. Until
+// ggml's CUDA_CHECK calls ggml_abort, which calls abort, which raises SIGABRT and never runs an atexit handler. Until
 // the library caught that, every failed check inside llama.cpp left the GPU bus mastering into mappings about to be
 // reclaimed, and macOS latched a fault flag that only re-enumerating the device clears: one person and one cable, per
 // failure. Session A found it the first time a real op suite hit a real bug.

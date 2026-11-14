@@ -14,6 +14,7 @@
 #include "fw.h"
 #include "mmu.h"
 #include "vbios.h"
+#include "boot610.h"
 
 // A booter image as SEC2 runs it: the signed bytes in video memory, and where its code and data are inside them.
 // booter_load unpacks GSP-RM into the write-protected region at boot; booter_unload tears the region down at unload.
@@ -21,6 +22,14 @@ typedef struct {
   tinynv_blob_t fw;
   tinynv_bootmem_t image;
   uint32_t code_off, code_sz, data_off, data_sz;
+  // The launch parameters the image's own metadata declares. 570: the fixed NVFW values the call sites always passed
+  // (booter 0x10/1/3, scrubber 0/1/13). 610: read from the BTL1 header, with the signature's DMEM offset
+  // derived from patch_loc - os_data_off. Same fields, so the falcon launch is one code path for both.
+  uint32_t pkc_off, engid, ucodeid;
+  // the parsed BTL1 container (610 only; is_btl1 = 0 on 570). The container bytes stay in fw; the image is
+  // fuse-patched and staged at hardware init, where the SEC2 fuse register can be read.
+  int is_btl1;
+  tinynv_btl1_t btl1;
 } tinynv_booter_t;
 
 typedef struct {
@@ -52,6 +61,10 @@ int tinynv_flcn_reset(tinynv_gpu_t *g, uint64_t base, int riscv);
 void tinynv_flcn_disable_ctx_req(tinynv_dev_t *d, uint64_t base);
 void tinynv_flcn_start_cpu(tinynv_dev_t *d, uint64_t base);
 int tinynv_flcn_wait_cpu_halted(tinynv_dev_t *d, uint64_t base);
+// the same primitives, exposed for the 610 host-request executor (gsp610_host.c). The 610 firmware replaced
+// the register sequencer with structured load-exec requests, which drive the falcon through these same operations.
+void tinynv_flcn_rmw(tinynv_dev_t *d, uint64_t off, uint32_t mask, uint32_t val);
+int tinynv_flcn_dma(tinynv_dev_t *d, uint64_t base, uint32_t cmd, uint32_t dest, uint32_t mem_off, uint64_t src, uint32_t size);
 
 int tinynv_flcn_init_sw(tinynv_gpu_t *g); // place the boot image and its arguments. no hardware.
 int tinynv_flcn_init_hw(tinynv_gpu_t *g); // send the chain of trust message and wait for the falcon to be released.

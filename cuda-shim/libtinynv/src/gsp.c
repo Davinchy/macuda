@@ -9,6 +9,9 @@
 #include "gpu.h"
 #include "internal.h"
 #include "nv_regs.h"
+#include "rpc610.h"   // tinynv_rpc_checksum: the XOR-fold shared with the 610 element codec
+#include "gsp610_host.h"
+#include "fw610.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +19,25 @@
 
 #define MB (1ull << 20)
 #define PAGE 0x1000ull
+
+// the PFB sysmem-flush address registers are absent from the generated nv_regs.h. Offsets and fields from the
+// pinned 610 swref/published/ampere/ga100/dev_fb.h: LO 0x100C10 ADR_39_08 (31:0, address >> 8); HI 0x100C40 ADR_63_40
+// (23:0, mask 0x7F, address >> 40).
+#define NV_PFB_NISO_FLUSH_SYSMEM_ADDR         0x00100C10u
+#define NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI      0x00100C40u
+#define NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI_MASK 0x7Fu
+
+// the frozen profile decides every version-dependent branch below. Pointer identity, not a string compare:
+// the selector hands out exactly these two descriptors and nothing else can become one (runtime_profile.c).
+static int is610(const tinynv_gpu_t *g) { return g->profile == &tinynv_runtime_610; }
+static int gsp_schedule_group(tinynv_gpu_t *g, uint32_t client, uint32_t group);
+
+// The staged generic-bootloader ucode for the 610 host-request executor (loaded at software init, fw610).
+static tinynv_gsp610_bl_ucode_t gsp610_bl(const tinynv_gsp_t *gsp) {
+  tinynv_gsp610_bl_ucode_t bl = {.image = gsp->gbl_fw.data, .image_len = gsp->gbl_fw.size,
+                                 .start_tag = gsp->gbl_start_tag, .code_size = gsp->gbl_code_size};
+  return bl;
+}
 
 // The firmware this driver is pinned to. The hashes are the version: a firmware image is code the GPU's secure boot
 // executes, so the file's name is not evidence of anything and the content is checked before it is used.
@@ -52,7 +74,7 @@ static uint64_t id8_of(const char *s) {
 // The recorded 5090 boot never sends one -- there is not a single register write between the chain of trust and the
 // windows being retargeted -- so this path is written from the oracle and has not been exercised by the replay. It is
 // here rather than left as a failure because a board that does send one would otherwise stop dead.
-// Returns -1 with the reason in tinynv_last_error() if the sequence could not be completed. It used to be void and
+// Returns -1 with the reason in tinynv_last_error if the sequence could not be completed. It used to be void and
 // `return` silently from every falcon step that failed, after which the caller sat in a 60 s wait for a start-up notice
 // that could never come and reported only the wait - the real failure was overwritten before anyone read it. On the
 // 3060 (2026-09-17) that was three boots in a row with nothing between the sequence line and the timeout.
@@ -152,6 +174,131 @@ static int run_cpu_seq(tinynv_gpu_t *g, const uint8_t *msg, size_t len) {
 // its own header; the reader advances a read pointer that, by this queue's convention, is stored in the *other*
 // direction's header. So neither side ever writes to the other's header, and a single shared mapping is enough.
 
+// the 610 libos has three tasks the 570 one does not - DEBUG, ROOT and RM_STATE_MONITOR - and the pinned
+// 610 kgspSetupLibosLogs provides a log region for EACH of them (kernel_gsp.c logInitValues: LOGDBG 64K, LOGROOT 4K,
+// LOGRMON 4K, on top of INIT/INTR/RM/MNOC/KRNL). The 570 baremetal list is only INIT/INTR/RM/MNOC (+KRNL), which is
+// what the 570 path keeps. Offsets inside the 2 MiB log allocation; the region ORDER matches the vendor's.
+static const struct { const char *name; uint64_t off, size; } LOGS610[] = {
+  {"LOGINIT", 0x00000, 0x10000}, {"LOGINTR", 0x10000, 0x10000}, {"LOGRM", 0x20000, 0x10000},
+  {"LOGMNOC", 0x30000, 0x10000}, {"LOGDBG", 0x40000, 0x10000}, {"LOGROOT", 0x50000, 0x1000},
+  {"LOGRMON", 0x51000, 0x1000}, {"LOGKRNL", 0x60000, 0x10000},
+};
+
+// when GSP-RM never writes the status queue header, the only witnesses are its own log buffers (libos
+// writes LOGINIT/LOGRM there from its first instructions) and the falcon's state. Read-only, failure path only -
+// a successful boot never reaches this, so the recorded 570 operation stream is unchanged.
+static void gsp_silent_boot_diag(tinynv_gpu_t *g) {
+  tinynv_gsp_t *gsp = &g->gsp;
+  tinynv_dev_t *d = &g->dev;
+  if (!d->pci || !d->pci->live) return;
+  uint32_t mb0 = tinynv_rd32(d, NV_PGSP_FALCON_MAILBOX0);
+  uint32_t mb1 = tinynv_rd32(d, NV_PGSP_FALCON_MAILBOX0 + 4);
+  uint32_t os = tinynv_rd32(d, g->flcn.falcon + NV_PFALCON_FALCON_OS);
+  uint32_t cpuctl = tinynv_rd32(d, g->flcn.falcon + NV_PRISCV_RISCV_CPUCTL);
+  fprintf(stderr, "tinynv: silent-boot diag: gsp mailbox0 %#x mailbox1 %#x falcon_os %#x cpuctl %#x (active %u, halted %u)\n",
+          mb0, mb1, os, cpuctl,
+          NV_GET(cpuctl, NV_PRISCV_RISCV_CPUCTL, ACTIVE_STAT), NV_GET(cpuctl, NV_PRISCV_RISCV_CPUCTL, HALTED));
+  // did GSP-RM consume the pre-filled command-ring records (sysinfo/registry)? its read pointer lives in the
+  // status header's rx area; the command header's own writePtr is ours. Dump both headers raw.
+  if (gsp->queues.size && gsp->cmd_q_off) {
+    uint32_t hdr[8];
+    nv_rd_block(&gsp->queues.view, gsp->cmd_q_off, hdr, sizeof(hdr));
+    fprintf(stderr, "tinynv: silent-boot diag: cmd hdr ver=%u size=%#x msgSize=%#x msgCount=%u writePtr=%u flags=%#x rxHdrOff=%#x entryOff=%#x\n",
+            hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7]);
+    nv_rd_block(&gsp->queues.view, gsp->cmd_q_off + gsp->queue_size, hdr, sizeof(hdr));
+    fprintf(stderr, "tinynv: silent-boot diag: stat hdr ver=%u size=%#x msgSize=%#x msgCount=%u writePtr=%u flags=%#x rxHdrOff=%#x entryOff=%#x\n",
+            hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7]);
+  }
+  // the exact blocks handed to the firmware: WPR meta, cached RM args, libos regions. Read back from where the
+  // firmware reads them, so a placement/encoding mistake is visible rather than assumed.
+  if (gsp->wpr_meta.size) {
+    uint64_t m[32];
+    nv_rd_block(&gsp->wpr_meta.view, 0, m, sizeof m);
+    fprintf(stderr, "tinynv: silent-boot diag: wpr meta @%#llx:", (unsigned long long)gsp->wpr_meta.addrs[0]);
+    for (int k = 0; k < 32; k++) fprintf(stderr, "%s%016llx", k % 4 ? " " : "\n  ", (unsigned long long)m[k]);
+    fprintf(stderr, "\n");
+  }
+  if (gsp->rm_args.size) {
+    uint64_t a[20];
+    size_t n = gsp->rm_args.size < sizeof a ? gsp->rm_args.size : sizeof a;
+    nv_rd_block(&gsp->rm_args.view, 0, a, n);
+    fprintf(stderr, "tinynv: silent-boot diag: rm args @%#llx (%zu B):", (unsigned long long)gsp->rm_args.addrs[0], gsp->rm_args.size);
+    for (size_t k = 0; k < n / 8; k++) fprintf(stderr, "%s%016llx", k % 4 ? " " : "\n  ", (unsigned long long)a[k]);
+    fprintf(stderr, "\n");
+  }
+  if (gsp->libos_args.size) {
+    uint64_t r[40];
+    nv_rd_block(&gsp->libos_args.view, 0, r, sizeof r);
+    fprintf(stderr, "tinynv: silent-boot diag: libos args @%#llx:", (unsigned long long)gsp->libos_args.addrs[0]);
+    for (int k = 0; k < 40; k++) fprintf(stderr, "%s%016llx", k % 4 ? " " : "\n  ", (unsigned long long)r[k]);
+    fprintf(stderr, "\n");
+  }
+  // read back what booter_load unpacked into the WPR image slot, through the retargeting BAR1 window
+  // (read-only). The first words must be the libos boot code; the embedded task ELFs must start with \x7fELF.
+  if (is610(g) && gsp->wpr_meta.size) {
+    uint64_t meta[32];
+    nv_rd_block(&gsp->wpr_meta.view, 0, meta, sizeof meta);
+    uint64_t gsp_off = meta[17]; // gspFwOffset (tinynv_wpr_meta_t word order)
+    static const uint64_t probes[] = {0, 0x6e000, 0x120c000, 0x5052000};
+    // the probes read the BAR1 view at full-VRAM offsets, reachable only when the window spans the image
+    // (a large BAR). nv_rd32 does not bounds-check a .ptr-backed view, and the offline mock's window is 128 MiB, so
+    // reading gsp_off there runs past the mapping and faults. Skip the FB probes when the window cannot reach the
+    // last probe; on a large-BAR card the window spans VRAM and every probe reads exactly as before.
+    if (gsp_off + probes[sizeof probes / sizeof probes[0] - 1] + 16 <= d->vram.size) {
+      for (size_t k = 0; k < sizeof probes / sizeof probes[0]; k++) {
+        uint32_t w[4];
+        for (int j = 0; j < 4; j++) w[j] = nv_rd32(&d->vram, gsp_off + probes[k] + 4 * j);
+        fprintf(stderr, "tinynv: silent-boot diag: fb image @%#llx+%#llx: %08x %08x %08x %08x\n",
+                (unsigned long long)gsp_off, (unsigned long long)probes[k], w[0], w[1], w[2], w[3]);
+      }
+      // control: a NON-WPR FB address. If this also reads ff, the window itself is not answering (the firmware owns
+      // BAR1 while it runs); if it reads data, the ff above is the WPR read protection, not a missing image.
+      uint32_t c[4];
+      for (int j = 0; j < 4; j++) c[j] = nv_rd32(&d->vram, 0x100000 + 4 * j);
+      fprintf(stderr, "tinynv: silent-boot diag: fb non-wpr @0x100000: %08x %08x %08x %08x\n", c[0], c[1], c[2], c[3]);
+    }
+  }
+  if (!gsp->logbuf.size || gsp->logbuf.size < 5 * 0x10000) return;
+  uint8_t *buf = malloc(0x10000);
+  if (!buf) return;
+  static const char *LOGS[] = {"INIT", "INTR", "RM", "MNOC", "KRNL"};
+  const int nlogs = is610(g) ? 8 : 5;
+  for (int i = 0; i < nlogs; i++) {
+    const uint64_t loff = is610(g) ? LOGS610[i].off : 0x10000ull * i;
+    const size_t lsize = is610(g) ? (size_t)LOGS610[i].size : 0x10000;
+    const char *lname = is610(g) ? LOGS610[i].name : LOGS[i];
+    nv_rd_block(&gsp->logbuf.view, loff, buf, lsize);
+    // libos logs are BINARY nvlog entries (packed u64: metadata VA 47:0, totalArgs 55:48, taskId 63:56 -
+    // libos_log.h), not text. Count non-zero words and dump them raw; a text scan stops at the first zero byte
+    // inside the first entry and reads as "1 byte written". Word 0 is the ring's put pointer; records are packed
+    // from word 1 up to it, so the NEWEST entries (where RM logs its start-up result) sit at the high end. Dump the
+    // whole committed region, not a fixed prefix - a 96-word cap hid the RM tail that names the init failure.
+    const uint64_t *w = (const uint64_t *)buf;
+    size_t used = 0;
+    for (size_t k = 0; k < lsize / 8; k++) if (w[k]) used = k + 1;
+    if (!used) { fprintf(stderr, "tinynv: gsp log %s: empty\n", lname); continue; }
+    fprintf(stderr, "tinynv: gsp log %s: %zu non-zero u64 words (last at %#zx, put=%llu):\n", lname, used,
+            (used - 1) * 8, (unsigned long long)w[0]);
+    for (size_t k = 0; k < used; k++)
+      fprintf(stderr, "  [%04zu] %016llx  task=%llu args=%llu meta=%#llx\n", k, (unsigned long long)w[k],
+              (unsigned long long)(w[k] >> 56), (unsigned long long)((w[k] >> 48) & 0xff),
+              (unsigned long long)(w[k] & 0xffffffffffffull));
+  }
+  free(buf);
+}
+
+// a boot stage that fails with the firmware ALREADY UP leaves its reason inside RM's own log rings, and
+// nothing on the 610 path read them: the silent-boot dump above only runs when the status queue never initialises,
+// and its env-var arm only after a successful boot. A refusal several stages in - the first channel allocation, say -
+// therefore reported the envelope's status code and nothing else, while RM's own NV_PRINTF(LEVEL_ERROR) explaining
+// itself sat in LOGRM unread. Called from the boot-stage failure path. Read-only, and 610-gated HERE so the gate
+// cannot be forgotten at a call site and the 570 profile issues no operation it did not issue before.
+void tinynv_gsp_boot_stage_diag(tinynv_gpu_t *g) {
+  if (!is610(g)) return;
+  fprintf(stderr, "tinynv: a boot stage failed with gsp-rm already up; reading its own log rings for the reason\n");
+  gsp_silent_boot_diag(g);
+}
+
 // Wait for a queue's header to say its slots have appeared, then take our copy of it from memory rather than assuming
 // what we wrote. For the command queue that is immediate: we wrote it. For the status queue it is the whole of GSP-RM's
 // start-up, which on this card is several seconds of spinning.
@@ -164,8 +311,11 @@ static int rpcq_attach(tinynv_gpu_t *g, tinynv_rpcq_t *q, uint64_t base, const c
   do {
     entry_off = nv_rd32(&gsp->queues.view, base + offsetof(tinynv_msgq_tx_header_t, entryOff));
   } while (entry_off != PAGE && tinynv_now_s() < deadline);
-  if (entry_off != PAGE) return tinynv_fail("the %s queue never initialised: its entry offset read %#x, not %#llx",
-                                            what, entry_off, (unsigned long long)PAGE);
+  if (entry_off != PAGE) {
+    if (!strcmp(what, "status")) gsp_silent_boot_diag(g);
+    return tinynv_fail("the %s queue never initialised: its entry offset read %#x, not %#llx",
+                       what, entry_off, (unsigned long long)PAGE);
+  }
   nv_rd_block(&gsp->queues.view, base, &q->tx, sizeof(q->tx));
   q->entries = base + q->tx.entryOff;
   if (!q->tx.msgSize || !q->tx.msgCount) return tinynv_fail("the %s queue describes %u slots of %u bytes", what,
@@ -176,7 +326,9 @@ static int rpcq_attach(tinynv_gpu_t *g, tinynv_rpcq_t *q, uint64_t base, const c
 // The element header's own checksum: exclusive-or of the record as 64 bit words, folded in half. Zero length tails are
 // padded, which matters because a record is only ever a whole number of slots on the wire but is checksummed at its
 // natural length.
-static uint32_t rpc_checksum(const uint8_t *data, size_t n) {
+// Shared with the 610 element codec (rpc610.c): the algorithm is byte-identical in 570 and 610 (_checkSum32), so it
+// lives here once. renamed it from static rpc_checksum; the 570 call sites are unchanged.
+uint32_t tinynv_rpc_checksum(const uint8_t *data, size_t n) {
   uint64_t sum = 0;
   size_t whole = n / 8 * 8;
   for (size_t i = 0; i < whole; i += 8) {
@@ -216,7 +368,7 @@ static int rpc_send_record(tinynv_gpu_t *g, uint32_t func, const void *payload, 
   eh->elemCount = elem_count;
   eh->seqNum = q->seq;
   // the checksum covers the record at its natural length, with the checksum field still zero
-  eh->checkSum = rpc_checksum(rec, sizeof(*eh) + mh->length);
+  eh->checkSum = tinynv_rpc_checksum(rec, sizeof(*eh) + mh->length);
 
   uint64_t ring = q->entries, ring_len = (uint64_t)q->tx.msgSize * q->tx.msgCount;
   uint32_t wp = nv_rd32(&gsp->queues.view, q->base + offsetof(tinynv_msgq_tx_header_t, writePtr));
@@ -250,7 +402,48 @@ static int rpc_send_record(tinynv_gpu_t *g, uint32_t func, const void *payload, 
 
 // A payload too long for one record is continued in further records. The first carries the real function number and the
 // rest a continuation marker, which is how the far side knows to join them back together.
+// the 610 profile frames records with the MCTP/NVDM element codec (rpc610) and splits at the vendor's ONE
+// PAGE, not the queue's 16-element ceiling. The 570 path below is unchanged operation for operation.
+static int rpc_send_record610(tinynv_gpu_t *g, uint32_t func, const void *payload, size_t len) {
+  tinynv_gsp_t *gsp = &g->gsp;
+  tinynv_rpcq_t *q = &gsp->cmd_q;
+  if (tinynv_failpoint("610-rpc-send")) return -1;
+  // A record may span up to sixteen page-sized queue elements; the codec enforces
+  // the negotiated ceiling, including its transport header.
+  uint8_t *rec = calloc(1, TINYNV_RPC610_ELEM_SIZE_MAX);
+  if (!rec) return tinynv_fail("out of memory for a 610 rpc record");
+  uint32_t elem_count = 0;
+  size_t total = 0;
+  if (tinynv_rpc610_encode(rec, TINYNV_RPC610_ELEM_SIZE_MAX, func, payload, len, q->seq, q->tx.msgSize,
+                           &elem_count, &total)) { free(rec); return -1; }
+
+  uint64_t ring = q->entries, ring_len = (uint64_t)q->tx.msgSize * q->tx.msgCount;
+  uint32_t wp = nv_rd32(&gsp->queues.view, q->base + offsetof(tinynv_msgq_tx_header_t, writePtr));
+  uint64_t off = (uint64_t)wp * q->tx.msgSize;
+  size_t first = total < ring_len - off ? total : (size_t)(ring_len - off);
+  nv_wr_block(&gsp->queues.view, ring + off, rec, first);
+  if (first < total) nv_wr_block(&gsp->queues.view, ring, rec + first, total - first);
+  nv_wr32(&gsp->queues.view, q->base + offsetof(tinynv_msgq_tx_header_t, writePtr), (wp + elem_count) % q->tx.msgCount);
+  __sync_synchronize(); // the doorbell must not be seen before the record it announces
+  if (getenv("TINYNV_RPC_TRACE"))
+    fprintf(stderr, "tinynv: 610 rpc function %u, %zu bytes payload, %u element(s) at mem:0 %#llx (seq %u)\n",
+            func, len, elem_count, (unsigned long long)(ring + off), q->seq);
+  q->seq++;
+  tinynv_wr32(&g->dev, NV_PGSP_QUEUE_HEAD(0), 0);
+  free(rec);
+  return 0;
+}
+
 static int rpc_send(tinynv_gpu_t *g, uint32_t func, const void *payload, size_t len) {
+  if (is610(g)) {
+    const size_t max = tinynv_rpc610_first_payload_max();
+    const uint8_t *p = payload;
+    if (rpc_send_record610(g, func, p, len < max ? len : max)) return -1;
+    for (size_t off = max; off < len; off += max)
+      if (rpc_send_record610(g, TINYNV_MSG_FUNCTION_CONTINUATION_RECORD, p + off, len - off < max ? len - off : max))
+        return -1;
+    return 0;
+  }
   tinynv_rpcq_t *q = &g->gsp.cmd_q;
   size_t max = (size_t)q->tx.msgSize * 16 - sizeof(tinynv_msg_element_t) - sizeof(tinynv_msg_header_t);
   const uint8_t *p = payload;
@@ -260,11 +453,311 @@ static int rpc_send(tinynv_gpu_t *g, uint32_t func, const void *payload, size_t 
   return 0;
 }
 
+// names for the wire, so a refusal reads as the thing that was refused rather than a number to look up in a
+// header. Only what this driver's boot path actually puts on the wire; anything else says so instead of guessing.
+static const char *rpc610_function_name(uint32_t func) {
+  switch (func) {
+    case TINYNV_MSG_FUNCTION_GSP_RM_ALLOC: return "an object allocation";
+    case TINYNV_MSG_FUNCTION_GSP_RM_CONTROL: return "an object control call";
+    case TINYNV_MSG_FUNCTION_UNLOADING_GUEST_DRIVER: return "the unload notice";
+    default: return "a call";
+  }
+}
+
+static const char *rpc610_class_name(uint32_t cls) {
+  switch (cls) {
+    case TINYNV_CLASS_ROOT: return "the root client";
+    case TINYNV_CLASS_DEVICE: return "a device";
+    case TINYNV_CLASS_SUBDEVICE: return "a subdevice";
+    case TINYNV_CLASS_VASPACE: return "a VA space";
+    case TINYNV_CLASS_MEMORY_VIRTUAL: return "virtual memory";
+    case TINYNV_CLASS_CHANNEL_GROUP: return "a channel group";
+    case TINYNV_CLASS_CONTEXT_SHARE: return "a context share";
+    case TINYNV_CLASS_GPFIFO_AMPERE: return "an Ampere GPFIFO channel";
+    case TINYNV_CLASS_GPFIFO_BLACKWELL: return "a Blackwell GPFIFO channel";
+    case TINYNV_CLASS_COMPUTE_AMPERE: return "an Ampere compute object";
+    case TINYNV_CLASS_COMPUTE_ADA: return "an Ada compute object";
+    case TINYNV_CLASS_DMA_COPY_AMPERE: return "an Ampere copy object";
+    case TINYNV_CLASS_DMA_COPY_BLACKWELL: return "a Blackwell copy object";
+    case TINYNV_CLASS_USER_SHARED_DATA: return "a user shared data block";
+    default: return "an object this driver has no name for";
+  }
+}
+
+// what a refused allocation put on the wire, next to what gsp-rm handed back. The 512-byte error buffer that
+// carries the reason to the caller cannot hold a 376-byte parameter blob, and the blob is the evidence: gsp-rm rewrites
+// the fields it owns as its construct runs, in a known order - cid becomes its own counter first thing, then the
+// client-supplied internal fields (internalFlags, both notifier descriptors, the process ids) are cleared, and
+// hPhysChannelGroup is filled with the TSG it allocated internally to wrap a channel whose parent is a device. Which of
+// those happened says how far the handler got before it refused, which is the question the error code alone cannot
+// answer: a status of 0x1f arrives from the rpc decode layer and from a dozen places inside the construct alike. And a
+// byte that differs where nothing should have touched it is a serializer bug, visible at a glance. stderr, so no length
+// limit applies and the live log keeps all of it. Failure path only, and only for the 610 wire format.
+static void dump_refused_blob(const char *what, const uint8_t *b, uint32_t len) {
+  fprintf(stderr, "tinynv: refusal diag: %s (%u bytes)\n", what, len);
+  for (uint32_t i = 0; i < len; i += 16) {
+    fprintf(stderr, "tinynv:   %04x:", i);
+    for (uint32_t j = i; j < i + 16 && j < len; j++) fprintf(stderr, " %02x", b[j]);
+    fprintf(stderr, "\n");
+  }
+}
+
+static void dump_refused_alloc610(tinynv_gpu_t *g, const tinynv_rpc_rm_alloc_t *ah, const uint8_t *payload,
+                                  uint32_t payload_len) {
+  tinynv_gsp_t *gsp = &g->gsp;
+  fprintf(stderr,
+          "tinynv: refusal diag: echoed header hClient %#x hParent %#x hObject %#x hClass %#x status %#x paramsSize %u "
+          "flags %#x reserved %#x\n",
+          ah->hClient, ah->hParent, ah->hObject, ah->hClass, ah->status, ah->paramsSize, ah->flags, ah->reserved);
+  const uint8_t *echo = payload + sizeof *ah;
+  uint32_t echo_len = payload_len - (uint32_t)sizeof *ah;
+  dump_refused_blob("the parameters this driver sent", gsp->last_alloc_sent, gsp->last_alloc_sent_len);
+  dump_refused_blob("the parameters gsp-rm echoed back", echo, echo_len);
+  if (ah->hClass != TINYNV_CLASS_GPFIFO_AMPERE && ah->hClass != TINYNV_CLASS_GPFIFO_BLACKWELL) return;
+  if (gsp->last_alloc_sent_len != sizeof(tinynv_rpc610_gpfifo_alloc_t) ||
+      echo_len < sizeof(tinynv_rpc610_gpfifo_alloc_t))
+    return;
+  const tinynv_rpc610_gpfifo_alloc_t *s = (const tinynv_rpc610_gpfifo_alloc_t *)gsp->last_alloc_sent;
+  tinynv_rpc610_gpfifo_alloc_t e;
+  memcpy(&e, echo, sizeof e);
+  fprintf(stderr, "tinynv: refusal diag: channel parameters, sent -> echoed. a value gsp-rm changed is one it "
+                  "reached; the notes say when it changes each\n");
+  fprintf(stderr, "tinynv:   cid               %#10x -> %#-10x replaced by rm's own counter, before any validation\n",
+          s->cid, e.cid);
+  fprintf(stderr, "tinynv:   internalFlags     %#10x -> %#-10x cleared once the client's own fields are dropped\n",
+          s->internalFlags, e.internalFlags);
+  fprintf(stderr, "tinynv:   hPhysChannelGroup %#10x -> %#-10x the tsg rm wrapped this channel in, if it got that far\n",
+          s->hPhysChannelGroup, e.hPhysChannelGroup);
+  fprintf(stderr, "tinynv:   ProcessID         %#10x -> %#-10x cleared with internalFlags\n", s->ProcessID, e.ProcessID);
+  fprintf(stderr, "tinynv:   errorNotifierMem  %#10llx -> %#-10llx cleared with internalFlags\n",
+          (unsigned long long)s->errorNotifierMem.base, (unsigned long long)e.errorNotifierMem.base);
+  fprintf(stderr, "tinynv:   flags             %#10x -> %#-10x read, never rewritten: userd index/page, privilege\n",
+          s->flags, e.flags);
+  fprintf(stderr, "tinynv:   engineType        %#10x -> %#-10x 1 is gr0, which is what compute runs on\n",
+          s->engineType, e.engineType);
+  fprintf(stderr, "tinynv:   hVASpace          %#10x -> %#-10x pointer-based; must be the only one of the two set\n",
+          s->hVASpace, e.hVASpace);
+  fprintf(stderr, "tinynv:   hHandleVASpace    %#10x -> %#-10x new in 610, handle-based; sent as zero\n",
+          s->hHandleVASpace, e.hHandleVASpace);
+  fprintf(stderr, "tinynv:   hContextShare     %#10x -> %#-10x must be zero: it and hVASpace cannot both be set\n",
+          s->hContextShare, e.hContextShare);
+  fprintf(stderr, "tinynv:   hObjectError      %#10x -> %#-10x zero on the privileged channel\n", s->hObjectError,
+          e.hObjectError);
+  fprintf(stderr, "tinynv:   gpFifoEntries     %#10x -> %#-10x ring depth\n", s->gpFifoEntries, e.gpFifoEntries);
+  fprintf(stderr, "tinynv:   gpFifoOffset      %#10llx -> %#-10llx the ring's address\n",
+          (unsigned long long)s->gpFifoOffset, (unsigned long long)e.gpFifoOffset);
+  fprintf(stderr, "tinynv:   subDeviceId       %#10x -> %#-10x one-hot subdevice mask\n", s->subDeviceId, e.subDeviceId);
+  const struct { const char *n; const tinynv_memory_desc_t *a, *b; } D[] = {
+    {"instanceMem", &s->instanceMem, &e.instanceMem}, {"userdMem", &s->userdMem, &e.userdMem},
+    {"ramfcMem", &s->ramfcMem, &e.ramfcMem},         {"mthdbufMem", &s->mthdbufMem, &e.mthdbufMem}};
+  for (unsigned i = 0; i < sizeof D / sizeof *D; i++)
+    fprintf(stderr, "tinynv:   %-14s base %#llx size %#llx space %u attr %u -> base %#llx size %#llx space %u attr %u\n",
+            D[i].n, (unsigned long long)D[i].a->base, (unsigned long long)D[i].a->size, D[i].a->addressSpace,
+            D[i].a->cacheAttrib, (unsigned long long)D[i].b->base, (unsigned long long)D[i].b->size,
+            D[i].b->addressSpace, D[i].b->cacheAttrib);
+  if (memcmp(s, &e, sizeof e) == 0)
+    fprintf(stderr, "tinynv: refusal diag: the echo is byte-identical to what was sent, so gsp-rm rewrote nothing: "
+                    "its channel construct never ran, and the refusal came from the layer that decoded the message\n");
+}
+
+// the 610 status-queue drain. Same ring discipline as 570 (pointer bounds, one ring's worth per call), but
+// the record framing is the MCTP/NVDM element codec, the sequence number is checked per record (the 610 host's
+// rxSeqNum rule), the removed register sequencer is refused through the host-request dispatcher, and a split reply
+// is reassembled: RM echoes the request, so the caller's head+params size is the exact total to wait for.
+static int rpc_drain610(tinynv_gpu_t *g, uint32_t want, uint32_t want_total, int *seen, uint8_t **reply,
+                        uint32_t *reply_len) {
+  tinynv_gsp_t *gsp = &g->gsp;
+  tinynv_rpcq_t *q = &gsp->stat_q;
+  __sync_synchronize();
+  for (uint32_t taken = 0;; taken++) {
+    uint32_t rp = nv_rd32(&gsp->queues.view, q->rx_off);
+    uint32_t wp = nv_rd32(&gsp->queues.view, q->base + offsetof(tinynv_msgq_tx_header_t, writePtr));
+    if (rp == wp) return 0;
+    if (wp >= q->tx.msgCount || rp >= q->tx.msgCount)
+      return tinynv_fail("the 610 status queue's pointers are outside the ring (read %u, write %u, %u slots): the "
+                         "memory gsp-rm writes has been corrupted", rp, wp, q->tx.msgCount);
+    if (taken >= q->tx.msgCount)
+      return tinynv_fail("the 610 status queue never empties (%u records taken, write pointer %u)", taken, wp);
+
+    // The element count is DERIVED from the RPC length (610 stores no elemCount), so read the two headers first.
+    uint64_t slot = q->entries + (uint64_t)rp * q->tx.msgSize;
+    uint8_t hdrs[TINYNV_RPC610_ELEM_HDR_SIZE + 32];
+    nv_rd_block(&gsp->queues.view, slot, hdrs, sizeof hdrs);
+    tinynv_msg_header_t mh;
+    memcpy(&mh, hdrs + TINYNV_RPC610_ELEM_HDR_SIZE, sizeof mh);
+    if (mh.length < sizeof(tinynv_msg_header_t) || mh.length > TINYNV_RPC610_ELEM_SIZE_MAX - TINYNV_RPC610_ELEM_HDR_SIZE)
+      return tinynv_fail("the 610 status record declares %u rpc bytes, outside [%zu, %u]", mh.length,
+                         sizeof(tinynv_msg_header_t), TINYNV_RPC610_ELEM_SIZE_MAX - TINYNV_RPC610_ELEM_HDR_SIZE);
+    size_t msg_len = TINYNV_RPC610_ELEM_HDR_SIZE + (size_t)mh.length;
+    uint32_t count = (uint32_t)((msg_len + q->tx.msgSize - 1) / q->tx.msgSize);
+    if (count > q->tx.msgCount)
+      return tinynv_fail("the 610 status record spans %u elements, more than the ring's %u slots", count, q->tx.msgCount);
+    size_t total = (size_t)count * q->tx.msgSize;
+    uint8_t *rec = malloc(total);
+    if (!rec) return tinynv_fail("out of memory for a %zu byte 610 status record", total);
+    uint64_t ring_len = (uint64_t)q->tx.msgSize * q->tx.msgCount, off = (uint64_t)rp * q->tx.msgSize;
+    size_t first = total <= ring_len - off ? total : (size_t)(ring_len - off);
+    nv_rd_block(&gsp->queues.view, q->entries + off, rec, first);
+    if (first < total) nv_rd_block(&gsp->queues.view, q->entries, rec + first, total - first);
+
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0, elem_count = 0;
+    if (tinynv_rpc610_decode(rec, total, q->tx.msgSize, q->seq, &mh, &payload, &payload_len, &elem_count)) {
+      free(rec);
+      return -1;
+    }
+    q->seq++;
+    nv_wr32(&gsp->queues.view, q->rx_off, (rp + elem_count) % q->tx.msgCount);
+    __sync_synchronize();
+    if (tinynv_failpoint("610-rpc-reply")) { free(rec); return -1; }
+
+    uint32_t func = mh.function;
+    if (mh.rpc_result) {
+      // this refusal used to be one clause and the record was freed unread. But GSP-RM ECHOES the request
+      // back, so the record being thrown away is the only thing on the wire that says WHICH object was refused - and
+      // it carries a second status, the alloc/control header's own, which the envelope's result does not duplicate.
+      // The two together separate the cases that look identical from the outside: an envelope result with a ZERO
+      // echoed status means the message was turned away while being decoded, before any class handler ran; two equal
+      // values mean the handler ran and refused on its own terms. Six wrong guesses were spent on a refusal that
+      // never named its class. Read before freeing, on the failure path only.
+      //
+      // The echoed status leads the detail, because the error buffer is 512 bytes and the first run that carried a
+      // detail at all had it appended last - the truncation fell exactly there, and the one field that decides which
+      // of the two cases this is never reached the log. Everything after it is ordered by how much it narrows the
+      // search. The field-by-field comparison goes to stderr, which has no such limit.
+      char detail[352];
+      detail[0] = 0;
+      if (func == TINYNV_MSG_FUNCTION_GSP_RM_ALLOC && payload_len >= sizeof(tinynv_rpc_rm_alloc_t)) {
+        tinynv_rpc_rm_alloc_t ah;
+        memcpy(&ah, payload, sizeof ah);
+        // kept for the caller, which on the 610 channel sweep has to report a status per attempt and cannot
+        // get one out of the failure text (gsp.h:last_alloc_status).
+        gsp->last_alloc_status = ah.status;
+        snprintf(detail, sizeof detail,
+                 ": gsp-rm's own status for the call is %#x, %s; the echo names %s (class %#x), handle %#x under "
+                 "parent %#x for client %#x, %u parameter bytes, flags %#x",
+                 ah.status,
+                 ah.status ? "so the class handler ran and refused on its own terms"
+                           : "zero, so the envelope refused the message while decoding it, before the class handler "
+                             "ran",
+                 rpc610_class_name(ah.hClass), ah.hClass, ah.hObject, ah.hParent, ah.hClient, ah.paramsSize, ah.flags);
+        dump_refused_alloc610(g, &ah, payload, payload_len);
+      } else if (func == TINYNV_MSG_FUNCTION_GSP_RM_CONTROL && payload_len >= sizeof(tinynv_rpc610_rm_control_t)) {
+        tinynv_rpc610_rm_control_t ch;
+        memcpy(&ch, payload, sizeof ch);
+        snprintf(detail, sizeof detail,
+                 ": gsp-rm's own status for the call is %#x; the echo names control %#x on object %#x for client %#x, "
+                 "%u parameter bytes",
+                 ch.status, ch.cmd, ch.hObject, ch.hClient, ch.paramsSize);
+        if (payload_len > sizeof ch)
+          dump_refused_blob("the control parameters gsp-rm echoed back", payload + sizeof ch,
+                            payload_len - (uint32_t)sizeof ch);
+      }
+      free(rec);
+      return tinynv_fail("gsp-rm refused rpc %u (%s) with result %#x%s. The reply was %u bytes", func,
+                         rpc610_function_name(func), mh.rpc_result, detail, payload_len);
+    }
+
+    // The sequencer's replacements: validated and executed before any other interpretation. A malformed request,
+    // the removed sequencer event or an unknown event is a refusal here, never a guess (gsp610_host.c).
+    tinynv_gsp610_bl_ucode_t bl = gsp610_bl(gsp);
+    int hr = tinynv_gsp610_host_request(g, func, payload, payload_len, &bl);
+    if (hr < 0) { free(rec); return -1; }
+    if (hr == 0) { free(rec); continue; }   // a host request, executed
+
+    if (func == TINYNV_MSG_EVENT_OS_ERROR_LOG && payload_len > 12)
+      fprintf(stderr, "tinynv: gsp log: %.*s\n", (int)(payload_len - 12), (const char *)payload + 12);
+    if (func == TINYNV_MSG_EVENT_OS_ERROR_LOG || func == TINYNV_MSG_EVENT_MMU_FAULT_QUEUED) {
+      gsp->err_state = 1;
+      gsp->err_fn = func;
+      gsp->err_len = payload_len;
+      uint32_t keep = payload_len < sizeof(gsp->err_head) ? payload_len : (uint32_t)sizeof(gsp->err_head);
+      if (keep) memcpy(gsp->err_head, payload, keep);
+      fprintf(stderr, "tinynv: gsp-rm reported %s (event %u, %u byte payload)\n",
+              func == TINYNV_MSG_EVENT_MMU_FAULT_QUEUED ? "an mmu fault" : "an error log", func, payload_len);
+      for (uint32_t i = 0; i < keep; i += 16) {
+        fprintf(stderr, "tinynv:   %04x:", i);
+        for (uint32_t j = i; j < i + 16 && j < keep; j++) fprintf(stderr, " %02x", gsp->err_head[j]);
+        fprintf(stderr, "\n");
+      }
+    }
+
+    if (func == TINYNV_MSG_FUNCTION_CONTINUATION_RECORD) {
+      if (gsp->cont_buf) {
+        if (gsp->cont_len + payload_len > gsp->cont_want) {
+          free(rec);
+          return tinynv_fail("a 610 continuation overruns the reply being assembled (%u + %u > %u)",
+                             gsp->cont_len, payload_len, gsp->cont_want);
+        }
+        memcpy(gsp->cont_buf + gsp->cont_len, payload, payload_len);
+        gsp->cont_len += payload_len;
+        if (gsp->cont_len >= gsp->cont_want) {
+          if (seen) *seen = 1;
+          if (reply) { *reply = gsp->cont_buf; *reply_len = gsp->cont_len; }
+          else free(gsp->cont_buf);
+          gsp->cont_buf = NULL; gsp->cont_len = gsp->cont_want = 0;
+          free(rec);
+          return 0;
+        }
+      }
+      // else: the tail of a reply nobody is waiting for (a poll drains everything); drop it with the record.
+      free(rec);
+      continue;
+    }
+
+    // A new record while an assembly is pending means the firmware abandoned the split reply. Say so and drop it;
+    // delivering a half reply as if it were whole is the confidently-wrong answer this path exists to prevent.
+    if (gsp->cont_buf) {
+      fprintf(stderr, "tinynv: a 610 reply was left half-assembled (%u of %u bytes) when the next record arrived; "
+                      "dropping it\n", gsp->cont_len, gsp->cont_want);
+      free(gsp->cont_buf);
+      gsp->cont_buf = NULL; gsp->cont_len = gsp->cont_want = 0;
+    }
+
+    if (func == want) {
+      uint32_t need = want_total ? want_total : payload_len;
+      // an EMPTY payload is a complete reply, never the head of a split one. rpc_send fills the first record to
+      // first_payload_max before it emits any CONTINUATION_RECORD, so a fragment of a genuinely split reply is never
+      // zero-length; treating one as fragment 1 waits for bytes that cannot arrive. That is exactly how a working 610
+      // unload became a 10 s timeout blaming the firmware (see tinynv_gsp_unload). 570 matches by function alone.
+      if (payload_len >= need || payload_len == 0) {
+        if (seen) *seen = 1;
+        if (reply) {
+          *reply = malloc(payload_len ? payload_len : 1);
+          if (!*reply) { free(rec); return tinynv_fail("out of memory for a %u byte rpc reply", payload_len); }
+          memcpy(*reply, payload, payload_len);
+          *reply_len = payload_len;
+        }
+        free(rec);
+        return 0;
+      }
+      // The reply is split: hold what arrived and let the continuation records finish it. The total is the
+      // request's own head+params size, which RM echoes back exactly.
+      gsp->cont_buf = malloc(need);
+      if (!gsp->cont_buf) { free(rec); return tinynv_fail("out of memory for a %u byte split reply", need); }
+      memcpy(gsp->cont_buf, payload, payload_len);
+      gsp->cont_len = payload_len;
+      gsp->cont_want = need;
+      free(rec);
+      continue;
+    }
+    // A record this driver is not waiting for. Most are events it has already acted on above; naming the ones it drops
+    // is what turns "gsp-rm never answered" into "gsp-rm answered with function N", which is a different bug. Opt-in,
+    // so the recorded 570 boot and the ordinary path issue no extra operation.
+    if (getenv("TINYNV_RPC_TRACE"))
+      fprintf(stderr, "tinynv: 610 status record function %u, %u byte payload, dropped while waiting for %u\n", func,
+              payload_len, want);
+    free(rec);
+  }
+}
+
 // Take whatever GSP-RM has put in the status queue, and say whether the message we are waiting for was among it.
 //
 // Two kinds of message are acted on rather than merely delivered: a request to run a register sequence on GSP-RM's
 // behalf, and a log line, which is the only way to see what the firmware thinks went wrong.
-static int rpc_drain(tinynv_gpu_t *g, uint32_t want, int *seen, uint8_t **reply, uint32_t *reply_len) {
+static int rpc_drain(tinynv_gpu_t *g, uint32_t want, uint32_t want_total, int *seen, uint8_t **reply, uint32_t *reply_len) {
+  if (is610(g)) return rpc_drain610(g, want, want_total, seen, reply, reply_len);
+  (void)want_total; // 570 replies are matched by function alone, as they always were
   tinynv_gsp_t *gsp = &g->gsp;
   tinynv_rpcq_t *q = &gsp->stat_q;
   __sync_synchronize();
@@ -346,7 +839,7 @@ static void fault_report(tinynv_gpu_t *g);
 int tinynv_gsp_poll(tinynv_gpu_t *g) {
   int seen = 0;
   if (!g->gsp.stat_q.base) return 0;               // the queue does not exist before the firmware is up
-  if (rpc_drain(g, 0xffffffffu, &seen, NULL, NULL)) return 1; // a refusal is itself news, and it has been recorded
+  if (rpc_drain(g, 0xffffffffu, 0, &seen, NULL, NULL)) return 1; // a refusal is itself news, and it has been recorded
   // The event says a fault happened. Where it happened has to be asked for, and this is the only moment anyone is
   // looking - so ask now, while the answer still describes the fault that is being reported rather than a later one.
   if (g->gsp.err_state) fault_report(g);
@@ -412,7 +905,7 @@ static void init_wait_report(tinynv_gpu_t *g, double elapsed) {
   tinynv_dev_restore_decode(d);
 }
 
-static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char *what, uint8_t **reply, uint32_t *reply_len) {
+static int rpc_wait(tinynv_gpu_t *g, uint32_t want, uint32_t want_total, double timeout_s, const char *what, uint8_t **reply, uint32_t *reply_len) {
   double start = tinynv_now_s(), deadline = start + timeout_s, next_report = start + 5.0;
   int seen = 0, gave_up = 0;
   const unsigned restored_before = g->dev.windows_restored;   // only a restore made during THIS wait counts below
@@ -423,7 +916,7 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
   // back within a quarter second is less time for anything written through the window to be lost.
   double next_cfg = start + 0.25;
   do {
-    if (rpc_drain(g, want, &seen, reply, reply_len)) return -1;
+    if (rpc_drain(g, want, want_total, &seen, reply, reply_len)) return -1;
     if (seen) {
       if (report && tinynv_now_s() - start > 5.0)
         fprintf(stderr, "tinynv: the start-up notice arrived after %.1f s\n", tinynv_now_s() - start);
@@ -453,6 +946,8 @@ static int rpc_wait(tinynv_gpu_t *g, uint32_t want, double timeout_s, const char
   } while (tinynv_now_s() < deadline);
   // Whatever arrives now belongs to a request nobody is waiting for any more.
   g->gsp.rpc_desync = 1;
+  // a half-assembled split reply dies with the wait; the desync drain drops any late continuation.
+  if (g->gsp.cont_buf) { free(g->gsp.cont_buf); g->gsp.cont_buf = NULL; g->gsp.cont_len = g->gsp.cont_want = 0; }
   if (want == TINYNV_MSG_EVENT_GSP_INIT_DONE) g->gsp.init_timed_out = 1;
   // A timeout on the start-up notice is the one this driver keeps hitting on a live 3060, so say enough to tell a silent
   // death apart from a message we failed to recognise. If GSP-RM's write pointer sits exactly where our read pointer is,
@@ -495,7 +990,7 @@ static int rpc_call(tinynv_gpu_t *g, uint32_t func, void *head, size_t head_len,
     int seen = 0;
     fprintf(stderr, "tinynv: a previous rpc gave up waiting; emptying the reply queue so a late answer cannot be "
                     "mistaken for this one\n");
-    if (rpc_drain(g, 0xffffffffu, &seen, NULL, NULL)) return -1;
+    if (rpc_drain(g, 0xffffffffu, 0, &seen, NULL, NULL)) return -1;
     g->gsp.rpc_desync = 0;
   }
   size_t total = head_len + params_len;
@@ -509,7 +1004,7 @@ static int rpc_call(tinynv_gpu_t *g, uint32_t func, void *head, size_t head_len,
 
   uint8_t *reply = NULL;
   uint32_t reply_len = 0;
-  if (rpc_wait(g, func, 10.0, what, &reply, &reply_len)) return -1;
+  if (rpc_wait(g, func, (uint32_t)(head_len + params_len), 10.0, what, &reply, &reply_len)) return -1;
   // gsp-rm answers with the request echoed back and the parameters filled in, so take them from where they were sent
   if (params && params_len && reply_len >= head_len + params_len) memcpy(params, reply + head_len, params_len);
   // The echoed header carries RM's OWN status, and it used to be freed here with the rest of the reply. That status is
@@ -533,7 +1028,34 @@ static int rm_alloc_as(tinynv_gpu_t *g, uint32_t client, uint32_t parent, uint32
   head.hObject = handle ? handle : next_handle(gsp);
   head.hClass = cls;
   head.paramsSize = (uint32_t)params_len;
-  if (rpc_call(g, TINYNV_MSG_FUNCTION_GSP_RM_ALLOC, &head, sizeof(head), params, params_len, "object allocation")) return -1;
+  // two allocation payloads grew (rpc610): the VA space (48 -> 56, pasid appended) and the GPFIFO channel
+  // (368 -> 376, hHandleVASpace inserted). Encode the caller's 570-shaped working struct into a scratch buffer at
+  // the 610 layout; the echo copies back into the scratch, never into the caller's differently-shaped struct. No
+  // caller reads channel/vaspace alloc params back (handles come from the header), which test_lifecycle610 pins.
+  uint8_t enc610[400];
+  void *send_params = params;
+  size_t send_len = params_len;
+  if (is610(g) && params && params_len == sizeof(tinynv_vaspace_alloc_t) && cls == TINYNV_CLASS_VASPACE) {
+    tinynv_rpc610_vaspace_encode((tinynv_rpc610_vaspace_alloc_t *)enc610, params);
+    send_params = enc610; send_len = sizeof(tinynv_rpc610_vaspace_alloc_t);
+    head.paramsSize = (uint32_t)send_len;
+  } else if (is610(g) && params && params_len == sizeof(tinynv_gpfifo_alloc_t) && cls == g->dev.class_gpfifo) {
+    tinynv_rpc610_channel_encode((tinynv_rpc610_gpfifo_alloc_t *)enc610, params);
+    send_params = enc610; send_len = sizeof(tinynv_rpc610_gpfifo_alloc_t);
+    head.paramsSize = (uint32_t)send_len;
+  }
+  // keep a copy of the exact parameter bytes about to go on the wire, so the refusal path can set them
+  // against what gsp-rm echoes back (rpc_drain610 -> dump_refused_alloc610). The request is gone by the time the
+  // answer arrives, and the echo alone cannot say whether a differing byte came from gsp-rm rewriting it or from
+  // this driver serializing it wrong. Cleared first, so a refusal never reports the previous allocation's bytes.
+  // 610 only: the 570 profile gets no echo to compare against, and copying there would be work for nothing.
+  gsp->last_alloc_sent_len = 0;
+  gsp->last_alloc_status = 0;
+  if (is610(g) && send_params && send_len <= sizeof gsp->last_alloc_sent) {
+    memcpy(gsp->last_alloc_sent, send_params, send_len);
+    gsp->last_alloc_sent_len = (uint32_t)send_len;
+  }
+  if (rpc_call(g, TINYNV_MSG_FUNCTION_GSP_RM_ALLOC, &head, sizeof(head), send_params, send_len, "object allocation")) return -1;
   // Said, not enforced. A nonzero status here has always been ignored, so some allocation on the boot path may well be
   // returning one and working anyway; making it fatal today would break a boot that currently comes up, and finding
   // that out costs a card window. So this reports and carries on, and the caller's own failure - if there is one - is
@@ -550,6 +1072,18 @@ static int rm_alloc(tinynv_gpu_t *g, uint32_t parent, uint32_t cls, void *params
 }
 
 static int rm_control_as(tinynv_gpu_t *g, uint32_t client, uint32_t object, uint32_t cmd, void *params, size_t params_len) {
+  // the 610 control header grew 24 -> 40 B (rpc610). The alloc header (32 B) is unchanged and shared. The
+  // status field sits at the same offset in both, so the read-back below is identical; only the header size differs.
+  if (is610(g)) {
+    tinynv_rpc610_rm_control_t head;
+    tinynv_rpc610_rm_control_fill(&head, client, object, cmd, (uint32_t)params_len);
+    if (rpc_call(g, TINYNV_MSG_FUNCTION_GSP_RM_CONTROL, &head, sizeof(head), params, params_len, "object control call"))
+      return -1;
+    g->gsp.last_ctrl_status = head.status;
+    if (head.status)
+      fprintf(stderr, "tinynv: gsp-rm returned status %#x for control %#x on object %#x\n", head.status, cmd, object);
+    return 0;
+  }
   tinynv_rpc_rm_control_t head;
   memset(&head, 0, sizeof(head));
   head.hClient = client;
@@ -587,9 +1121,11 @@ int tinynv_gsp_sensors_init(tinynv_gpu_t *g, uint64_t poll_mask, uint32_t freq_m
   tinynv_gsp_t *gsp = &g->gsp;
   if (gsp->rusd_armed) return 0;
   // Host memory, because that is where the firmware puts it: ADDR_SYSMEM in the vendor's own allocation of this
-  // buffer. It is 464 bytes and it costs one of the 128 host mappings the broker will ever hand out, which is a small
-  // finite resource that only goes up - worth stating rather than waving through.
-  if (tinynv_mm_alloc_buffer(&g->mm, sizeof(tinynv_rusd_t), 1, 1, 0, 0, 1, &gsp->rusd_mem)) return -1;
+  // buffer. It is 464 bytes on 570 (3152 on 610, whose block grew - rpc610) and it costs one of the 128 host mappings
+  // the broker will ever hand out, which is a small finite resource that only goes up - worth stating rather than
+  // waving through.
+  const size_t rusd_sz = is610(g) ? TINYNV_RPC610_RUSD_SIZE : sizeof(tinynv_rusd_t);
+  if (tinynv_mm_alloc_buffer(&g->mm, rusd_sz, 1, 1, 0, 0, 1, &gsp->rusd_mem)) return -1;
 
   // The class allocation is attempted but NOT required, and that distinction is the whole of why this still exists.
   //
@@ -604,11 +1140,22 @@ int tinynv_gsp_sensors_init(tinynv_gpu_t *g, uint64_t poll_mask, uint32_t freq_m
   if (rm_alloc(g, gsp->subdevice, TINYNV_CLASS_USER_SHARED_DATA, &ap, sizeof(ap), &gsp->rusd_obj))
     gsp->rusd_obj = 0;   // carry on without it
 
-  tinynv_rusd_init_t ip = {.physAddr = gsp->rusd_mem.ranges[0].paddr};
-  if (rm_control(g, gsp->subdevice, TINYNV_CTRL_INIT_USER_SHARED_DATA, &ip, sizeof(ip))) goto undo;
+  // the two RUSD controls changed for 610 (init gained bInit before physAddr@8; poll renamed its interval
+  // field at the same offset). The encoders place the fields; the 570 payloads are unchanged.
+  if (is610(g)) {
+    tinynv_rpc610_rusd_init_t ip;
+    tinynv_rpc610_rusd_init_fill(&ip, gsp->rusd_mem.ranges[0].paddr);
+    if (rm_control(g, gsp->subdevice, TINYNV_CTRL_INIT_USER_SHARED_DATA, &ip, sizeof(ip))) goto undo;
+    tinynv_rpc610_rusd_poll_t pp;
+    tinynv_rpc610_rusd_poll_fill(&pp, poll_mask, freq_ms);
+    if (rm_control(g, gsp->subdevice, TINYNV_CTRL_USER_SHARED_DATA_POLL, &pp, sizeof(pp))) goto undo;
+  } else {
+    tinynv_rusd_init_t ip = {.physAddr = gsp->rusd_mem.ranges[0].paddr};
+    if (rm_control(g, gsp->subdevice, TINYNV_CTRL_INIT_USER_SHARED_DATA, &ip, sizeof(ip))) goto undo;
 
-  tinynv_rusd_poll_t pp = {.polledDataMask = poll_mask, .pollFrequencyMs = freq_ms};
-  if (rm_control(g, gsp->subdevice, TINYNV_CTRL_USER_SHARED_DATA_POLL, &pp, sizeof(pp))) goto undo;
+    tinynv_rusd_poll_t pp = {.polledDataMask = poll_mask, .pollFrequencyMs = freq_ms};
+    if (rm_control(g, gsp->subdevice, TINYNV_CTRL_USER_SHARED_DATA_POLL, &pp, sizeof(pp))) goto undo;
+  }
 
   gsp->rusd_armed = 1;
   return 0;
@@ -626,6 +1173,9 @@ int tinynv_gsp_sensors_read(tinynv_gpu_t *g, tinynv_rusd_t *out) {
   tinynv_gsp_t *gsp = &g->gsp;
   memset(out, 0, sizeof(*out));
   if (!gsp->rusd_armed || !gsp->rusd_mem.dma.va) return tinynv_fail("sensors were not asked for on this device");
+  // the 610 block is a different layout (3152 B, new offsets); its reader maps the used fields into the
+  // same 570-shaped target with the same per-field timestamp retry protocol.
+  if (is610(g)) return tinynv_rpc610_rusd_read(gsp->rusd_mem.dma.va, TINYNV_RPC610_RUSD_SIZE, out);
   const volatile tinynv_rusd_t *src = (const volatile tinynv_rusd_t *)gsp->rusd_mem.dma.va;
 
   // Field by field, because each carries its own timestamp and the firmware updates them independently. Read the
@@ -888,6 +1438,8 @@ static int fill_channel_state(tinynv_gpu_t *g, uint32_t client, tinynv_gpfifo_al
     p->internalFlags |= (3u << 2);   // ERROR_NOTIFIER_TYPE = MEMORY (field 3:2), else RM sees UNKNOWN and asserts
     p->userdMem = (tinynv_memory_desc_t){.base = p->hUserdMemory[0] + p->userdOffset[0], .size = 0x400, .addressSpace = 2};
   }
+  if (is610(g) && !p->hObjectEccError)
+    p->internalFlags = (p->internalFlags & ~(3u << 4)) | (1u << 4);
   if (ramfc_out) *ramfc_out = ramfc;
   if (mthd_out) *mthd_out = mthd;
   return 0;
@@ -906,7 +1458,10 @@ int tinynv_gsp_init_channel(tinynv_gpu_t *g) {
   p.engineType = 1; // graphics, which is what compute runs on
   p.cid = 3;
   p.hVASpace = gsp->vaspace;
-  p.internalFlags = 0x1a;
+  // No error/ECC notifier is allocated for the privileged channel. 610 consumes
+  // these types directly: CTXDMA (2) with an empty descriptor fails memdescCreate.
+  // Keep the historical 570 wire value; 610 uses KERNEL (2), NONE (1), NONE (1).
+  p.internalFlags = is610(g) ? (2u | (1u << 2) | (1u << 4)) : 0x1a;
   p.flags = 0x200320;
   // the hardware's progress block sits just past the ring's entries, in the same page
   uint64_t userd_off = (uint64_t)entries * 8;
@@ -1135,6 +1690,22 @@ int tinynv_gsp_open_client(tinynv_gpu_t *g) {
     } }
 
   // the shape of the die: how many partitions it can have, not how many are turned on
+  // the 610 static-info reply grew to 4032 B (63 entries per engine, rpc610); the indices read are the same.
+  if (is610(g)) {
+    uint8_t *raw = calloc(1, TINYNV_RPC610_GR_STATIC_SIZE);
+    if (!raw) return tinynv_fail("out of memory for the chip's geometry");
+    if (rm_control_as(g, cl, gsp->user_subdevice, TINYNV_CTRL_CMD_STATIC_KGR_GET_INFO, raw, TINYNV_RPC610_GR_STATIC_SIZE)) {
+      free(raw);
+      return -1;
+    }
+    int rc = tinynv_rpc610_gr_info_get(raw, TINYNV_RPC610_GR_STATIC_SIZE, 0, TINYNV_GR_INFO_NUM_GPCS, &gsp->max_gpcs) ||
+             tinynv_rpc610_gr_info_get(raw, TINYNV_RPC610_GR_STATIC_SIZE, 0, TINYNV_GR_INFO_NUM_TPC_PER_GPC, &gsp->max_tpc_per_gpc) ||
+             tinynv_rpc610_gr_info_get(raw, TINYNV_RPC610_GR_STATIC_SIZE, 0, TINYNV_GR_INFO_NUM_SM_PER_TPC, &gsp->max_sm_per_tpc) ||
+             tinynv_rpc610_gr_info_get(raw, TINYNV_RPC610_GR_STATIC_SIZE, 0, TINYNV_GR_INFO_MAX_WARPS_PER_SM, &gsp->max_warps_per_sm) ||
+             tinynv_rpc610_gr_info_get(raw, TINYNV_RPC610_GR_STATIC_SIZE, 0, TINYNV_GR_INFO_SM_VERSION, &gsp->sm_version);
+    free(raw);
+    if (rc) return -1;
+  } else {
   tinynv_gr_static_info_t *info = calloc(1, sizeof(*info));
   if (!info) return tinynv_fail("out of memory for the chip's geometry");
   if (rm_control_as(g, cl, gsp->user_subdevice, TINYNV_CTRL_CMD_STATIC_KGR_GET_INFO, info, sizeof(*info))) { free(info); return -1; }
@@ -1146,6 +1717,7 @@ int tinynv_gsp_open_client(tinynv_gpu_t *g) {
   gsp->max_warps_per_sm = il[TINYNV_GR_INFO_MAX_WARPS_PER_SM].data;
   gsp->sm_version = il[TINYNV_GR_INFO_SM_VERSION].data;
   free(info);
+  }
 
   // A page of device memory with no processor mapping, allocated before anything else this client does. What it holds is
   // not visible from the boundary: it is unzeroed, unmapped from here, and one page table entry wide. It is reproduced
@@ -1409,19 +1981,27 @@ int tinynv_gsp_init_queues(tinynv_gpu_t *g) {
                   gsp->ce_engine, TINYNV_NOTIFIER_BYTES)) {
       fprintf(stderr, "tinynv: CE channel probe: FAILED in group 0x%x: %s\n", gsp->ce_group, tinynv_last_error());
     } else {
-      tinynv_gpfifo_schedule_t cesched;
-      memset(&cesched, 0, sizeof(cesched));
-      cesched.bEnable = 1;
-      int rc = rm_control_as(g, TINYNV_RM_USER_ROOT, gsp->ce_group, TINYNV_CTRL_CMD_GPFIFO_SCHEDULE, &cesched, sizeof(cesched));
+      int rc = gsp_schedule_group(g, TINYNV_RM_USER_ROOT, gsp->ce_group);
       fprintf(stderr, "tinynv: CE channel probe: channel 0x%x token 0x%x on runlist %u, schedule rc %d\n",
               gsp->ce_copy_q.channel, gsp->ce_copy_q.token, gsp->ce_runlist, rc);
     }
   }
 
+  return gsp_schedule_group(g, TINYNV_RM_USER_ROOT, gsp->user_group);
+}
+
+// schedule one channel group. The 610 params grew 2 -> 3 B (bSkipEnable appended, zero - the driver wants
+// the group enabled); the 570 payload is unchanged. One helper so both call sites cannot drift apart.
+static int gsp_schedule_group(tinynv_gpu_t *g, uint32_t client, uint32_t group) {
+  if (is610(g)) {
+    tinynv_rpc610_gpfifo_schedule_t s;
+    tinynv_rpc610_schedule_fill(&s, 1, 0);
+    return rm_control_as(g, client, group, TINYNV_CTRL_CMD_GPFIFO_SCHEDULE, &s, sizeof(s));
+  }
   tinynv_gpfifo_schedule_t sched;
   memset(&sched, 0, sizeof(sched));
   sched.bEnable = 1;
-  return rm_control_as(g, TINYNV_RM_USER_ROOT, gsp->user_group, TINYNV_CTRL_CMD_GPFIFO_SCHEDULE, &sched, sizeof(sched));
+  return rm_control_as(g, client, group, TINYNV_CTRL_CMD_GPFIFO_SCHEDULE, &sched, sizeof(sched));
 }
 
 // The queue GSP-RM answers on, and the arguments that tell it where the queue is.
@@ -1438,14 +2018,40 @@ static int init_rm_args(tinynv_gpu_t *g) {
 
   for (size_t i = 0; i < gsp->queues.naddrs; i++) nv_wr_block(&gsp->queues.view, i * 8, &gsp->queues.addrs[i], 8);
 
-  tinynv_gsp_args_cached_t args;
-  memset(&args, 0, sizeof(args));
-  args.bDmemStack = 1;
-  args.messageQueueInitArguments.sharedMemPhysAddr = gsp->queues.addrs[0];
-  args.messageQueueInitArguments.pageTableEntryCount = (uint32_t)pte_cnt;
-  args.messageQueueInitArguments.cmdQueueOffset = pt_size;
-  args.messageQueueInitArguments.statQueueOffset = pt_size + queue_size;
-  if (tinynv_alloc_boot_mem(&g->mm, sizeof(args), &args, -1, &gsp->rm_args)) return -1;
+  // the 610 cached-args block grew 72 -> 152 B and its msgq init args 32 -> 64 B (boot610). The encoder
+  // fills the same logical inputs plus the five new queue-geometry fields; the 570 block is unchanged.
+  if (is610(g)) {
+    tinynv_boot610_args_cached_t args;
+    tinynv_boot610_fill_args_cached(&args, gsp->queues.addrs[0], (uint32_t)pte_cnt, pt_size, pt_size + queue_size);
+    // kgspAllocRmStateMonitorBuffer + kgspPopulateGspRmInitArgs in pinned 610 kernel_gsp.c:
+    // INIT maps this page unconditionally. A zero-sized pair returns LibosErrorArgument before RM starts.
+    // LOGRMON is a separate diagnostic ring and cannot stand in for this shared state page.
+    uint8_t zero[PAGE];
+    memset(zero, 0, sizeof zero);
+    if (tinynv_alloc_boot_mem(&g->mm, PAGE, zero, -1, &gsp->rm_state_monitor)) return -1;
+    args.rmStateMonitorBufferArgs[0] = gsp->rm_state_monitor.addrs[0];
+    args.rmStateMonitorBufferArgs[1] = PAGE;
+    // KernelMemorySystem's statePreLoad asserts the PFB sysmem-flush address registers are non-zero
+    // (kmemsysAssertSysmemFlushBufferValid_GA100); 610 made that fatal where 570 tolerated it. The CPU-RM answers it
+    // with a resident sysmem page (kmemsysInitFlushSysmemBuffer_GA100). Allocate one here, explicitly in sysmem: the
+    // GPU's flush is a sysmem read, so a VRAM page would be wrong, and -1 would resolve to VRAM on a large-BAR card.
+    // The register itself is programmed in the hardware path (tinynv_gsp_program_sysmem_flush); init_sw stays GPU-free.
+    if (tinynv_alloc_boot_mem(&g->mm, PAGE, zero, 1, &gsp->sysmem_flush)) return -1;
+    // zero the whole args page before placing the 152-byte block - the DMA pages carry stale bytes (see
+    // init_libos_args), and the RMARGS region hands libos a full page.
+    if (tinynv_alloc_boot_mem(&g->mm, sizeof(args), NULL, -1, &gsp->rm_args)) return -1;
+    nv_wr_block(&gsp->rm_args.view, 0, zero, PAGE);
+    nv_wr_block(&gsp->rm_args.view, 0, &args, sizeof args);
+  } else {
+    tinynv_gsp_args_cached_t args;
+    memset(&args, 0, sizeof(args));
+    args.bDmemStack = 1;
+    args.messageQueueInitArguments.sharedMemPhysAddr = gsp->queues.addrs[0];
+    args.messageQueueInitArguments.pageTableEntryCount = (uint32_t)pte_cnt;
+    args.messageQueueInitArguments.cmdQueueOffset = pt_size;
+    args.messageQueueInitArguments.statQueueOffset = pt_size + queue_size;
+    if (tinynv_alloc_boot_mem(&g->mm, sizeof(args), &args, -1, &gsp->rm_args)) return -1;
+  }
   gsp->rm_args_sysmem = gsp->rm_args.addrs[0];
 
   tinynv_msgq_tx_header_t hdr;
@@ -1470,26 +2076,57 @@ static int init_libos_args(tinynv_gpu_t *g) {
   static const char *LOGS[] = {"INIT", "INTR", "RM", "MNOC", "KRNL"};
 
   if (tinynv_alloc_boot_mem(&g->mm, 2 * MB, NULL, -1, &gsp->logbuf)) return -1;
+  // VRAM keeps its old contents across boots, and the libos log buffers are rings whose first word is the
+  // put pointer - stale words past it read as log entries from a previous boot. Zero the 610 logs so a silent boot's
+  // dump is truthful. 610-gated: the 570 recorded operation stream stays byte-identical.
+  if (is610(g) || getenv("TINYNV_DUMP_GSP_LOGS")) {
+    uint8_t zero[0x10000];
+    memset(zero, 0, sizeof zero);
+    for (uint64_t off = 0; off < 2 * MB; off += sizeof zero) nv_wr_block(&gsp->logbuf.view, off, zero, sizeof zero);
+  }
   if (tinynv_alloc_boot_mem(&g->mm, PAGE, NULL, -1, &gsp->libos_args)) return -1;
+  // the vendor portMemSet's the WHOLE 4 KiB init-args block before filling the regions (kgspSetupLibosInitArgs),
+  // and libos scans it until a zero id8. The TinyGPU DMA pages are NOT zeroed (the stale log buffers prove it), so the
+  // bytes past the six regions are whatever the previous boot left there - garbage regions. Zero the block first.
+  // 610-gated: the 570 recorded operation stream stays byte-identical.
+  if (is610(g)) {
+    uint8_t zero[PAGE];
+    memset(zero, 0, sizeof zero);
+    nv_wr_block(&gsp->libos_args.view, 0, zero, PAGE);
+  }
   gsp->libos_args_sysmem = gsp->libos_args.addrs[0];
 
-  tinynv_libos_region_t regions[6];
+  tinynv_libos_region_t regions[9];
   memset(regions, 0, sizeof(regions));
-  for (int i = 0; i < 5; i++) {
-    char name[16];
-    snprintf(name, sizeof(name), "LOG%s", LOGS[i]);
-    regions[i].kind = TINYNV_LIBOS_MEMORY_REGION_CONTIGUOUS;
-    regions[i].loc = TINYNV_LIBOS_MEMORY_REGION_LOC_SYSMEM;
-    regions[i].size = 0x10000;
-    regions[i].id8 = id8_of(name);
-    regions[i].pa = gsp->logbuf.addrs[0] + 0x10000ull * i;
+  int nregions;
+  if (is610(g)) {
+    // the vendor's 610 region set and order (see LOGS610 above); RMARGS last, exactly as kgspSetupLibosInitArgs
+    for (int i = 0; i < 8; i++) {
+      regions[i].kind = TINYNV_LIBOS_MEMORY_REGION_CONTIGUOUS;
+      regions[i].loc = TINYNV_LIBOS_MEMORY_REGION_LOC_SYSMEM;
+      regions[i].size = LOGS610[i].size;
+      regions[i].id8 = id8_of(LOGS610[i].name);
+      regions[i].pa = gsp->logbuf.addrs[0] + LOGS610[i].off;
+    }
+    nregions = 8;
+  } else {
+    for (int i = 0; i < 5; i++) {
+      char name[16];
+      snprintf(name, sizeof(name), "LOG%s", LOGS[i]);
+      regions[i].kind = TINYNV_LIBOS_MEMORY_REGION_CONTIGUOUS;
+      regions[i].loc = TINYNV_LIBOS_MEMORY_REGION_LOC_SYSMEM;
+      regions[i].size = 0x10000;
+      regions[i].id8 = id8_of(name);
+      regions[i].pa = gsp->logbuf.addrs[0] + 0x10000ull * i;
+    }
+    nregions = 5;
   }
-  regions[5].kind = TINYNV_LIBOS_MEMORY_REGION_CONTIGUOUS;
-  regions[5].loc = TINYNV_LIBOS_MEMORY_REGION_LOC_SYSMEM;
-  regions[5].size = PAGE;
-  regions[5].id8 = id8_of("RMARGS");
-  regions[5].pa = gsp->rm_args_sysmem;
-  nv_wr_block(&gsp->libos_args.view, 0, regions, sizeof(regions));
+  regions[nregions].kind = TINYNV_LIBOS_MEMORY_REGION_CONTIGUOUS;
+  regions[nregions].loc = TINYNV_LIBOS_MEMORY_REGION_LOC_SYSMEM;
+  regions[nregions].size = PAGE;
+  regions[nregions].id8 = id8_of("RMARGS");
+  regions[nregions].pa = gsp->rm_args_sysmem;
+  nv_wr_block(&gsp->libos_args.view, 0, regions, sizeof(tinynv_libos_region_t) * (nregions + 1));
   return 0;
 }
 
@@ -1500,8 +2137,17 @@ static int init_libos_args(tinynv_gpu_t *g) {
 // why the loop runs backwards.
 static int init_gsp_image(tinynv_gpu_t *g) {
   tinynv_gsp_t *gsp = &g->gsp;
-  // the oracle loads this one from the ga102 directory whatever the chip is: it is the same file for every architecture
-  if (tinynv_fw_load("ga102", "gsp-" TINYNV_FW_VER ".bin", GSP_SHA, &gsp->gsp_fw)) return -1;
+  if (is610(g) && tinynv_failpoint("610-gsp-image")) return -1;
+  // the oracle loads this one from the ga102 directory whatever the chip is: it is the same file for every architecture.
+  // the version infix comes from the frozen runtime profile (570: TINYNV_FW_VER, byte-identical name).
+  // the 610 GSP ELF is a bundle asset (fw610), hash-pinned to the 610 manifest - never the 570 ga102 file.
+  if (is610(g)) {
+    if (tinynv_fw610_load("gsp", &gsp->gsp_fw)) return -1;
+  } else {
+    char fw_name[64];
+    snprintf(fw_name, sizeof fw_name, "gsp-%s.bin", g->profile->version);
+    if (tinynv_fw_load("ga102", fw_name, GSP_SHA, &gsp->gsp_fw)) return -1;
+  }
 
   const uint8_t *image, *sig;
   size_t image_len, sig_len;
@@ -1514,10 +2160,10 @@ static int init_gsp_image(tinynv_gpu_t *g) {
   gsp->gsp_image_size = image_len;
   // The reservation at the top of video memory was sized against this image (fw_layout.h): a bigger one is refused
   // here, where the message can say why, rather than placed under the manager's feet.
-  if (image_len > TINYNV_FW_IMAGE_BOUND)
+  if (image_len > g->profile->image_bound)
     return tinynv_fail("the GSP-RM image is %zu bytes, past the %llu MB the firmware reservation was sized for - raise "
                        "TINYNV_FW_IMAGE_BOUND and the reservation with it (fw_layout.h)",
-                       image_len, (unsigned long long)(TINYNV_FW_IMAGE_BOUND >> 20));
+                       image_len, (unsigned long long)(g->profile->image_bound >> 20));
 
   size_t npages[4], offsets[4] = {0, 0, 0, 0};
   npages[3] = round_up(image_len, PAGE) / PAGE;
@@ -1541,9 +2187,33 @@ static int init_gsp_image(tinynv_gpu_t *g) {
 // The RISC-V bootloader that starts GSP-RM, in NVIDIA's own container rather than an ELF.
 static int init_boot_binary_image(tinynv_gpu_t *g) {
   tinynv_gsp_t *gsp = &g->gsp;
+  if (is610(g) && tinynv_failpoint("610-bootloader")) return -1;
+  // the 610 bootloader is a RAW image plus a SEPARATE 84-byte v5 descriptor (boot610), not the 570 NVFW
+  // container. Parse the descriptor against the raw image, keep the three offsets the shared WPR-meta fill reads
+  // (and appVersion for the host-request core-resume), and place the raw bytes. No cast between the two layouts.
+  if (is610(g)) {
+    if (tinynv_fw610_load("bootloader", &gsp->bl_fw)) return -1;
+    if (tinynv_fw610_load("bootloader_desc", &gsp->bl_desc_fw)) return -1;
+    if (tinynv_boot610_desc_parse(gsp->bl_desc_fw.data, gsp->bl_desc_fw.size, (uint32_t)gsp->bl_fw.size,
+                                 &gsp->bl_desc610)) return -1;
+    gsp->bootloader_size = gsp->bl_fw.size;
+    if (gsp->bootloader_size > g->profile->bootbin_bound)
+      return tinynv_fail("the 610 riscv bootloader is %zu bytes, past the %llu MB the firmware reservation was sized "
+                         "for (fw_layout_610.h)", gsp->bootloader_size,
+                         (unsigned long long)(g->profile->bootbin_bound >> 20));
+    // the shared descriptor fields the WPR-meta fill and the core-resume step read, at their unchanged wire offsets
+    memset(&gsp->bl_desc, 0, sizeof(gsp->bl_desc));
+    gsp->bl_desc.manifestOffset = gsp->bl_desc610.manifest_offset;
+    gsp->bl_desc.monitorDataOffset = gsp->bl_desc610.data_offset;
+    gsp->bl_desc.monitorCodeOffset = gsp->bl_desc610.code_offset;
+    memcpy(&gsp->bl_desc.appVersion, gsp->bl_desc_fw.data + 28, 4);
+    return tinynv_alloc_boot_mem(&g->mm, gsp->bl_fw.size, gsp->bl_fw.data, -1, &gsp->bootloader);
+  }
   const char *sha = bl_sha(g->dev.fw_name);
   if (!sha) return tinynv_fail("no riscv bootloader hash is pinned for %s, so its image cannot be trusted", g->dev.fw_name);
-  if (tinynv_fw_load(g->dev.fw_name, "bootloader-" TINYNV_FW_VER ".bin", sha, &gsp->bl_fw)) return -1;
+  char bl_name[64];
+  snprintf(bl_name, sizeof bl_name, "bootloader-%s.bin", g->profile->version);
+  if (tinynv_fw_load(g->dev.fw_name, bl_name, sha, &gsp->bl_fw)) return -1;
 
   tinynv_nvfw_bin_hdr_t h;
   if (gsp->bl_fw.size < sizeof(h)) return tinynv_fail("the riscv bootloader is truncated");
@@ -1552,9 +2222,9 @@ static int init_boot_binary_image(tinynv_gpu_t *g) {
     return tinynv_fail("the riscv bootloader's header points outside the file");
   memcpy(&gsp->bl_desc, gsp->bl_fw.data + h.header_offset, sizeof(gsp->bl_desc));
   gsp->bootloader_size = h.data_size;
-  if (h.data_size > TINYNV_FW_BOOTBIN_BOUND)   // same reason as the image bound above
+  if (h.data_size > g->profile->bootbin_bound)   // same reason as the image bound above
     return tinynv_fail("the riscv bootloader is %u bytes, past the %llu MB the firmware reservation was sized for "
-                       "(fw_layout.h)", h.data_size, (unsigned long long)(TINYNV_FW_BOOTBIN_BOUND >> 20));
+                       "(fw_layout.h)", h.data_size, (unsigned long long)(g->profile->bootbin_bound >> 20));
   return tinynv_alloc_boot_mem(&g->mm, h.data_size, gsp->bl_fw.data + h.data_offset, -1, &gsp->bootloader);
 }
 
@@ -1563,6 +2233,26 @@ static int init_wpr_meta(tinynv_gpu_t *g) {
   tinynv_gsp_t *gsp = &g->gsp;
   if (init_gsp_image(g)) return -1;
   if (init_boot_binary_image(g)) return -1;
+
+  // the 610 carveout is re-derived from the matching pinned sizes (boot610/fw_layout_610), overflow-checked
+  // and bounds-verified, not the 570 arithmetic with a bigger image dropped in. The WPR meta block itself is
+  // byte-identical (asserted in test_headers_610), so the shared fill places every boundary.
+  if (is610(g)) {
+    if (tinynv_failpoint("610-wpr-meta")) return -1;
+    if (g->dev.fmc_boot)
+      return tinynv_fail("the 610.43.03 profile is the AD102 vbios boot path; a chain-of-trust device cannot run it");
+    tinynv_boot610_layout_t l;
+    if (tinynv_boot610_vbios_layout(g->dev.vram_size, gsp->gsp_image_size, gsp->bootloader_size, &l)) return -1;
+    if (g->flcn.frts_offset != l.frts_offset)
+      return tinynv_fail("fwsec was told to place the protected region at %#llx but the 610 metadata says %#llx",
+                         (unsigned long long)g->flcn.frts_offset, (unsigned long long)l.frts_offset);
+    tinynv_wpr_meta_t m;
+    tinynv_boot610_fill_wpr_meta(&m, &l, gsp->radix3.addrs[0], gsp->gsp_image_size, gsp->bootloader.addrs[0],
+                                 gsp->bootloader_size, &gsp->bl_desc610, gsp->signature.addrs[0]);
+    if (tinynv_alloc_boot_mem(&g->mm, sizeof(m), &m, -1, &gsp->wpr_meta)) return -1;
+    gsp->wpr_meta_sysmem = gsp->wpr_meta.addrs[0];
+    return 0;
+  }
 
   tinynv_wpr_meta_t m;
   memset(&m, 0, sizeof(m));
@@ -1654,6 +2344,13 @@ static int rpc_set_gsp_system_info(tinynv_gpu_t *g) {
   info.PCISubDeviceID = pci->cfg_read(pci, 0x2c, 4); // subsystem vendor and device together
   info.PCIRevisionID = pci->cfg_read(pci, 0x08, 1);
   info.maxUserVa = 0x7ffffffff000ull;
+  // the 610 GspSystemInfo grew 928 -> 952 B (virtualConfigBits inserted, bIsPassthru moved to 842). The
+  // encoder places every field the driver fills at its 610 offset; the 570 payload is unchanged.
+  if (is610(g)) {
+    uint8_t buf[TINYNV_RPC610_SYSINFO_SIZE];
+    if (tinynv_rpc610_system_info_encode(buf, sizeof buf, &info)) return -1;
+    return rpc_send(g, TINYNV_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, buf, sizeof buf);
+  }
   return rpc_send(g, TINYNV_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, &info, sizeof(info));
 }
 
@@ -1678,7 +2375,8 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
   // named one disabled, and bit 31, LOCK_AT_LOAD, so the firmware keeps the link where it found it instead of
   // retraining it during its init - which on this enclosure is the moment the configuration is cleared. Live cards
   // only, and only when asked: the recorded boot sends exactly two entries.
-  struct { const char *name; uint32_t value; } extra = {NULL, 0};
+  struct { const char *name; uint32_t value; } extra[2];
+  size_t n_extra = 0;
   // ON BY DEFAULT on a live vbios-path card since 2026-09-21: the first boot of the day on a 16 GT/s link that did not
   // lose its configuration was the one with the link locked, and the loss had always come 1.5 s into init - where the
   // firmware, left to itself, drops the link to Gen1 for power. TINYNV_PCIE_LINK_SPEED=off sends the two entries the
@@ -1713,13 +2411,12 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
     if (gen >= 1 && gen < 3) v |= 2u << 2;       // ALLOW_GEN3_DISABLE
     if (gen >= 1 && gen < 4) v |= 2u << 4;       // ALLOW_GEN4_DISABLE
     if (gen >= 1 && gen < 5) v |= 2u << 6;       // ALLOW_GEN5_DISABLE
-    extra.name = "RMPcieLinkSpeed"; extra.value = v;
+    extra[n_extra].name = "RMPcieLinkSpeed"; extra[n_extra].value = v; n_extra++;
     fprintf(stderr, "tinynv: registry table: RMPcieLinkSpeed=%#x (%s, locked at load)\n", v, ls);
   }
-  size_t n_extra = extra.name ? 1 : 0;
   size_t hdr_size = sizeof(tinynv_registry_table_t), entries_size = sizeof(tinynv_registry_entry_t) * (n + n_extra), names_size = 0;
   for (size_t i = 0; i < n; i++) names_size += strlen(TABLE[first + i].name) + 1;
-  if (n_extra) names_size += strlen(extra.name) + 1;
+  for (size_t i = 0; i < n_extra; i++) names_size += strlen(extra[i].name) + 1;
 
   size_t total = hdr_size + entries_size + names_size;
   uint8_t *buf = calloc(1, total);
@@ -1738,18 +2435,36 @@ static int rpc_set_registry_table(tinynv_gpu_t *g) {
     memcpy(buf + hdr_size + entries_size + at, TABLE[first + i].name, len);
     at += len;
   }
-  if (n_extra) {
-    size_t len = strlen(extra.name) + 1;
-    e[n].nameOffset = (uint32_t)(hdr_size + entries_size + at);
-    e[n].type = TINYNV_REGISTRY_TYPE_DWORD;
-    e[n].data = extra.value;
-    e[n].length = 4;
-    memcpy(buf + hdr_size + entries_size + at, extra.name, len);
+  for (size_t i = 0; i < n_extra; i++) {
+    size_t len = strlen(extra[i].name) + 1;
+    e[n + i].nameOffset = (uint32_t)(hdr_size + entries_size + at);
+    e[n + i].type = TINYNV_REGISTRY_TYPE_DWORD;
+    e[n + i].data = extra[i].value;
+    e[n + i].length = 4;
+    memcpy(buf + hdr_size + entries_size + at, extra[i].name, len);
     at += len;
   }
   int rc = rpc_send(g, TINYNV_MSG_FUNCTION_SET_REGISTRY, buf, total);
   free(buf);
   return rc;
+}
+
+// the hardware half of the sysmem flush buffer. 610's KernelMemorySystem statePreLoad returns
+// NV_ERR_INVALID_STATE unless the PFB flush address registers name a real page; the CPU-RM programs them HI then LO
+// (kmemsysProgramSysmemFlushBuffer_GA100). PFB is not cleared by falcon reset, and a full-card reset re-runs init_hw,
+// so a boot retry re-programs it. 570 never wrote these registers and its assert is non-fatal, so this is a no-op there.
+int tinynv_gsp_program_sysmem_flush(tinynv_gpu_t *g) {
+  if (!is610(g)) return 0;
+  tinynv_gsp_t *gsp = &g->gsp;
+  if (!gsp->sysmem_flush.naddrs) return tinynv_fail("the 610 sysmem flush buffer was not allocated");
+  uint64_t addr = gsp->sysmem_flush.addrs[0];
+  if ((addr >> 40) > NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI_MASK)
+    return tinynv_fail("the sysmem flush buffer address %#llx does not fit the PFB flush register",
+                       (unsigned long long)addr);
+  tinynv_wr32(&g->dev, NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI,
+              (uint32_t)(addr >> 40) & NV_PFB_NISO_FLUSH_SYSMEM_ADDR_HI_MASK);
+  tinynv_wr32(&g->dev, NV_PFB_NISO_FLUSH_SYSMEM_ADDR, (uint32_t)(addr >> 8));
+  return 0;
 }
 
 int tinynv_gsp_init_hw(tinynv_gpu_t *g) {
@@ -1782,7 +2497,11 @@ int tinynv_gsp_init_hw(tinynv_gpu_t *g) {
     }
     fprintf(stderr, "\n");
   }
-  if (rpc_wait(g, TINYNV_MSG_EVENT_GSP_INIT_DONE, init_timeout, "its start-up notice", NULL, NULL)) return -1;
+  if (is610(g) && tinynv_failpoint("610-init-done")) return -1;
+  if (rpc_wait(g, TINYNV_MSG_EVENT_GSP_INIT_DONE, 0, init_timeout, "its start-up notice", NULL, NULL)) {
+    if (is610(g)) gsp_silent_boot_diag(g);
+    return -1;
+  }
   if (gsp->err_state) return tinynv_fail("gsp-rm started but reported an error on the way up");
 
   // one more look at the configuration before anything is written through the window again
@@ -1792,7 +2511,41 @@ int tinynv_gsp_init_hw(tinynv_gpu_t *g) {
   tinynv_wr32(&g->dev, NV_PBUS_BAR1_BLOCK, 0);
   if (g->dev.fmc_boot) tinynv_wr32(&g->dev, NV_VIRTUAL_FUNCTION_PRIV_FUNC_BAR1_BLOCK_LOW_ADDR, 0);
   gsp->up = 1;
+  // opt-in comparison dump (TINYNV_DUMP_GSP_LOGS=1) - the same state/log readout the silent-boot failure
+  // path uses, taken after a SUCCESSFUL boot so a 570 control can be compared against a silent 610 one.
+  if (getenv("TINYNV_DUMP_GSP_LOGS")) gsp_silent_boot_diag(g);
   return 0;
+}
+
+// why an unload notice went unanswered. The decisive reading is how far gsp-rm has read OUR command queue: if
+// its read pointer reached the record this driver wrote, gsp-rm took the notice and chose not to answer it, which is a
+// firmware-side teardown question; if it is still behind, the record never reached it, which is a host-side delivery
+// question. The status-queue pointers say whether it wrote anything back at all, the log put pointers say whether its
+// DMA into host memory still works, and the mailbox with the RISC-V control register say whether the core is alive or
+// has already parked itself. This is init_wait_report's question set applied to the way down instead of the way up.
+static void gsp_unload_diag(tinynv_gpu_t *g, uint32_t wp_before) {
+  tinynv_gsp_t *gsp = &g->gsp;
+  tinynv_dev_t *d = &g->dev;
+  uint32_t wp = nv_rd32(&gsp->queues.view, gsp->cmd_q.base + offsetof(tinynv_msgq_tx_header_t, writePtr));
+  uint32_t took = nv_rd32(&gsp->queues.view, gsp->cmd_q.rx_off);   // how far gsp-rm has read OUR queue
+  uint32_t rp = nv_rd32(&gsp->queues.view, gsp->stat_q.rx_off);
+  uint32_t swp = nv_rd32(&gsp->queues.view, gsp->stat_q.base + offsetof(tinynv_msgq_tx_header_t, writePtr));
+  uint32_t logput[3] = {0, 0, 0};
+  for (int i = 0; i < 3; i++) logput[i] = nv_rd32(&gsp->logbuf.view, 0x10000u * (unsigned)i); // INIT, INTR, RM
+  uint32_t mbx0 = tinynv_rd32(d, NV_PGSP_FALCON_MAILBOX0), mbx1 = tinynv_rd32(d, NV_PGSP_FALCON_MAILBOX1);
+  uint32_t rv = tinynv_rd32(d, g->flcn.falcon + NV_PRISCV_RISCV_CPUCTL);
+  uint32_t cmd = d->pci->cfg_read(d->pci, 0x04, 2);
+  fprintf(stderr, "tinynv: unload diagnostic | command queue: write pointer %u -> %u and gsp-rm has read %u (%s) | "
+                  "status queue rp %u wp %u (%s) | log put INIT %u INTR %u RM %u | gsp mailbox %#x %#x, riscv %s%s | "
+                  "command register %#06x (memory %s, bus master %s)\n",
+          wp_before, wp, took, took == wp ? "it took the notice" : "it never read the notice",
+          rp, swp, rp == swp ? "it wrote nothing back" : "it sent something this driver did not act on",
+          logput[0], logput[1], logput[2], mbx0, mbx1,
+          NV_GET(rv, NV_PRISCV_RISCV_CPUCTL, ACTIVE_STAT) ? "active" : "NOT active",
+          NV_GET(rv, NV_PRISCV_RISCV_CPUCTL, HALTED) ? " halted" : "", cmd, (cmd & 0x2) ? "on" : "OFF",
+          (cmd & 0x4) ? "on" : "OFF");
+  // And the log rings, which are the only place gsp-rm can say why it will not go down.
+  gsp_silent_boot_diag(g);
 }
 
 // Tell GSP-RM the driver is going, and wait for it to halt.
@@ -1806,7 +2559,27 @@ int tinynv_gsp_unload(tinynv_gpu_t *g) {
   if (!gsp->up) return 0;
   double t0 = tinynv_now_s();
   tinynv_unloading_guest_driver_t u = {.bInPMTransition = 0, .bGc6Entering = 0, .newLevel = 1u << 6};
-  if (rpc_call(g, TINYNV_MSG_FUNCTION_UNLOADING_GUEST_DRIVER, &u, sizeof u, NULL, 0, "the unload notice")) return -1;
+  if (is610(g) && tinynv_failpoint("610-unload-notice")) return -1;
+  // where the write pointer stood before the notice, so the diagnostic can say whether the record this driver
+  // wrote was the one gsp-rm stopped short of.
+  uint32_t wp_before =
+      is610(g) ? nv_rd32(&gsp->queues.view, gsp->cmd_q.base + offsetof(tinynv_msgq_tx_header_t, writePtr)) : 0;
+  // on 610 the notice is sent WITHOUT waiting for a reply. gsp-rm does answer it - the drain trace on the live
+  // boot (logs/g610-12-boot610-20261112-231521.log) records `function 47, 0 byte payload` - but that answer is EMPTY, and
+  // rpc_call asks rpc_wait for want_total = the REQUEST's own 8 bytes. rpc_drain610 read a reply shorter than want_total
+  // as the head of a split one, so it held a complete empty reply as fragment 1 of a continuation that cannot come, and
+  // timed out 10 s later reporting "gsp-rm never sent the unload notice": a host-side matching defect wearing the
+  // costume of a firmware teardown refusal. What the firmware actually does is take the notice, print once more (event
+  // 4108), answer it empty and park - mailbox0 becomes 0x80000000 (LIBOS_INTERRUPT_PROCESSOR_SUSPENDED) and the RISC-V
+  // halts. The pinned 610 kgspUnloadRm_IMPL treats the rpc the same way: it records rpcStatus, goes on to
+  // kgspWaitForProcessorSuspend_HAL, dumps the logs and tears down, and only reports rpcStatus at the very end. So the
+  // parked core is the evidence the firmware went down and the reply is incidental. 570 keeps waiting, unchanged.
+  int sent = is610(g) ? rpc_send(g, TINYNV_MSG_FUNCTION_UNLOADING_GUEST_DRIVER, &u, sizeof u)
+                      : rpc_call(g, TINYNV_MSG_FUNCTION_UNLOADING_GUEST_DRIVER, &u, sizeof u, NULL, 0, "the unload notice");
+  if (sent) {
+    if (is610(g)) gsp_unload_diag(g, wp_before);
+    return -1;
+  }
   // Poll the mailbox AND keep draining the queue: on its way down GSP-RM may ask for a register sequence (the sequencer's
   // core-reset and wait-for-halt operations exist for exactly this), and a request left unanswered is a firmware that
   // waits for us while we wait for it.
@@ -1814,32 +2587,67 @@ int tinynv_gsp_unload(tinynv_gpu_t *g) {
   uint32_t mbx;
   for (;;) {
     int seen = 0;
-    if (rpc_drain(g, 0xffffffffu, &seen, NULL, NULL)) return -1;
+    if (is610(g) && tinynv_failpoint("610-unload-halt")) return -1;
+    if (rpc_drain(g, 0xffffffffu, 0, &seen, NULL, NULL)) return -1;
     mbx = tinynv_rd32(&g->dev, NV_PGSP_FALCON_MAILBOX0);
     if (mbx == 0x80000000u) break;
-    if (tinynv_now_s() > deadline)
+    if (tinynv_now_s() > deadline) {
+      if (is610(g)) {
+        gsp_unload_diag(g, wp_before);
+        return tinynv_fail("gsp-rm took the unload notice but its core never parked in 10 s (gsp mailbox %#x)", mbx);
+      }
       return tinynv_fail("gsp-rm acknowledged the unload notice but did not halt in 10 s (gsp mailbox %#x)", mbx);
+    }
   }
   gsp->up = 0;
-  fprintf(stderr, "tinynv: gsp-rm acknowledged the unload notice and halted, %.2f s\n", tinynv_now_s() - t0);
+  if (is610(g))
+    fprintf(stderr, "tinynv: gsp-rm took the unload notice and its core parked, %.2f s\n", tinynv_now_s() - t0);
+  else
+    fprintf(stderr, "tinynv: gsp-rm acknowledged the unload notice and halted, %.2f s\n", tinynv_now_s() - t0);
   return 0;
 }
 
 int tinynv_gsp_init_sw(tinynv_gpu_t *g) {
   g->gsp.gpu = g;
+  // the 610 profile preflights the WHOLE lifecycle bundle (boot AND unload AND the host-request ucode) and
+  // stages the generic-bootloader ucode before any firmware is placed. A missing/wrong-hash asset is an error here,
+  // never a substitution. The 570 path issues no extra operation.
+  if (is610(g)) {
+    if (g->dev.fmc_boot || strcmp(g->dev.fw_name, "ad102"))
+      return tinynv_fail("the 610.43.03 profile is the AD102 vbios boot path only; this device is %s%s", g->dev.fw_name,
+                         g->dev.fmc_boot ? " (chain-of-trust)" : "");
+    if (tinynv_failpoint("610-assets")) return -1;
+    if (tinynv_fw610_validate_all()) return -1;
+    tinynv_gsp_t *gsp = &g->gsp;
+    if (tinynv_fw610_load("generic_bl", &gsp->gbl_fw)) return -1;
+    if (tinynv_fw610_load("generic_bl_desc", &gsp->gbl_desc_fw)) return -1;
+    if (tinynv_fw610_bl_desc(&gsp->gbl_desc_fw, &gsp->gbl_start_tag, &gsp->gbl_code_size)) return -1;
+    if (tinynv_failpoint("610-rm-args")) return -1;
+  }
   if (init_rm_args(g)) return -1;
+  if (is610(g) && tinynv_failpoint("610-libos-args")) return -1;
   if (init_libos_args(g)) return -1;
   if (init_wpr_meta(g)) return -1;
   // prefilled before the firmware exists: it reads both out of the ring as soon as it starts
+  if (is610(g) && tinynv_failpoint("610-sysinfo")) return -1;
   if (rpc_set_gsp_system_info(g)) return -1;
+  if (is610(g) && tinynv_failpoint("610-registry")) return -1;
   return rpc_set_registry_table(g);
 }
 
 void tinynv_gsp_fini(tinynv_gpu_t *g) {
   tinynv_gsp_t *gsp = &g->gsp;
   tinynv_bootmem_t *all[] = {&gsp->queues, &gsp->rm_args, &gsp->logbuf, &gsp->libos_args,
-                             &gsp->radix3, &gsp->signature, &gsp->bootloader, &gsp->wpr_meta};
+                             &gsp->radix3, &gsp->signature, &gsp->bootloader, &gsp->wpr_meta,
+                             &gsp->rm_state_monitor, &gsp->sysmem_flush};
   for (size_t i = 0; i < sizeof(all) / sizeof(*all); i++) if (all[i]->size) tinynv_free_boot_mem(&g->mm, all[i]);
   tinynv_fw_free(&gsp->gsp_fw);
   tinynv_fw_free(&gsp->bl_fw);
+  // the 610-only state (all zero on 570, so these are no-ops there).
+  tinynv_fw_free(&gsp->bl_desc_fw);
+  tinynv_fw_free(&gsp->gbl_fw);
+  tinynv_fw_free(&gsp->gbl_desc_fw);
+  free(gsp->cont_buf);
+  gsp->cont_buf = NULL;
+  gsp->cont_len = gsp->cont_want = 0;
 }

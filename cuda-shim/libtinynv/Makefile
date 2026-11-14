@@ -22,6 +22,15 @@ NVSRC   := third_party/open-gpu-kernel-modules-81fe4fb417c8ac3b9bdcc1d56827d1167
 NVINC   := -I$(NVSRC)/src/nvidia/arch/nvalloc/common/inc -I$(NVSRC)/src/common/sdk/nvidia/inc -I$(NVSRC)/src/common/inc \
            -I$(NVSRC)/src/nvidia/inc -I$(NVSRC)/src/common/shared/msgq/inc -I$(NVSRC)/src/common/uproc/os/common/include \
            -I$(NVSRC)/src/nvidia/generated   # rmconfig.h, which gsp_fw_heap.h (the firmware heap formula test_headers pins) includes
+# : the pinned 610.43.03 source tree (tools/gsp610-runtime/fetch_inputs.sh), compiled as its OWN assertion TU
+# so the two releases' same-named headers never collide. 610 moved msgq into src/nvidia/inc/libraries and folded
+# fsp_nvdm_format.h into nvdm_format.h; test_headers_610.c handles both with __has_include.
+NVSRC610 := third_party/NVIDIA-kernel-module-source-610.43.03
+NVINC610 := -I$(NVSRC610)/src/nvidia/arch/nvalloc/common/inc -I$(NVSRC610)/src/common/sdk/nvidia/inc -I$(NVSRC610)/src/common/inc \
+            -I$(NVSRC610)/src/nvidia/inc -I$(NVSRC610)/src/nvidia/inc/kernel -I$(NVSRC610)/src/common/shared/msgq/inc \
+            -I$(NVSRC610)/src/nvidia/inc/libraries -I$(NVSRC610)/src/common/uproc/os/common/include -I$(NVSRC610)/src/nvidia/generated
+# The prepared 610 runtime bundle (tools/gsp610-runtime/run_prepare.sh). test_boot610 parses its real assets when present.
+BUNDLE610 ?= $(abspath ../build/gsp610-runtime/bundle)
 BUILD   := build
 # track header dependencies. without this a change to a struct in a header rebuilds only the .c files that were edited,
 # and the rest of the library keeps the old layout: the two halves then disagree about where a field is, which shows up
@@ -54,14 +63,32 @@ always:
 $(BUILD)/src/build_id.o: always
 
 UNAME := $(shell uname -s)
-SRCS  := src/err.c src/build_id.c src/qmd.c src/image.c src/arena.c src/exec.c src/cubin.c src/sha256.c src/fw.c src/dev.c src/mmu.c src/tlsf.c src/pt.c src/gpu.c src/gsp.c src/flcn.c src/vbios.c src/submit.c \
+SRCS  := src/err.c src/build_id.c src/qmd.c src/image.c src/arena.c src/exec.c src/cubin.c src/sha256.c src/fw.c src/fw610.c src/runtime_profile.c src/boot610.c src/rpc610.c src/gsp610_host.c src/dev.c src/mmu.c src/tlsf.c src/pt.c src/gpu.c src/gsp.c src/flcn.c src/vbios.c src/submit.c \
          src/tinynv.c src/pci_replay.c src/pci_tinygpu.c
 ifeq ($(UNAME),Linux)
 SRCS  += src/pci_sysfs.c
 endif
 OBJS  := $(SRCS:%.c=$(BUILD)/%.o)
 
-.PHONY: all test clean
+.PHONY: all test clean test-runtime-profile
+
+# (docs/driver/gsp-610-runtime plan §3): the runtime-profile suite - strict TINYNV_GSP_RUNTIME parsing, the
+# build/device dispatch gate, selection before any device access, and the frozen profile. With a recorded boot present
+# ($(TRACE)) it also proves unset == explicit 570 operation for operation and that 610/invalid requests consume ZERO
+# recorded operations; without one that arm says SKIPPED (an environmental gap, not a pass).
+test-runtime-profile: $(BUILD)/test_runtime_profile $(BUILD)/test_boot610 $(BUILD)/test_rpc610 $(BUILD)/test_lifecycle610
+	@$(BUILD)/test_runtime_profile $(if $(wildcard $(TRACE).trace),$(TRACE),)
+	@# : the 610 boot-metadata adapters (BTL1/descriptor/startup-args/carveout), synthetic + real-asset fixtures.
+	@$(BUILD)/test_boot610 $(if $(wildcard $(BUNDLE610)/manifest.json),$(BUNDLE610),)
+	@# : the 610 RPC/RM adapters + host-request executor (codec/continuation/encoders/rusd, fake falcon). No GPU,
+	@# no 610 header tree needed - the boundary sizes are asserted separately in test_headers_610 below.
+	@$(BUILD)/test_rpc610
+	@# : the wired 610 lifecycle - software init with the real bundle, a mock GSP-RM queue peer, failure
+	@# injection per stage, retry/profile retention, unload. No GPU; the bundle is required (run run_prepare.sh).
+	@$(BUILD)/test_lifecycle610 $(BUNDLE610) $(abspath third_party/firmware)
+	@# : the separately compiled 610 header assertions, when the pinned 610 tree is present.
+	@if [ -d $(NVSRC610)/src ]; then $(MAKE) -s $(BUILD)/test_headers_610 && $(BUILD)/test_headers_610; \
+	 else echo "  (no 610 header tree at $(NVSRC610), test_headers_610 skipped; run tools/gsp610-runtime/fetch_inputs.sh)"; fi
 # The smi tool is part of a build, not of a test run. It was reachable only through `make test`, which meant the one
 # command anybody would run to get it did not produce it and it sat in a directory nobody had reason to look in.
 all: $(BUILD)/libtinynv.a $(BUILD)/tinynv-smi
@@ -87,6 +114,18 @@ $(BUILD)/test_headers: test/test_headers.c src/nv_structs.h
 	  -DTINYNV_HDR_STRUCTS=$$(grep -c '^SAME_SIZE(' test/test_headers.c) \
 	  -DTINYNV_HDR_FIELDS=$$(grep -c '^SAME_AT(' test/test_headers.c) \
 	  -DTINYNV_HDR_CONSTS=$$(grep -c '^_Static_assert(' test/test_headers.c) $< -o $@
+
+# : the 610 assertion TU, compiled against the pinned 610 tree (NVINC610), separate from the 570 test_headers so
+# the two releases' same-named headers never collide. Asserts the shared layouts are byte-identical and the changed boot
+# layouts match boot610.h, and re-derives the 610 reservation terms from the matching definitions.
+# : it also asserts the RPC/RM boundary (rpc610.h). GspSystemInfo / the load-exec payloads sit behind the NVOC
+# port layer, so extract_structs.py copies those typedefs VERBATIM from the pinned tree into $(BUILD)/gen first.
+$(BUILD)/gen/extracted_610.h: ../../tools/gsp610-runtime/extract_structs.py
+	@mkdir -p $(@D)
+	$(PYTHON) ../../tools/gsp610-runtime/extract_structs.py $(NVSRC610) $@
+$(BUILD)/test_headers_610: test/test_headers_610.c src/nv_structs.h src/boot610.h src/fw_layout_610.h src/rpc610.h $(BUILD)/gen/extracted_610.h
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -Isrc -I$(BUILD)/gen $(NVINC610) $< -o $@
 
 $(BUILD)/test_arena: test/test_arena.c src/arena.c
 	@mkdir -p $(dir $@)
@@ -141,7 +180,7 @@ SNAPSHOT ?= $(abspath ../../traces)/5090-launch2-launch.json
 # already wins over the environment, so this changes nothing about how they run - it removes the possibility that a
 # future test forgets to pass one and silently inherits a live server instead. Structural rather than remembered.
 test: export TINYNV_SOCKET :=
-test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_teardown_term $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
+test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/test_image $(BUILD)/test_exec_mode $(BUILD)/test_delta $(BUILD)/test_qmd_cost $(BUILD)/test_pci $(BUILD)/test_cubin $(BUILD)/test_api $(BUILD)/test_fw $(BUILD)/test_runtime_profile $(BUILD)/test_boot610 $(BUILD)/test_rpc610 $(BUILD)/test_lifecycle610 $(BUILD)/test_submit $(BUILD)/test_reloc $(BUILD)/test_thread_limit $(BUILD)/test_tlsf_used $(BUILD)/test_events $(BUILD)/test_global $(BUILD)/test_kernel_attrs $(BUILD)/test_elf_abi $(BUILD)/test_module_unload $(BUILD)/test_upload_order $(BUILD)/test_teardown_term $(BUILD)/test_num_barriers $(BUILD)/test_hw_namedbar $(BUILD)/test_mm $(BUILD)/test_qmd $(BUILD)/test_qmd_hw $(BUILD)/test_hw $(BUILD)/test_hw_kernel $(BUILD)/test_hw_smem $(BUILD)/test_hw_cbank $(BUILD)/test_hw_dims $(BUILD)/test_hw_chain $(BUILD)/test_hw_replay $(BUILD)/test_hw_gap $(BUILD)/test_hw_printf $(BUILD)/test_hw_abort $(BUILD)/test_hw_fault $(BUILD)/test_hw_wpr $(BUILD)/test_hw_fill $(BUILD)/test_dev
 	@# FIRST, before any test runs: do the tests in this directory still report what they find? On 2026-09-15
 	@# test_rm_free.c exited 0 with FAIL printed - it consulted its failure count at line 117 of a 318-line main, the
 	@# file grew past that guard, and the whole C4b decision plus the rows proving the read-only fix landed below it.
@@ -180,6 +219,16 @@ test: $(BUILD)/test_arena $(BUILD)/test_witness $(BUILD)/tinynv-smi $(BUILD)/tes
 	@$(BUILD)/test_cubin $(BUILD)/longname.cubin -
 	@$(BUILD)/test_api ../spike/vecadd.sm86.cubin 0x160 && $(BUILD)/test_api ../spike/vecadd.sm120.cubin 0x380
 	@$(BUILD)/test_fw
+	@# : runtime-profile selection/dispatch; the recorded-boot arm runs when the trace is present.
+	@$(BUILD)/test_runtime_profile $(if $(wildcard $(TRACE).trace),$(TRACE),)
+	@# : the 610 boot-metadata adapters (synthetic + real-asset fixtures) and the separate 610 header assertions.
+	@$(BUILD)/test_boot610 $(if $(wildcard $(BUNDLE610)/manifest.json),$(BUNDLE610),)
+	@# : the 610 RPC/RM adapters + host-request executor (codec/continuation/encoders/rusd, fake falcon).
+	@$(BUILD)/test_rpc610
+	@# : the wired 610 lifecycle (real bundle + mock queue peer + per-stage failure injection). No GPU.
+	@$(BUILD)/test_lifecycle610 $(BUNDLE610) $(abspath third_party/firmware)
+	@if [ -d $(NVSRC610)/src ]; then $(MAKE) -s $(BUILD)/test_headers_610 && $(BUILD)/test_headers_610; \
+	 else echo "  (no 610 header tree at $(NVSRC610), test_headers_610 skipped; run tools/gsp610-runtime/fetch_inputs.sh)"; fi
 	@# which submission path an unset environment gets, and how the two knobs resolve. costs nothing and is the only
 	@# place that decision is visible without a card.
 	@# recycling the scratch region a piece at a time, against a byte-by-byte record of who wrote what. the failure

@@ -97,7 +97,7 @@ static int one_run(uint64_t size, uint64_t maxbytes, uint64_t align, uint64_t la
     if (wrap) {
       // What exec.c does when the region comes round: send what is built, then rewind. The chain guard there means
       // there is never anything unsubmitted at this point, which is what makes the rewind safe to model this way.
-      push(&m);                  // arena() pushes before it comes round, whether or not there is anything to submit
+      push(&m);                  // arena pushes before it comes round, whether or not there is anything to submit
       submit(&m);
       m.r.wraps++;
       if (pol == POLICY_DRAIN) stall_until(&m, m.counter);   // the old cost: everything outstanding, every lap

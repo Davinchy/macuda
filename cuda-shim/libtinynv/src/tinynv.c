@@ -141,7 +141,7 @@ static void put_the_card_down(void) {
 
 // The same teardown, for the ways out that are not an exit.
 //
-// atexit is not enough, and the gap is not theoretical: ggml's CUDA_CHECK calls ggml_abort, which calls abort(), which
+// atexit is not enough, and the gap is not theoretical: ggml's CUDA_CHECK calls ggml_abort, which calls abort, which
 // raises SIGABRT and never runs an atexit handler. So every failed check inside llama.cpp - the ordinary way a bug
 // announces itself - left the GPU bus mastering into mappings about to be reclaimed, which macOS latches as a fault
 // flag that only re-enumerating the device clears: one person and one cable, per failure. Found by session A the first
@@ -282,8 +282,15 @@ static int device_boot(tinynv_device_t d) {
 // memcpy to NULL several thousand lines of log later, in a function that was only ever the victim.
 #define BOOT_STAGE(call) do { if (call) { d->boot_failed = 1; snprintf(d->boot_error, sizeof d->boot_error, "%s", tinynv_last_error()); \
     fprintf(stderr, "libtinynv: boot stage failed: %s\n", d->boot_error); return tinynv_fail("%s", d->boot_error); } } while (0)
+// the same, and then a read of gsp-rm's own log rings. For the stages that run AFTER the firmware is up,
+// where a refusal leaves its reason inside RM's logs and nothing else reads them; the firmware-boot stage keeps the
+// plain macro because a failure there already dumps (rpcq_attach) and a second dump would only repeat it. The 610 gate
+// lives inside tinynv_gsp_boot_stage_diag, so it cannot be forgotten here and the 570 path is untouched.
+#define BOOT_STAGE_LATE(call) do { if (call) { d->boot_failed = 1; snprintf(d->boot_error, sizeof d->boot_error, "%s", tinynv_last_error()); \
+    fprintf(stderr, "libtinynv: boot stage failed: %s\n", d->boot_error); tinynv_gsp_boot_stage_diag(&d->gpu); \
+    return tinynv_fail("%s", d->boot_error); } } while (0)
   BOOT_STAGE(tinynv_gpu_boot_firmware(&d->gpu));
-  BOOT_STAGE(tinynv_gsp_init_objects(&d->gpu) || tinynv_gsp_init_channel(&d->gpu) || tinynv_gsp_init_gr_context(&d->gpu) ||
+  BOOT_STAGE_LATE(tinynv_gsp_init_objects(&d->gpu) || tinynv_gsp_init_channel(&d->gpu) || tinynv_gsp_init_gr_context(&d->gpu) ||
              tinynv_gsp_open_client(&d->gpu) || tinynv_gsp_init_queues(&d->gpu));
   // Does the memory manager stop below what the firmware owns? The firmware has placed its write-protected region by
   // now, so the two registers describe the firmware THIS open booted and not a resident one from an earlier run
@@ -304,7 +311,7 @@ static int device_boot(tinynv_device_t d) {
     int rc = tinynv_mm_check_fw_carveout(&d->gpu.mm, wlo, whi, line, sizeof line);
     fprintf(stderr, "libtinynv: firmware carveout: held back %llu MB of %llu MB (the sizes handed to the firmware sum "
                     "to %llu MB); %s\n",
-            (unsigned long long)(TINYNV_FW_RESERVE_TOP >> 20), (unsigned long long)(d->gpu.dev.vram_size >> 20),
+            (unsigned long long)(d->gpu.profile->reserve_top >> 20), (unsigned long long)(d->gpu.dev.vram_size >> 20),
             (unsigned long long)(TINYNV_FW_CARVEOUT_ESTIMATE >> 20), rc ? tinynv_last_error() : line);
     if (rc) {
       const char *e = getenv("TINYNV_FW_RESERVE_CHECK");

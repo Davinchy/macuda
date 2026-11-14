@@ -7,6 +7,10 @@
 // records the message and returns -1, so a failing path reads `return tinynv_fail("bar %d is too small", bar);`
 int tinynv_fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// test-only per-stage failure injection (TINYNV_FAILPOINT=<stage>). Returns -1 with the stage named when
+// armed, 0 otherwise. Call sites are 610-profile-gated; see err.c.
+int tinynv_failpoint(const char *stage);
+
 // monotonic seconds, for the wait loops. one definition, because three copies is three chances to get a deadline wrong
 double tinynv_now_s(void);
 // Remember a host span this driver is about to write, so a later crash can say whether we wrote the faulting address.

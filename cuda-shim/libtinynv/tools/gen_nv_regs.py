@@ -71,6 +71,13 @@ WANTED = [
   ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B"),
   ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_DMATRFFBOFFS"),
   ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_DMATRFMOFFS"),
+  # : the IMEM/DMEM access ports + HWCFG the 610 generic-bootloader host request copies through
+  ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_HWCFG"),
+  ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_IMEMC"),
+  ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_IMEMD"),
+  ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_IMEMT"),
+  ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_DMEMC"),
+  ("dev_falcon_v4", "ga102", "NV_PFALCON_FALCON_DMEMD"),
   ("dev_falcon_v4", ("gh100", "ga102"), "NV_PFALCON_FALCON_MAILBOX0"),
   ("dev_falcon_v4", ("gh100", "ga102"), "NV_PFALCON_FALCON_MAILBOX1"),
   ("dev_falcon_v4", ("gh100", "ga102"), "NV_PFALCON_FALCON_OS"),
@@ -85,6 +92,11 @@ WANTED = [
   ("dev_fbif_v4", "ga102", "NV_PFALCON_FBIF_CTL"),
   ("dev_fbif_v4", "ga102", "NV_PFALCON_FBIF_TRANSCFG"),
   ("dev_fbif_v4", "ga102", "NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL"),
+  # : the aperture targets + engine-id flag the 610 host-request loader programs
+  ("dev_fbif_v4", "ga102", "NV_PFALCON_FBIF_TRANSCFG_TARGET_LOCAL_FB"),
+  ("dev_fbif_v4", "ga102", "NV_PFALCON_FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM"),
+  ("dev_fbif_v4", "ga102", "NV_PFALCON_FBIF_TRANSCFG_TARGET_NONCOHERENT_SYSMEM"),
+  ("dev_fbif_v4", "ga102", "NV_PFALCON_FBIF_TRANSCFG_ENGINE_ID_FLAG_BAR2_FN0"),
   # the RISC-V core inside the GSP falcon: which core boots, and whether it came up
   ("dev_riscv_pri", "ga102", "NV_PRISCV_RISCV_BCR_CTRL"),
   ("dev_riscv_pri", "ga102", "NV_PRISCV_RISCV_CPUCTL"),

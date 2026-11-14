@@ -9,6 +9,7 @@ build/*
 # a rule with a slash in it is anchored here, so nested build directories need saying separately - the old bare
 # `build/` had covered them by matching any directory of that name at any depth
 libtinynv/build/
+libtinynv/build-gsp610-fix/
 libtinynv/test/build/
 *.o
 *.a

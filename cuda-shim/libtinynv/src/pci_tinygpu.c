@@ -30,7 +30,7 @@ _Static_assert(sizeof(resp_t) == 17, "response is 17 packed bytes");
 typedef struct {
   int fd;
   // A read whose request has been sent and whose reply has not been taken. Any other request must first take that
-  // reply (the socket carries one conversation), so rpc() drains it into pending_val and rd32_recv finds it there.
+  // reply (the socket carries one conversation), so rpc drains it into pending_val and rd32_recv finds it there.
   int pending, pending_done;
   uint32_t pending_val;
   int ndma;

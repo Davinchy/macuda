@@ -173,6 +173,7 @@ TINYNV_AT(tinynv_libos_region_t, loc, 25);
 #define TINYNV_MSG_EVENT_GSP_RUN_CPU_SEQUENCER 4098
 #define TINYNV_MSG_EVENT_MMU_FAULT_QUEUED 4101
 #define TINYNV_MSG_EVENT_OS_ERROR_LOG 4102
+#define TINYNV_MSG_EVENT_UCODE_LIBOS_PRINT 4108 // 0x100C: a one-way libos print (rpc_global_enums.h); benign, no reply
 
 typedef struct {
   uint8_t authTagBuffer[16], aadBuffer[16]; // confidential computing only; zero here

@@ -14,11 +14,18 @@
 #include "nv_regs.h"
 #include "nv_structs.h"
 #include "fw_layout.h"
+#include "fw610.h"
 #include "vbios.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+// the frozen profile decides the booter container format. Pointer identity, as in gsp.c.
+static int is610(const tinynv_gpu_t *g) { return g->profile == &tinynv_runtime_610; }
+// The SEC2 ucode-fuse register bank: one word per ucode id, the
+// signature index is derived from its highest set bit. Read at hardware init, never at software init.
+#define SEC2_FUSE_UCODE1 0x00824140u
 
 static const char *FMC_SHA = "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd59f5af2ddd7fece";
 // the two booters SEC2 runs on the vbios path, from linux-firmware at the commit tools/fetch_firmware.sh pins
@@ -51,9 +58,11 @@ static void flcn_sleep_ms(int ms) {
 // the mask of one field, for a read-modify-write that must leave its neighbours alone
 #define FLD(reg, f) ((uint32_t)(((1ull << (reg##_##f##_HI - reg##_##f##_LO + 1)) - 1) << reg##_##f##_LO))
 
-// what the oracle's .update() does: read, replace these bits, write back. The bits not named belong to the engine and
+// what the oracle's .update does: read, replace these bits, write back. The bits not named belong to the engine and
 // a blind write would clear them.
-static void flcn_rmw(tinynv_dev_t *d, uint64_t off, uint32_t mask, uint32_t val) {
+// Exposed for the 610 host-request executor (gsp610_host.c), which programs the same FBIF/BROM registers the boot
+// path does. renamed it from static flcn_rmw; the 570 call sites are unchanged.
+void tinynv_flcn_rmw(tinynv_dev_t *d, uint64_t off, uint32_t mask, uint32_t val) {
   tinynv_wr32(d, off, (tinynv_rd32(d, off) & ~mask) | val);
 }
 
@@ -64,7 +73,9 @@ static int flcn_dma_free(tinynv_dev_t *d, uint64_t base) {
 
 // Move `size` bytes in 256 byte transfers. The engine takes the source once, as a base, and then one command per block;
 // `mem_off` and `dest` advance together because the image's layout inside the falcon mirrors its layout in memory.
-static int flcn_dma(tinynv_dev_t *d, uint64_t base, uint32_t cmd, uint32_t dest, uint32_t mem_off, uint64_t src, uint32_t size) {
+// Exposed for the 610 host-request executor (gsp610_host.c): the HS-binary request DMAs its IMEM/DMEM the same way
+// the boot path does. renamed it from static flcn_dma; the 570 call sites are unchanged.
+int tinynv_flcn_dma(tinynv_dev_t *d, uint64_t base, uint32_t cmd, uint32_t dest, uint32_t mem_off, uint64_t src, uint32_t size) {
   if (flcn_dma_free(d, base)) return -1;
   tinynv_wr32(d, base + NV_PFALCON_FALCON_DMATRFBASE, (uint32_t)(src >> 8));
   tinynv_wr32(d, base + NV_PFALCON_FALCON_DMATRFBASE1, (uint32_t)((src >> 8) >> 32) & 0x1ff);
@@ -80,7 +91,7 @@ static int flcn_dma(tinynv_dev_t *d, uint64_t base, uint32_t cmd, uint32_t dest,
 
 // Let the engine address memory physically, without a context.
 void tinynv_flcn_disable_ctx_req(tinynv_dev_t *d, uint64_t base) {
-  flcn_rmw(d, base + NV_PFALCON_FBIF_CTL, FLD(NV_PFALCON_FBIF_CTL, ALLOW_PHYS_NO_CTX),
+  tinynv_flcn_rmw(d, base + NV_PFALCON_FBIF_CTL, FLD(NV_PFALCON_FBIF_CTL, ALLOW_PHYS_NO_CTX),
            NV_SET(NV_PFALCON_FBIF_CTL, ALLOW_PHYS_NO_CTX, 1));
   tinynv_wr32(d, base + NV_PFALCON_FALCON_DMACTL, 0);
 }
@@ -139,7 +150,7 @@ static int flcn_execute_hs(tinynv_gpu_t *g, uint64_t base, uint64_t img_paddr, u
   // aperture 0 is video memory. It is not in the published headers under any name, which is why it is a bare 0 here
   // and in the oracle.
   const uint32_t ctx_dma = 0;
-  flcn_rmw(d, base + NV_PFALCON_FBIF_TRANSCFG(ctx_dma),
+  tinynv_flcn_rmw(d, base + NV_PFALCON_FBIF_TRANSCFG(ctx_dma),
            FLD(NV_PFALCON_FBIF_TRANSCFG, TARGET) | FLD(NV_PFALCON_FBIF_TRANSCFG, MEM_TYPE),
            NV_SET(NV_PFALCON_FBIF_TRANSCFG, TARGET, 0) |
            NV_SET(NV_PFALCON_FBIF_TRANSCFG, MEM_TYPE, NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL));
@@ -150,13 +161,13 @@ static int flcn_execute_hs(tinynv_gpu_t *g, uint64_t base, uint64_t img_paddr, u
                  NV_SET(NV_PFALCON_FALCON_DMATRFCMD, SIZE, NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B) |
                  NV_SET(NV_PFALCON_FALCON_DMATRFCMD, CTXDMA, ctx_dma) |
                  NV_SET(NV_PFALCON_FALCON_DMATRFCMD, IMEM, 1) | NV_SET(NV_PFALCON_FALCON_DMATRFCMD, SEC, 1);
-  if (flcn_dma(d, base, cmd, imem_pa, imem_va, img_paddr + code_off - imem_va, imem_sz)) return -1;
+  if (tinynv_flcn_dma(d, base, cmd, imem_pa, imem_va, img_paddr + code_off - imem_va, imem_sz)) return -1;
 
   cmd = NV_SET(NV_PFALCON_FALCON_DMATRFCMD, WRITE, 0) |
         NV_SET(NV_PFALCON_FALCON_DMATRFCMD, SIZE, NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B) |
         NV_SET(NV_PFALCON_FALCON_DMATRFCMD, CTXDMA, ctx_dma) |
         NV_SET(NV_PFALCON_FALCON_DMATRFCMD, IMEM, 0) | NV_SET(NV_PFALCON_FALCON_DMATRFCMD, SEC, 0);
-  if (flcn_dma(d, base, cmd, dmem_pa, dmem_va, img_paddr + data_off - dmem_va, dmem_sz)) return -1;
+  if (tinynv_flcn_dma(d, base, cmd, dmem_pa, dmem_va, img_paddr + data_off - dmem_va, dmem_sz)) return -1;
 
   tinynv_wr32(d, base + NV_PFALCON2_FALCON_BROM_PARAADDR(0), pkc_off);
   tinynv_wr32(d, base + NV_PFALCON2_FALCON_BROM_ENGIDMASK, engid);
@@ -197,7 +208,7 @@ static int flcn_parse_booter(tinynv_gpu_t *g, const char *which, const char *sha
   const char *sha = hs_sha(g->dev.fw_name, which, sha_ga102);
   if (!sha) return tinynv_fail("no %s hash is pinned for %s, so its image cannot be trusted", which, g->dev.fw_name);
   char name[64];
-  snprintf(name, sizeof name, "%s-" TINYNV_FW_VER ".bin", which);
+  snprintf(name, sizeof name, "%s-%s.bin", which, g->profile->version); // profile-owned version infix
   if (tinynv_fw_load(g->dev.fw_name, name, sha, &out->fw)) return -1;
 
   const uint8_t *b = out->fw.data;
@@ -258,12 +269,64 @@ static void flcn_free_booter(tinynv_gpu_t *g, tinynv_booter_t *b) {
   memset(b, 0, sizeof *b);
 }
 
+// ---- the 610 booter path ---------------------------------------------------------------------------------
+//
+// The 610 booters are BTL1 containers, not NVFW images, and the production signature is selected by the SEC2 fuse at
+// RUNTIME (index = num_sigs - 1 - fuse_ver, kernel_gsp_booter.c), not by a selector baked into the header. So the
+// software init parses and bounds-checks the container (files only, no device), and the hardware init reads the fuse,
+// patches the image and places it in video memory. The launch itself is the same flcn_execute_hs the 570 path uses;
+// the BTL1 header's engine/ucode ids and signature DMEM offset happen to equal the 570 literals for these AD102
+// images, and are taken from the container regardless rather than assumed.
+static int flcn_parse_booter610(tinynv_gpu_t *g, const char *which, tinynv_booter_t *out) {
+  (void)g;
+  memset(out, 0, sizeof *out);
+  if (tinynv_fw610_load(which, &out->fw)) return -1;
+  uint32_t image_size = 0;
+  const tinynv_btl1_hdr_t *geom = tinynv_boot610_geom(which, &image_size);
+  if (!geom) return tinynv_fail("no BTL1 geometry is pinned for the 610 %s", which);
+  if (tinynv_boot610_btl1_parse(out->fw.data, out->fw.size, geom, image_size, &out->btl1)) return -1;
+  out->is_btl1 = 1;
+  out->code_off = geom->app_code_off;
+  out->code_sz = geom->app_code_size;
+  out->data_off = geom->os_data_off;
+  out->data_sz = geom->os_data_size;
+  out->pkc_off = out->btl1.sig_dmem_off;
+  out->engid = geom->engine_id;
+  out->ucodeid = geom->ucode_id;
+  return 0;
+}
+
+// Read the SEC2 fuse for this ucode, patch the selected signature and place the image in video memory. Hardware init
+// only: the fuse read is a device access. Idempotent - a retry that re-runs the hardware init reuses the staged image.
+static int flcn_stage_booter610(tinynv_gpu_t *g, tinynv_booter_t *b) {
+  if (!b->is_btl1 || b->image.size) return 0;
+  if (b->ucodeid < 1 || b->ucodeid > 16)
+    return tinynv_fail("the 610 booter's ucode id %u is outside the SEC2 fuse bank", b->ucodeid);
+  uint32_t fuse_raw = tinynv_rd32(&g->dev, SEC2_FUSE_UCODE1 + (b->ucodeid - 1) * 4);
+  uint32_t fuse_ver = tinynv_boot610_fuse_version(fuse_raw);
+  fprintf(stderr, "tinynv: 610 booter signature: fuse_raw=%#x version=%u signatures=%u\n", fuse_raw, fuse_ver,
+          b->btl1.hdr.num_sigs);
+  uint8_t *image;
+  size_t len;
+  if (tinynv_boot610_btl1_image(&b->btl1, b->fw.data, fuse_ver, &image, &len)) return -1;
+  int rc = tinynv_alloc_boot_mem(&g->mm, len, image, 0, &b->image);
+  free(image);
+  return rc;
+}
+
 static int flcn_vbios_init_sw(tinynv_gpu_t *g) {
   tinynv_flcn_t *f = &g->flcn;
   // Two megabytes below the top of video memory, which is where the oracle puts it. The region's own size is declared
-  // to the firmware in 4K units and the firmware fills it; the driver only says where.
+  // to the firmware in 4K units and the firmware fills it; the driver only says where. The 610 layout (boot610) places
+  // FRTS at the same offset; init_wpr_meta compares the two.
   f->frts_offset = g->dev.vram_size - 0x100000 - 0x100000;
   if (tinynv_vbios_fwsec_frts(g, f->frts_offset, &f->fwsec)) return -1;
+  // the 610 booters are BTL1 containers parsed here; the fuse-selected signature is patched and staged at
+  // hardware init (flcn_stage_booter610), because the fuse is a device register.
+  if (is610(g)) {
+    if (flcn_parse_booter610(g, "scrubber", &f->scrubber)) return -1;
+    return flcn_parse_booter610(g, "booter_load", &f->booter);
+  }
   // Ada runs a scrubber on SEC2 between the riscv reset and booter_load (kgspBootstrap_TU102 -> the AD102 HAL); its
   // image has the booter's shape, so the same reader serves it
   if (!strcmp(g->dev.fw_name, "ad102") && flcn_prep_booter(g, "scrubber", NULL, &f->scrubber)) return -1;
@@ -283,7 +346,9 @@ int tinynv_flcn_init_sw(tinynv_gpu_t *g) {
   if (tinynv_alloc_boot_mem(&g->mm, sizeof(empty), &empty, -1, &f->boot_args)) return -1;
   f->boot_args_sysmem = f->boot_args.addrs[0];
 
-  if (tinynv_fw_load(g->dev.fw_name, "fmc-" TINYNV_FW_VER ".bin", FMC_SHA, &f->fmc_fw)) return -1;
+  char fmc_name[64];
+  snprintf(fmc_name, sizeof fmc_name, "fmc-%s.bin", g->profile->version);
+  if (tinynv_fw_load(g->dev.fw_name, fmc_name, FMC_SHA, &f->fmc_fw)) return -1;
   const uint8_t *image;
   size_t image_len;
   if (tinynv_elf_section(&f->fmc_fw, "image", &image, &image_len)) return -1;
@@ -350,6 +415,35 @@ static int kfsp_send_msg(tinynv_gpu_t *g, uint32_t nvdm_type, const void *payloa
   return 0;
 }
 
+// Ada: the scrubber, unless its handoff says it already ran (kgspExecuteScrubberIfNeeded_AD102). Engine id 1, ucode id
+// 13 and a signature at data offset 0 are what the image's own metadata declares (booter_load's reads 1, 3, 0x10).
+// the pinned 610 kgspBootstrap_TU102 runs the scrubber BEFORE FWSEC (570 ran it after the riscv reset and
+// mailbox programming); the 610 path below calls this at the vendor's position, the 570 path at its recorded one.
+static int flcn_scrubber_if_needed(tinynv_gpu_t *g) {
+  tinynv_flcn_t *f = &g->flcn;
+  tinynv_dev_t *d = &g->dev;
+  if (!f->scrubber.image.size) return 0;
+  uint32_t h = tinynv_rd32(d, 0x001180fc) >> 29;   // NV_PGC6_BSI_VPR_SECURE_SCRATCH_15_SCRUBBER_HANDOFF, 31:29
+  if (h >= 3) {
+    fprintf(stderr, "libtinynv: ada scrubber already ran (handoff %u), skipped\n", h);
+    return 0;
+  }
+  if (is610(g) && tinynv_failpoint("610-scrubber")) return -1;
+  if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
+  // 610: the launch parameters come from the BTL1 header (same values for the pinned AD102 images); 570: the
+  // literals the NVFW metadata declares, unchanged.
+  uint32_t pkc = f->scrubber.is_btl1 ? f->scrubber.pkc_off : 0x0;
+  uint32_t eng = f->scrubber.is_btl1 ? f->scrubber.engid : 1;
+  uint32_t uc = f->scrubber.is_btl1 ? f->scrubber.ucodeid : 13;
+  if (flcn_execute_hs(g, f->sec2, f->scrubber.image.paddr, f->scrubber.code_off, f->scrubber.data_off,
+                      0, f->scrubber.code_off, f->scrubber.code_sz, 0, 0, f->scrubber.data_sz,
+                      pkc, eng, uc, NULL, NULL)) return -1;
+  uint32_t h2 = tinynv_rd32(d, 0x001180fc) >> 29;
+  fprintf(stderr, "libtinynv: ada scrubber ran on sec2: handoff %u -> %u%s\n", h, h2, h2 >= 3 ? "" : " (NOT DONE)");
+  if (h2 < 3) return tinynv_fail("the ada scrubber halted without setting its handoff (%u)", h2);
+  return 0;
+}
+
 // ---- the vbios path's hardware boot -------------------------------------------------------------------------------
 //
 // Four steps, and each one is a gate on the next. FWSEC runs on the GSP falcon and places the write-protected region -
@@ -376,8 +470,21 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
                        "previous run should have unloaded it (TINYNV_UNLOAD=1, the default); a replug re-enumerates the card",
                        d->wpr2_hi_now);
 
+  // stage the fuse-patched BTL1 booters now that the device can be read (the software init only parsed them).
+  if (is610(g)) {
+    if (tinynv_failpoint("610-booter-stage")) return -1;
+    if (flcn_stage_booter610(g, &f->scrubber) || flcn_stage_booter610(g, &f->booter)) return -1;
+  }
+
+  // the 610 vendor bootstrap scrubs BEFORE FWSEC (kgspBootstrap_TU102, pinned 610.43.03). The 570 order
+  // (FWSEC first) is kept unchanged below for the recorded path.
+  if (is610(g)) {
+    if (flcn_scrubber_if_needed(g)) return -1;
+  }
+
   // FWSEC, out of the card's own rom, on the gsp falcon. Its data segment loads at virtual zero, which is why the
   // dmem virtual base is a literal here and the code's is not.
+  if (is610(g) && tinynv_failpoint("610-fwsec")) return -1;
   if (tinynv_flcn_reset(g, f->falcon, 0)) return -1;
   if (flcn_execute_hs(g, f->falcon, f->fwsec.image.paddr, 0, dsc->IMEMLoadSize,
                       dsc->IMEMPhysBase, dsc->IMEMVirtBase, dsc->IMEMLoadSize,
@@ -397,31 +504,23 @@ static int flcn_vbios_init_hw(tinynv_gpu_t *g) {
   tinynv_wr32(d, NV_PGSP_FALCON_MAILBOX0, (uint32_t)gsp->libos_args_sysmem);
   tinynv_wr32(d, NV_PGSP_FALCON_MAILBOX1, (uint32_t)(gsp->libos_args_sysmem >> 32));
 
-  // Ada: the scrubber, unless its handoff says it already ran (kgspExecuteScrubberIfNeeded_AD102). Engine id 1, ucode id
-  // 13 and a signature at data offset 0 are what the image's own metadata declares (booter_load's reads 1, 3, 0x10).
-  if (f->scrubber.image.size) {
-    uint32_t h = tinynv_rd32(d, 0x001180fc) >> 29;   // NV_PGC6_BSI_VPR_SECURE_SCRATCH_15_SCRUBBER_HANDOFF, 31:29
-    if (h < 3) {
-      if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
-      if (flcn_execute_hs(g, f->sec2, f->scrubber.image.paddr, f->scrubber.code_off, f->scrubber.data_off,
-                          0, f->scrubber.code_off, f->scrubber.code_sz, 0, 0, f->scrubber.data_sz,
-                          0x0, 1, 13, NULL, NULL)) return -1;
-      uint32_t h2 = tinynv_rd32(d, 0x001180fc) >> 29;
-      fprintf(stderr, "libtinynv: ada scrubber ran on sec2: handoff %u -> %u%s\n", h, h2, h2 >= 3 ? "" : " (NOT DONE)");
-      if (h2 < 3) return tinynv_fail("the ada scrubber halted without setting its handoff (%u)", h2);
-    } else {
-      fprintf(stderr, "libtinynv: ada scrubber already ran (handoff %u), skipped\n", h);
-    }
+  // the scrubber at its recorded 570 position (the 610 path already ran it before FWSEC, above)
+  if (!is610(g)) {
+    if (flcn_scrubber_if_needed(g)) return -1;
   }
 
   // booter_load on SEC2, carrying the wpr metadata. engine id 1 and ucode id 3 are what this image declares itself to
-  // be; the boot rom refuses it under any other pair.
+  // be; the boot rom refuses it under any other pair. 610 takes them from the BTL1 header (the same values).
+  if (is610(g) && tinynv_failpoint("610-booter-load")) return -1;
   if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
   uint32_t mbx[2] = {0, 0};
   uint64_t wpr = gsp->wpr_meta_sysmem;
+  uint32_t b_pkc = f->booter.is_btl1 ? f->booter.pkc_off : 0x10;
+  uint32_t b_eng = f->booter.is_btl1 ? f->booter.engid : 1;
+  uint32_t b_uc = f->booter.is_btl1 ? f->booter.ucodeid : 3;
   if (flcn_execute_hs(g, f->sec2, f->booter.image.paddr, f->booter.code_off, f->booter.data_off,
                       0, f->booter.code_off, f->booter.code_sz, 0, 0, f->booter.data_sz,
-                      0x10, 1, 3, &wpr, mbx)) return -1;
+                      b_pkc, b_eng, b_uc, &wpr, mbx)) return -1;
   if (mbx[0]) return tinynv_fail("booter_load refused to unpack gsp-rm: mailbox %#x %#x", mbx[0], mbx[1]);
 
   tinynv_wr32(d, f->falcon + NV_PFALCON_FALCON_OS, 0);
@@ -504,6 +603,28 @@ int tinynv_flcn_unload_prepare(tinynv_gpu_t *g) {
     return tinynv_fail("the boot's fwsec and booter_load slots are gone, so there is nowhere proven to put the unload images");
   if (!f->fwsec.sb_image) return tinynv_fail("no fwsec-sb image was built at boot: %s", f->fwsec.sb_error);
 
+  // the 610 booter_unload is a BTL1 container; parse, fuse-patch and stage it into booter_load's proven slot,
+  // exactly where the 570 NVFW image goes. The fuse read is legal here: GSP-RM is still up and the card is decoding.
+  if (is610(g)) {
+    if (tinynv_failpoint("610-booter-unload")) return -1;
+    if (flcn_parse_booter610(g, "booter_unload", &f->unload)) return -1;
+    uint32_t fuse_raw = tinynv_rd32(&g->dev, SEC2_FUSE_UCODE1 + (f->unload.ucodeid - 1) * 4);
+    uint32_t fuse_ver = tinynv_boot610_fuse_version(fuse_raw);
+    uint8_t *image;
+    size_t len;
+    if (tinynv_boot610_btl1_image(&f->unload.btl1, f->unload.fw.data, fuse_ver, &image, &len)) return -1;
+    if (len > f->booter.image.size) {
+      free(image);
+      return tinynv_fail("the 610 booter_unload is %zu bytes and booter_load's slot only %zu", len,
+                         (size_t)f->booter.image.size);
+    }
+    nv_wr_block(&f->fwsec.image.view, 0, f->fwsec.sb_image, f->fwsec.image_len);
+    nv_wr_block(&f->booter.image.view, 0, image, len);
+    free(image);
+    f->unload_staged = 1;
+    return 0;
+  }
+
   uint8_t *image;
   size_t len;
   if (flcn_parse_booter(g, "booter_unload", BOOTER_UNLOAD_SHA_GA102, &f->unload, &image, &len)) return -1;
@@ -538,8 +659,12 @@ int tinynv_flcn_unload_hw(tinynv_gpu_t *g) {
   uint32_t mbx[2] = {0, 0};
   uint64_t arg = 0xffull | (0xffull << 32);
   if (tinynv_flcn_reset(g, f->sec2, 0)) return -1;
+  // 610: launch parameters from the BTL1 header (the same values for the pinned AD102 image); 570: the NVFW literals.
+  uint32_t u_pkc = f->unload.is_btl1 ? f->unload.pkc_off : 0x10;
+  uint32_t u_eng = f->unload.is_btl1 ? f->unload.engid : 1;
+  uint32_t u_uc = f->unload.is_btl1 ? f->unload.ucodeid : 3;
   if (flcn_execute_hs(g, f->sec2, f->booter.image.paddr, f->unload.code_off, f->unload.data_off,
-                      0, f->unload.code_off, f->unload.code_sz, 0, 0, f->unload.data_sz, 0x10, 1, 3, &arg, mbx)) return -1;
+                      0, f->unload.code_off, f->unload.code_sz, 0, 0, f->unload.data_sz, u_pkc, u_eng, u_uc, &arg, mbx)) return -1;
   if (mbx[0]) return tinynv_fail("booter_unload refused to tear the region down: mailbox %#x %#x", mbx[0], mbx[1]);
 
   uint32_t wpr2 = tinynv_rd32(d, NV_PFB_PRI_MMU_WPR2_ADDR_HI);

@@ -813,7 +813,7 @@ int tinynv_exec_wait(tinynv_exec_t *ex, uint64_t value, double seconds) {
 
 // Whether an allocation fits without the region having to start again from the bottom. Callers that hold a chain use
 // this to flush before they allocate, because coming round with a built-but-unsubmitted descriptor in the region would
-// hand its bytes to something else - arena() refuses that outright, so this is how a caller avoids reaching it.
+// hand its bytes to something else - arena refuses that outright, so this is how a caller avoids reaching it.
 //
 // It asks the allocator rather than working it out, and that is the point of the line. This used to be a second copy
 // of the placement arithmetic, and a second copy is the shape that drifts: the copy in arena.c is driven by a test and
@@ -855,7 +855,7 @@ static void *arena(tinynv_exec_t *ex, int r, uint64_t bytes, uint64_t align, uin
     // those descriptors live in this region and nothing has been told to run them yet, so no wait would cover them and
     // the rewind would give their bytes away.
     //
-    // That guard used to be a partial check, and the gap cost six hardware runs: flush() zeroes the chain count and
+    // That guard used to be a partial check, and the gap cost six hardware runs: flush zeroes the chain count and
     // then allocates its own command buffer, so when THAT allocation wrapped, the count was already zero and the reset
     // went ahead under descriptors built moments earlier. With a region each, flush's command buffer can no longer
     // reach the descriptors, so the check now covers every wrap that could reach them. It still has to exist - the
@@ -963,7 +963,7 @@ static uint32_t *cmd_space(tinynv_exec_t *ex, uint32_t dwords, uint64_t *va) {
 // was waited on by the host that could not happen. It can now, so the ordering has to be in the command stream, which
 // is where the oracle puts it too.
 // Declared here because batch_begin needs it: a copy batch has to push any held inline uploads out as a compute batch
-// of their own before it can proceed, and run() is defined below.
+// of their own before it can proceed, and run is defined below.
 static int run(tinynv_exec_t *ex, tinynv_queue_t *q, tinynv_cmdbuf_t *c, uint64_t cmdbuf_va);
 
 // Hold bytes for the next compute batch to carry. The caller has already checked they fit.
@@ -983,7 +983,7 @@ static int inline_pend_fits(const tinynv_exec_t *ex, uint32_t len) {
 
 static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, tinynv_cmdbuf_t *c, uint64_t *va) {
   // Everything that is not a launch is ordered after the launches already built: a copy that reads what a kernel wrote,
-  // a wait, the setup batches. flush() clears the count before it builds anything, so the call it makes back into here
+  // a wait, the setup batches. flush clears the count before it builds anything, so the call it makes back into here
   // finds nothing pending and this does not recurse.
   if (tinynv_exec_flush(ex)) return -1;
   // A copy batch cannot carry compute-class methods, and a download that read memory whose bytes were still sitting in
@@ -1003,7 +1003,7 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
     ex->submitting_inline = 0;
     if (rc) return -1;
   }
-  // The refill's head timestamp, and it has to be built here rather than in run(): run() is handed a command buffer
+  // The refill's head timestamp, and it has to be built here rather than in run: run is handed a command buffer
   // that already holds the batch's launches, so anything it appends times the end. One semaphore method is six dwords
   // and the space for it is reserved here, by the only code that knows the batch has not been sized for it.
   int head_ts = ex->profile && ex->refill_pending && q != &ex->g->gsp.copy_q;
@@ -1423,7 +1423,7 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   int fpath = 0;           // how this flush's descriptors were delivered, for the post-mortem ring: 1 delta, 2 delta-skip, 3 inline, 4 copy
   unsigned fflags = 0;
   // This flush's patches and their footprint, hoisted out of the block below because the actual write happens after
-  // batch_begin() further down - see the comment there for why it moved. The spans themselves live in ex->delta_span.
+  // batch_begin further down - see the comment there for why it moved. The spans themselves live in ex->delta_span.
   unsigned delta_pend_n = 0;
   uint32_t delta_pend_dwords = 0;
   if (ex->delta_delivery && ex->region[AR_DESC].last_delivered && ex->arena_dma &&
@@ -1542,7 +1542,7 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
               need_bytes, ns);
     if (all_fit) {
       // Nothing above touched arena state - safe to commit now that every launch has been checked. The actual
-      // tinynv_cmd_inline_upload calls happen after batch_begin() below, once the chain's own command buffer
+      // tinynv_cmd_inline_upload calls happen after batch_begin below, once the chain's own command buffer
       // exists to write them into; ex->delta_span[0..delta_pend_n) and delta_pend_dwords (set here) are what that
       // later code reads.
       delta_pend_n = ns;
@@ -1625,14 +1625,14 @@ int tinynv_exec_flush(tinynv_exec_t *ex) {
   // Four dwords per launch method, and in the unlinked mode every descriptor needs its own rather than the head
   // alone carrying the rest.
   // Eight more under the profile for the tail stamp appended below.
-  // Room for this flush's own delta patches, on top of batch_begin()'s own reservation for whatever TINYNV_INLINE_UPLOAD
+  // Room for this flush's own delta patches, on top of batch_begin's own reservation for whatever TINYNV_INLINE_UPLOAD
   // has pending: delta_span_dwords per patch, summed in the check pass above - exact because every run is a dword
   // multiple by construction (tinynv_delta_runs diffs dwords) and the emit loop below splits a long run into pieces
   // exactly as delta_span_dwords priced them.
   uint32_t want_dwords = (ex->no_chain_deps ? 48 + 4 * (uint32_t)n : 48) + (ex->profile ? 8u : 0u) +
                          (ktail < TINYNV_KPROF_SLOTS ? 8u : 0u) + delta_pend_dwords;
   if (batch_begin(ex, &ex->g->gsp.compute_q, want_dwords, &c, &va)) return -1;
-  // Written here, not queued through inline_pend: batch_begin() has already reserved the room want_dwords asked
+  // Written here, not queued through inline_pend: batch_begin has already reserved the room want_dwords asked
   // for and drained whatever TINYNV_INLINE_UPLOAD had pending into this same c, in that order, ahead of this -
   // same "after the acquire, before anything the caller appends" placement inline_pend's own drain relies on
   // (see batch_begin), just written directly since these were never held anywhere else to begin with.
@@ -2067,7 +2067,7 @@ int tinynv_exec_upload(tinynv_exec_t *ex, uint64_t dst_va, const void *src, size
     double t1 = now();
     if (tinynv_exec_copy(ex, dst_va + off, ex->stage[sb].va, chunk)) return -1;
     // What this copy will have reached when it is done reading the buffer. q_last[1] is the copy queue's slot, set
-    // by the run() that tinynv_exec_copy just performed.
+    // by the run that tinynv_exec_copy just performed.
     ex->stage_pend[sb] = ex->q_last[1];
     // the arm this replaced: nothing may be in flight when the chunk ends, so the next memcpy is unconditionally safe
     if (ex->stage_single) { if (tinynv_exec_idle(ex)) return -1; ex->stage_pend[sb] = 0; }
@@ -2356,7 +2356,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   // token land where launch k of the last one did. Then what differs is what actually changes a token: a release
   // value, a KV position, an offset - a few dwords a launch.
   //
-  // Done by declaring the region full so the next placement comes round through arena()'s own wrap path, which is
+  // Done by declaring the region full so the next placement comes round through arena's own wrap path, which is
   // the only path that knows how: it refuses if a chain is pending (none is - the standstill flushed it), pushes and
   // flushes, waits per piece for whatever still owns the bytes, and refuses if any span is unaccounted for. Nothing
   // here reasons about ownership; that is deliberate. The region has to hold a whole token between rewinds (a dense
@@ -2444,7 +2444,7 @@ int tinynv_exec_run_inner(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tiny
   if (params_len) memcpy(host + slot + k->param_base, params, params_len);
 
   // Held, not handed over: the next launch still has to be able to write its address into this descriptor. The bytes
-  // are copied into the arena by flush(), once no more editing can happen.
+  // are copied into the arena by flush, once no more editing can happen.
   ex->chain[ex->nchain].qmd = q;
   ex->chain[ex->nchain].host = host;
   ex->chain[ex->nchain].va = qmd_va;
@@ -2765,7 +2765,7 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
       fprintf(stderr, "libtinynv: the first chain after a standstill carries %u launches and its descriptors ride in "
                       "the batch (was asked for)\n", ex->short_chain); }
 
-  // Measured 2026-09-18 (TINYNV_DUMP_CMD, see the diagnostic near tinynv_exec's run()): a steady-state MoE decode
+  // Measured 2026-09-18 (TINYNV_DUMP_CMD, see the diagnostic near tinynv_exec's run): a steady-state MoE decode
   // token's descriptor content is 2.7% different from the token before it - a handful of KV-cache offset/address
   // dwords advancing by a fixed stride, never the launch addresses themselves (ggml-cuda's MoE dispatch expresses
   // expert routing as small on-device buffer content, not as changed kernel addresses). The ring already reuses
