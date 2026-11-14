@@ -5,8 +5,14 @@
 #include "flcn.h"
 #include "gsp.h"
 #include "mmu.h"
+#include "runtime_profile.h"
 
 struct tinynv_gpu {
+  // The GSP runtime this open selected. Chosen before any device state exists and IMMUTABLE for the whole
+  // open: it lives here, outside gsp/flcn, so unmake_boot's memset of those two on a retry cannot disturb it, and
+  // nothing re-selects it until the next tinynv_gpu_open in a fresh process. tinynv_gpu_boot_firmware asserts it
+  // survived every retry.
+  const tinynv_runtime_profile_t *profile;
   tinynv_dev_t dev;
   tinynv_mm_t mm;
   // Whether the read before the doorbell has been confirmed to reach the device; see tinynv_submit. On a backend where

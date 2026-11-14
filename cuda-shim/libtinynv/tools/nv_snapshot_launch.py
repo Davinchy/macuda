@@ -91,7 +91,7 @@ def install():
     def note():
       snap["submits"].append({
         "queue": str(getattr(self, "queue", "?")), "cls": type(self).__name__,
-        "dwords": len(self.blob) // 4, "blob": bytes(self.blob).hex(),
+        "dwords": len(self.blob) // 4, "blob": bytes(self.blob).hex,
         # the offsets an address is written into. zero in the blob above, and supplied by the caller in the C driver too,
         # so leaving them out of the comparison is not a weakening of it.
         "patch_offsets": sorted(int(o) for o, _ in self.patches),

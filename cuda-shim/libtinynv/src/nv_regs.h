@@ -458,6 +458,51 @@ static inline uint64_t nv_get128(const uint64_t w[2], int lo, int hi) {
 #define NV_PFALCON_FALCON_DMATRFMOFFS_OFFS_LO 0
 #define NV_PFALCON_FALCON_DMATRFMOFFS_OFFS_HI 23
 
+// the falcon IMEM/DMEM access ports and HWCFG, needed by the 610 generic-bootloader host request
+// (kgspLoadAndExecuteGenericBootloader_TU102 -> s_imemCopyTo/s_dmemCopyTo). Added from the pinned 610.43.03
+// dev_falcon_v4.h (ga102) because the tinygrad autogen the generator reads is not available offline; the values are
+// asserted against that pinned header in test_headers_610, and the generator's WANTED list names them so a future
+// regeneration reproduces them. Do not hand-tune: the assertion is the source of truth.
+// dev_falcon_v4/ga102
+#define NV_PFALCON_FALCON_HWCFG 0x00000108
+#define NV_PFALCON_FALCON_HWCFG_IMEM_SIZE_LO 0
+#define NV_PFALCON_FALCON_HWCFG_IMEM_SIZE_HI 8
+
+// dev_falcon_v4/ga102
+#define NV_PFALCON_FALCON_IMEMC(i) (0x00000180u + (uint64_t)(i) * 0x10u)
+#define NV_PFALCON_FALCON_IMEMC_OFFS_LO 2
+#define NV_PFALCON_FALCON_IMEMC_OFFS_HI 7
+#define NV_PFALCON_FALCON_IMEMC_BLK_LO 8
+#define NV_PFALCON_FALCON_IMEMC_BLK_HI 23
+#define NV_PFALCON_FALCON_IMEMC_AINCW_LO 24
+#define NV_PFALCON_FALCON_IMEMC_AINCW_HI 24
+#define NV_PFALCON_FALCON_IMEMC_SECURE_LO 28
+#define NV_PFALCON_FALCON_IMEMC_SECURE_HI 28
+
+// dev_falcon_v4/ga102
+#define NV_PFALCON_FALCON_IMEMD(i) (0x00000184u + (uint64_t)(i) * 0x10u)
+#define NV_PFALCON_FALCON_IMEMD_DATA_LO 0
+#define NV_PFALCON_FALCON_IMEMD_DATA_HI 31
+
+// dev_falcon_v4/ga102
+#define NV_PFALCON_FALCON_IMEMT(i) (0x00000188u + (uint64_t)(i) * 0x10u)
+#define NV_PFALCON_FALCON_IMEMT_TAG_LO 0
+#define NV_PFALCON_FALCON_IMEMT_TAG_HI 15
+
+// dev_falcon_v4/ga102
+#define NV_PFALCON_FALCON_DMEMC(i) (0x000001c0u + (uint64_t)(i) * 0x8u)
+#define NV_PFALCON_FALCON_DMEMC_OFFS_LO 2
+#define NV_PFALCON_FALCON_DMEMC_OFFS_HI 7
+#define NV_PFALCON_FALCON_DMEMC_BLK_LO 8
+#define NV_PFALCON_FALCON_DMEMC_BLK_HI 23
+#define NV_PFALCON_FALCON_DMEMC_AINCW_LO 24
+#define NV_PFALCON_FALCON_DMEMC_AINCW_HI 24
+
+// dev_falcon_v4/ga102
+#define NV_PFALCON_FALCON_DMEMD(i) (0x000001c4u + (uint64_t)(i) * 0x8u)
+#define NV_PFALCON_FALCON_DMEMD_DATA_LO 0
+#define NV_PFALCON_FALCON_DMEMD_DATA_HI 31
+
 // dev_falcon_v4/gh100+ga102
 #define NV_PFALCON_FALCON_MAILBOX0 0x00000040
 #define NV_PFALCON_FALCON_MAILBOX0_DATA_LO 0
@@ -509,6 +554,17 @@ static inline uint64_t nv_get128(const uint64_t w[2], int lo, int hi) {
 
 // dev_fbif_v4/ga102
 #define NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL 0x1
+
+// the aperture targets and engine-id flag the 610 host-request loader programs (s_setupLoaderAperture /
+// kgspLoadAndExecuteHsBinary_GA102). Added from the pinned 610.43.03 dev_fbif_v4.h (ga102); asserted in
+// test_headers_610 and named in the generator's WANTED list for regeneration.
+// dev_fbif_v4/ga102
+#define NV_PFALCON_FBIF_TRANSCFG_TARGET_LOCAL_FB 0x0
+#define NV_PFALCON_FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM 0x1
+#define NV_PFALCON_FBIF_TRANSCFG_TARGET_NONCOHERENT_SYSMEM 0x2
+#define NV_PFALCON_FBIF_TRANSCFG_ENGINE_ID_FLAG_LO 16
+#define NV_PFALCON_FBIF_TRANSCFG_ENGINE_ID_FLAG_HI 16
+#define NV_PFALCON_FBIF_TRANSCFG_ENGINE_ID_FLAG_BAR2_FN0 0x0
 
 // dev_riscv_pri/ga102
 #define NV_PRISCV_RISCV_BCR_CTRL 0x00001668

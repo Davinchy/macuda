@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define TINYNV_MAX_BARS 6
 
@@ -82,17 +83,18 @@ static inline uint32_t nv_rd32_recv(tinynv_mmio_t *m) {
 static inline void nv_rd_block(tinynv_mmio_t *m, uint64_t off, void *dst, size_t n) {
   if (!m->ptr) { m->rd_block(m, off, dst, n); return; }
   volatile uint32_t *s = m->ptr + off / 4;
-  uint32_t *d = (uint32_t *)dst;
   size_t i = 0;
-  for (; i < n / 4; i++) d[i] = s[i];
+  // memcpy per word, not a uint32_t* cast over dst: dst may be a struct with wider (uint64_t) members, and a cast
+  // would be a strict-aliasing violation the optimizer can misread. Same volatile reads, same order, same bytes.
+  for (; i < n / 4; i++) { uint32_t v = s[i]; memcpy((uint8_t *)dst + i * 4, &v, 4); }
   for (size_t b = i * 4; b < n; b++) ((uint8_t *)dst)[b] = ((const volatile uint8_t *)m->ptr)[off + b];
 }
 static inline void nv_wr_block(tinynv_mmio_t *m, uint64_t off, const void *src, size_t n) {
   if (!m->ptr) { m->wr_block(m, off, src, n); return; }
   volatile uint32_t *d = m->ptr + off / 4;
-  const uint32_t *s = (const uint32_t *)src;
   size_t i = 0;
-  for (; i < n / 4; i++) d[i] = s[i];
+  // memcpy per word for the same aliasing reason as nv_rd_block (src may be a struct with uint64_t members).
+  for (; i < n / 4; i++) { uint32_t v; memcpy(&v, (const uint8_t *)src + i * 4, 4); d[i] = v; }
   for (size_t b = i * 4; b < n; b++) ((volatile uint8_t *)m->ptr)[off + b] = ((const uint8_t *)src)[b];
 }
 

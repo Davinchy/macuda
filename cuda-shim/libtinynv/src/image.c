@@ -114,7 +114,7 @@ static int place(const tinynv_cubin_t *c, uint64_t *addr, int with_bytes, uint8_
   // cuda::std::ignore) whose address is taken and never dereferenced, which is why nothing failed; the first real
   // zero-initialised __device__ variable would have written into that other section. Appended here AFTER every
   // PROGBITS section, so no section above moves: only the block's length grows, by the NOBITS sizes and their
-  // alignment. The bytes are zero because grow() zero-fills everything past the old length, and the whole block is
+  // alignment. The bytes are zero because grow zero-fills everything past the old length, and the whole block is
   // what goes across, so the device sees zeroes too.
   for (int i = 0; i < c->nsections; i++) {
     const tinynv_section_t *s = &c->sections[i];
@@ -287,12 +287,12 @@ void tinynv_image_free(tinynv_image_t *im) {
 // symbol, LOCAL binding, 112 bytes at offset 0 of `.nv.global.init` - so locals are found (the real driver answers
 // this one), and the size is the SYMBOL's own st_size, never a guess or the section's size.
 //
-// The offset comes from place(), the one layout tinynv_cubin_image builds with, so the address a caller gets is the
+// The offset comes from place, the one layout tinynv_cubin_image builds with, so the address a caller gets is the
 // address every relocation against the same symbol was written with.
 //
 // Refused, each by name: a name no symbol table carries; a symbol that is not an object (a kernel's name, say); and an
 // object in a section that is not part of the loadable block. Zero-initialised `.nv.global` (SHT_NOBITS) IS part of it:
-// place() appends it as zeroes after the PROGBITS sections.
+// place appends it as zeroes after the PROGBITS sections.
 int tinynv_cubin_global(const tinynv_cubin_t *c, const char *name, uint64_t *image_off, uint64_t *size) {
   if (!c->sections || !name) return tinynv_fail("cubin: no section table, or no name to look for");
   for (int i = 0; i < c->nsections; i++) {

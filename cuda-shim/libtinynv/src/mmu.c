@@ -12,6 +12,7 @@
 #include <time.h>
 #include "mmu.h"
 #include "internal.h"
+#include "runtime_profile.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -170,13 +171,18 @@ uint64_t tinynv_mm_alloc_va(tinynv_mm_t *mm, uint64_t size, uint64_t align) {
 int tinynv_mm_init(tinynv_mm_t *mm, tinynv_dev_t *dev) {
   memset(mm, 0, sizeof(*mm));
   mm->dev = dev;
+  // the hold-back is the selected runtime profile's reservation policy, not a global constant. A device
+  // without a frozen profile is refused rather than guessed at - the 570 profile carries exactly TINYNV_FW_RESERVE_TOP,
+  // so every address the recorded boot depends on is unchanged.
+  if (!dev->runtime) return tinynv_fail("no runtime profile is attached to this device: the firmware reservation is "
+                                       "profile-owned (tinynv_gpu_open selects it)");
 
   // The top of video memory is the firmware's - its write-protected region and the unprotected heap just below it -
   // so the manager never sees it. Derived from the sizes this driver hands the firmware (fw_layout.h) since
   // 2026-09-19; the flat 64 MB before that was related to none of them and left the top ~169 MB of this region inside
   // what the firmware owns, unnoticed only because no run had ever come within that of the top. The boot reads the
   // wpr2 registers afterwards and refuses the open if this arithmetic turns out short (tinynv_mm_check_fw_carveout).
-  uint64_t managed = dev->vram_size - TINYNV_FW_RESERVE_TOP;
+  uint64_t managed = dev->vram_size - dev->runtime->reserve_top;
   mm->reserve_ptable = !dev->large_bar;
 
   uint64_t ptable_size = mm->reserve_ptable ? round_up(managed / 512, MB) : 0;
@@ -273,25 +279,30 @@ int tinynv_mm_check_fw_carveout(const tinynv_mm_t *mm, uint64_t wpr2_lo, uint64_
   // the firmware image plus its heap, is a misread register, and a check that quietly passed on garbage would be no
   // check. The bounds are the image's and the reservation's own.
   const uint64_t span = wpr2_hi > wpr2_lo ? wpr2_hi - wpr2_lo : 0;
-  if (wpr2_lo >= wpr2_hi || wpr2_hi > vram || span < TINYNV_FW_HEAP_SIZE + TINYNV_FW_IMAGE_BOUND / 2 ||
-      span > TINYNV_FW_RESERVE_TOP)
+  // The bounds are the selected profile's image bound and reservation (570: the fw_layout.h values). The heap terms
+  // are profile-owned too: 570 carries exactly TINYNV_FW_HEAP_SIZE / TINYNV_FW_NONWPR_HEAP, so its recorded
+  // behavior is unchanged; 610 carries the matching AD102 values from fw_layout_610.h.
+  const uint64_t reserve_top = mm->dev->runtime->reserve_top, image_bound = mm->dev->runtime->image_bound;
+  const uint64_t fw_heap = mm->dev->runtime->fw_heap_size, nonwpr = mm->dev->runtime->nonwpr_heap;
+  if (wpr2_lo >= wpr2_hi || wpr2_hi > vram || span < fw_heap + image_bound / 2 ||
+      span > reserve_top)
     return tinynv_fail("the wpr2 registers read %#llx..%#llx, which is not a %llu-%llu MB region inside %llu MB of "
                        "video memory - a misread, not a layout",
                        (unsigned long long)wpr2_lo, (unsigned long long)wpr2_hi,
-                       (unsigned long long)((TINYNV_FW_HEAP_SIZE + TINYNV_FW_IMAGE_BOUND / 2) >> 20),
-                       (unsigned long long)(TINYNV_FW_RESERVE_TOP >> 20), (unsigned long long)(vram >> 20));
+                       (unsigned long long)((fw_heap + image_bound / 2) >> 20),
+                       (unsigned long long)(reserve_top >> 20), (unsigned long long)(vram >> 20));
   // The unprotected heap sits just below the region (gsp_fw_wpr_meta.h), and it is the first thing an allocator that
   // bumps upward would reach: the bound is its bottom, not wpr2's.
-  const uint64_t fw_low = wpr2_lo - TINYNV_FW_NONWPR_HEAP;
+  const uint64_t fw_low = wpr2_lo - nonwpr;
   if (top > fw_low)
     return tinynv_fail("the manager stops at %#llx but the firmware owns from %#llx (wpr2 %#llx..%#llx with %llu KB "
                        "of non-wpr heap below it): raise TINYNV_FW_RESERVE_TOP in fw_layout.h",
                        (unsigned long long)top, (unsigned long long)fw_low, (unsigned long long)wpr2_lo,
-                       (unsigned long long)wpr2_hi, (unsigned long long)(TINYNV_FW_NONWPR_HEAP >> 10));
+                       (unsigned long long)wpr2_hi, (unsigned long long)(nonwpr >> 10));
   snprintf(line, n, "chip says wpr2 %#llx..%#llx (%.1f MB) with %.1f MB of non-wpr heap below it; the manager stops "
                     "%.1f MB under that",
            (unsigned long long)wpr2_lo, (unsigned long long)wpr2_hi, (double)span / (double)MB,
-           (double)TINYNV_FW_NONWPR_HEAP / (double)MB, (double)(fw_low - top) / (double)MB);
+           (double)nonwpr / (double)MB, (double)(fw_low - top) / (double)MB);
   return 0;
 }
 

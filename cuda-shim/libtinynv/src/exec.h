@@ -110,7 +110,7 @@ _Static_assert(TINYNV_DELTA_SPANS_MAX >= TINYNV_EXEC_CHAIN_MAX, "every launch in
 // write them, which is inside a 256 MB window, while descriptors are no longer written by the processor at all and
 // can come from plain video memory and be as large as the wrap rate wants.
 //
-// There are two of them, and the reason is a bug rather than tidiness. flush() zeroes the chain count and THEN
+// There are two of them, and the reason is a bug rather than tidiness. flush zeroes the chain count and THEN
 // allocates its own command buffer, so a wrap during that allocation saw a count of zero, passed the guard meant to
 // refuse exactly that, and reset the arena under descriptors built moments earlier - which then existed only in the
 // host shadow while the engine read whatever video memory held a wrap ago. Six hardware runs. With one writer per
@@ -209,7 +209,7 @@ typedef struct {
 
   // Launches built but not yet handed to the ring. A kernel is ordered against the one before it by the descriptor
   // chain, not by draining the engine between them, and a chain has to be complete before its head is dispatched -
-  // so a launch is held until something needs it to have happened. See flush() in exec.c.
+  // so a launch is held until something needs it to have happened. See flush in exec.c.
   struct {
     tinynv_qmd_t qmd;    // the descriptor, still being edited: the next launch writes its chain pointer into this one
     uint8_t *host;       // where it will be copied, in the arena the GPU reads

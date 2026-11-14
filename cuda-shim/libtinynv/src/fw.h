@@ -23,6 +23,11 @@ void tinynv_fw_set_root(const char *dir);
 // Load <root>/nvidia/<chip_dir>/gsp/<name> and refuse it unless it hashes to sha256_hex. A firmware image is code the
 // GPU's secure boot will execute, so "the file was there" is not good enough: the version is pinned by content.
 int tinynv_fw_load(const char *chip_dir, const char *name, const char *sha256_hex, tinynv_blob_t *out);
+// load <root>/<relpath> with the same content pin. The 610 runtime bundle lives in its own versioned
+// subtree (nvidia/ad102/gsp-610.43.03/, the layout), NOT under the 570 nvidia/<chip>/gsp directory, so the
+// profile resolves its assets through this rather than by renaming files into the old layout. TINYNV_FW_DIR stays
+// the root for both; it never overrides the profile selection or the hash check.
+int tinynv_fw_load_rel(const char *relpath, const char *sha256_hex, tinynv_blob_t *out);
 void tinynv_fw_free(tinynv_blob_t *b);
 
 // One ELF section by its exact name, pointing into the blob. Handles both 32 and 64 bit containers: NVIDIA ships the FMC

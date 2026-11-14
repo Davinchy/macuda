@@ -16,7 +16,7 @@
 #include <string.h>
 
 #define LV2_COUNT 16
-#define LV2_BITS 5 // (16).bit_length(), the oracle's lv2_cnt.bit_length()
+#define LV2_BITS 5 // (16).bit_length, the oracle's lv2_cnt.bit_length
 
 static int bit_length(uint64_t v) {
   int n = 0;

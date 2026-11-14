@@ -77,7 +77,7 @@ void tinynv_arena_submitted(tinynv_exec_region_t *rg, uint64_t value) {
 
 // Start the region again from the bottom.
 //
-// THE CALLER MUST HAVE SUBMITTED AND PUSHED FIRST, and nothing in this file enforces or can enforce that. arena() in
+// THE CALLER MUST HAVE SUBMITTED AND PUSHED FIRST, and nothing in this file enforces or can enforce that. arena in
 // exec.c does it - push_shadow then flush, both immediately above its call to this - and the two spans below are empty
 // by the time control arrives here BECAUSE OF THAT and for no reason visible from here. Said the other way round: this
 // function cannot tell a correct call from one that is about to hand live bytes away, so the guarantee lives at the

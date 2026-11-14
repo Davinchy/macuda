@@ -12,7 +12,13 @@
 
 int tinynv_gpu_open(tinynv_gpu_t *g, tinynv_pci_t *pci) {
   memset(g, 0, sizeof(*g));
+  // the runtime profile is selected and frozen HERE, before any device state exists - an invalid or
+  // unsupported TINYNV_GSP_RUNTIME is refused before a single BAR is mapped, a register touched or a firmware byte
+  // placed. Unset and explicit 570.144 select the same descriptor with no device access at all, so the recorded
+  // boot is unchanged operation for operation.
+  if (tinynv_runtime_select(pci, &g->profile)) return -1;
   if (tinynv_dev_early_init(&g->dev, pci)) return -1;
+  g->dev.runtime = g->profile; // early_init zeroes the dev struct; attach the frozen profile after it
   if (tinynv_dev_mmu_init(&g->dev)) return -1;
   if (tinynv_mm_init(&g->mm, &g->dev)) return -1;
   g->flcn.gpu = g;
@@ -26,6 +32,9 @@ int tinynv_gpu_init_sw(tinynv_gpu_t *g) {
 }
 
 int tinynv_gpu_init_hw(tinynv_gpu_t *g) {
+  // the PFB sysmem-flush address must name a real page before GSP-RM's KernelMemorySystem checks it during
+  // init. Program it ahead of the falcon chain that starts GSP-RM (a no-op on 570).
+  if (tinynv_gsp_program_sysmem_flush(g)) return -1;
   if (tinynv_flcn_init_hw(g)) return -1;
   return tinynv_gsp_init_hw(g);
 }
@@ -60,6 +69,10 @@ int tinynv_gpu_boot_firmware(tinynv_gpu_t *g) {
   // overrides. A workaround for a marginal supply, not a fix: a supply that held would not clear the configuration.
   int attempts = g->dev.pci->live && !g->dev.fmc_boot ? 6 : 1;
   { const char *e = getenv("TINYNV_BOOT_ATTEMPTS"); if (e && *e && atoi(e) > 0) attempts = atoi(e); }
+  // The profile this open froze. A retry rebuilds gsp/flcn from nothing (unmake_boot), and the rebuilt boot must be
+  // the SAME runtime's boot - a mixed-version state is exactly what the design forbids. The pointer cannot change
+  // today; this says so out loud if a future edit ever makes it able to.
+  const tinynv_runtime_profile_t *profile = g->profile;
   for (int attempt = 1;; attempt++) {
     if (tinynv_gpu_init_sw(g)) return -1;
     if (!tinynv_gpu_init_hw(g)) {
@@ -75,6 +88,10 @@ int tinynv_gpu_boot_firmware(tinynv_gpu_t *g) {
       fprintf(stderr, "tinynv: could not undo the failed boot (%s), so there will be no second attempt\n", tinynv_last_error());
       return tinynv_fail("%s", why);
     }
+    if (g->profile != profile)
+      return tinynv_fail("the runtime profile changed across a boot retry (%s -> %s): a retry must reboot the same "
+                         "runtime, never fall back to another", profile ? profile->version : "(none)",
+                         g->profile ? g->profile->version : "(none)");
   }
 }
 

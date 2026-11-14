@@ -11,6 +11,7 @@
 #include "nv_regs.h"
 #include "internal.h"
 #include "gsp.h"
+#include "runtime_profile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,9 @@ static int start_up(void) {
     dev.mmu_ver = (v && *v == '2') ? 2 : 3;
   }
   dev.pci = &stub_pci;
+  // the reservation is profile-owned; this hand-built device runs the default 570 policy, whose reserve_top
+  // is exactly TINYNV_FW_RESERVE_TOP - so every expectation below is unchanged.
+  dev.runtime = &tinynv_runtime_570;
   return tinynv_mm_init(&mm, &dev);
 }
 

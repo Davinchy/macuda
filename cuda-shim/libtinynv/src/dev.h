@@ -3,8 +3,14 @@
 #define TINYNV_DEV_H
 #include "tinynv_pci.h"
 
+struct tinynv_runtime_profile;
+
 typedef struct {
   tinynv_pci_t *pci;
+  // The frozen runtime profile of this open, attached by tinynv_gpu_open after early_init (which zeroes
+  // this struct). The memory manager's firmware reservation is profile-owned; NULL only in unit tests that build a
+  // device by hand, and tinynv_mm_init refuses those rather than guessing a policy.
+  const struct tinynv_runtime_profile *runtime;
   tinynv_mmio_t mmio;   // BAR0: registers
   tinynv_mmio_t vram;   // BAR1: the window onto video memory, 256 MB on a small bar card
   uint32_t chip_id, architecture, implementation;

@@ -14,7 +14,7 @@
 static _Thread_local char g_err[512];
 
 int tinynv_fail(const char *fmt, ...) {
-  // formatted into a scratch buffer first: a caller that passes tinynv_last_error() as an argument would otherwise be
+  // formatted into a scratch buffer first: a caller that passes tinynv_last_error as an argument would otherwise be
   // reading the destination while vsnprintf writes it, which is undefined and in practice truncates the message
   char tmp[sizeof(g_err)];
   va_list ap;
@@ -26,6 +26,18 @@ int tinynv_fail(const char *fmt, ...) {
 }
 
 const char *tinynv_last_error(void) { return g_err[0] ? g_err : "no error"; }
+
+// per-stage failure injection for the offline lifecycle suite (plan §4 "failed-start cleanup/timeout/
+// first-error tests"). TINYNV_FAILPOINT=<stage> makes the named stage fail with a message that names it, so a test
+// can drive every failure arm of the 610 boot/unload path without a card. Read fresh on every call so a test can
+// arm and clear it between runs. Every call site is gated on the 610 profile, so the 570 boot cannot reach one even
+// with the variable set; and an unset variable (every real run) is one getenv and a null check.
+int tinynv_failpoint(const char *stage) {
+  const char *e = getenv("TINYNV_FAILPOINT");
+  if (e && *e && !strcmp(e, stage))
+    return tinynv_fail("failpoint: injected failure at stage '%s' (TINYNV_FAILPOINT)", stage);
+  return 0;
+}
 
 double tinynv_now_s(void) {
   struct timespec ts;

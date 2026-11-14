@@ -1,0 +1,408 @@
+// ABI probe: emits sizes/offsets/constants for every firmware-facing interface libtinynv uses,
+// compiled once against the pinned 570 header tree and once against the pinned 610.43.03 tree.
+// Output is line-oriented (S/F/C records) so tools/gsp610-runtime/abi_diff.py can build the comparison matrix.
+//
+// This file includes ONLY NVIDIA headers from the tree given by -I flags; it never includes nv_structs.h,
+// so the two builds cannot contaminate each other. The driver-side expectations live in abi_diff.py.
+#include <stddef.h>
+#include <stdio.h>
+#include "nvtypes.h"
+#include "nvgputypes.h"
+#include "nvos.h"
+#include "gsp/gsp_fw_wpr_meta.h"
+#include "gsp/gspifpub.h"
+#include "kernel/gpu/fsp/kern_fsp_cot_payload.h"
+#if defined(__has_include)
+#  if __has_include("fsp/fsp_nvdm_format.h")
+#    include "fsp/fsp_nvdm_format.h"
+#  elif __has_include("nvdm_format.h")
+#    include "nvdm_format.h"   // 610: fsp/fsp_nvdm_format.h was folded into nvdm_format.h
+#  endif
+#else
+#  include "fsp/fsp_nvdm_format.h"
+#endif
+#include "msgq/msgq_priv.h"
+#include "kernel/gpu/gsp/gsp_init_args.h"
+#include "libos_init_args.h"
+#include "rmRiscvUcode.h"
+#include "kernel/gpu/gsp/gsp_fw_heap.h"
+#include "class/cl0000.h"
+#include "class/cl0080.h"
+#include "class/cl2080.h"
+#include "class/cl0070.h"
+#include "class/cl00de.h"
+#include "class/cl83de.h"
+#include "class/cl90f1.h"
+#include "class/cla06c.h"
+#include "class/cl9067.h"
+#include "class/clb0b5sw.h"
+#include "class/clc56f.h"
+#include "class/clc96f.h"
+#include "class/clc7c0.h"
+#include "class/clc7b5.h"
+#include "class/clc9c0.h"
+#include "class/clcec0.h"
+#include "class/clcab5.h"
+#include "alloc/alloc_channel.h"
+#include "ctrl/ctrl83de.h"
+#include "ctrl/ctrl2080/ctrl2080internal.h"
+#include "ctrl/ctrl2080/ctrl2080fifo.h"
+#include "ctrl/ctrl2080/ctrl2080gr.h"
+#include "ctrl/ctrl0080/ctrl0080gr.h"
+#include "ctrl/ctrl2080/ctrl2080perf.h"
+#include "ctrl/ctrl90f1.h"
+#include "ctrl/ctrla06c.h"
+#include "ctrl/ctrlc36f.h"
+#include "swref/published/blackwell/gb202/dev_fault.h"
+#include "swref/published/hopper/gh100/dev_mmu.h"
+#include "kernel/vgpu/rpc_global_enums.h"
+
+// Ada's own fault numbering: the RTX 4090 runs mmu_ver 2 and its faults are named by ada's header,
+// not gb202's. Included under a namespace guard is impossible (same macro names), so the ada probe
+// is a separate translation unit (abi_probe_ada.c).
+
+#define S(t) printf("S %s %zu\n", #t, sizeof(t))
+#define F(t, f) printf("F %s.%s %zu\n", #t, #f, offsetof(t, f))
+#define C(c) printf("C %s %llu\n", #c, (unsigned long long)(c))
+#define R(c) printf("R %s %s\n", #c, #c)  // raw token text, for bitfield-range macros like 27:27
+
+int main(void) {
+  // ---- chain of trust / FSP boot args (Blackwell path, compiled for every profile) ----
+  S(NVDM_PAYLOAD_COT);
+  F(NVDM_PAYLOAD_COT, version); F(NVDM_PAYLOAD_COT, size);
+  F(NVDM_PAYLOAD_COT, gspFmcSysmemOffset); F(NVDM_PAYLOAD_COT, frtsSysmemOffset);
+  F(NVDM_PAYLOAD_COT, frtsSysmemSize); F(NVDM_PAYLOAD_COT, frtsVidmemOffset);
+  F(NVDM_PAYLOAD_COT, frtsVidmemSize); F(NVDM_PAYLOAD_COT, hash384);
+  F(NVDM_PAYLOAD_COT, publicKey); F(NVDM_PAYLOAD_COT, signature);
+  F(NVDM_PAYLOAD_COT, gspBootArgsSysmemOffset);
+  C(NVDM_TYPE_COT);
+  S(GSP_FMC_BOOT_PARAMS); S(GSP_FMC_INIT_PARAMS);
+  F(GSP_FMC_BOOT_PARAMS, bootGspRmParams); F(GSP_FMC_BOOT_PARAMS, gspRmParams); F(GSP_FMC_BOOT_PARAMS, gspSpdmParams);
+  S(GSP_ACR_BOOT_GSP_RM_PARAMS);
+  F(GSP_ACR_BOOT_GSP_RM_PARAMS, target); F(GSP_ACR_BOOT_GSP_RM_PARAMS, gspRmDescSize);
+  F(GSP_ACR_BOOT_GSP_RM_PARAMS, gspRmDescOffset); F(GSP_ACR_BOOT_GSP_RM_PARAMS, bIsGspRmBoot);
+  S(GSP_RM_PARAMS); F(GSP_RM_PARAMS, bootArgsOffset);
+  S(GSP_SPDM_PARAMS);
+  C(GSP_DMA_TARGET_COHERENT_SYSTEM);
+
+  // ---- WPR metadata ----
+  S(GspFwWprMeta);
+  F(GspFwWprMeta, magic); F(GspFwWprMeta, revision);
+  F(GspFwWprMeta, sysmemAddrOfRadix3Elf); F(GspFwWprMeta, sizeOfRadix3Elf);
+  F(GspFwWprMeta, sysmemAddrOfBootloader); F(GspFwWprMeta, sizeOfBootloader);
+  F(GspFwWprMeta, bootloaderCodeOffset); F(GspFwWprMeta, bootloaderDataOffset); F(GspFwWprMeta, bootloaderManifestOffset);
+  F(GspFwWprMeta, sysmemAddrOfSignature); F(GspFwWprMeta, sizeOfSignature);
+  F(GspFwWprMeta, gspFwRsvdStart); F(GspFwWprMeta, nonWprHeapOffset); F(GspFwWprMeta, nonWprHeapSize);
+  F(GspFwWprMeta, gspFwWprStart); F(GspFwWprMeta, gspFwHeapOffset); F(GspFwWprMeta, gspFwHeapSize);
+  F(GspFwWprMeta, gspFwOffset); F(GspFwWprMeta, bootBinOffset);
+  F(GspFwWprMeta, frtsOffset); F(GspFwWprMeta, frtsSize);
+  F(GspFwWprMeta, gspFwWprEnd); F(GspFwWprMeta, fbSize);
+  F(GspFwWprMeta, vgaWorkspaceOffset); F(GspFwWprMeta, vgaWorkspaceSize);
+  F(GspFwWprMeta, bootCount); F(GspFwWprMeta, partitionRpcAddr);
+  F(GspFwWprMeta, partitionRpcRequestOffset); F(GspFwWprMeta, partitionRpcReplyOffset);
+  F(GspFwWprMeta, elfCodeOffset); F(GspFwWprMeta, elfDataOffset);
+  F(GspFwWprMeta, elfCodeSize); F(GspFwWprMeta, elfDataSize); F(GspFwWprMeta, lsUcodeVersion);
+  F(GspFwWprMeta, gspFwHeapVfPartitionCount); F(GspFwWprMeta, flags);
+  F(GspFwWprMeta, pmuReservedSize); F(GspFwWprMeta, verified);
+  C(GSP_FW_WPR_META_MAGIC); C(GSP_FW_WPR_META_REVISION);
+
+  // ---- firmware heap formula (gsp_fw_heap.h) ----
+  C(GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS3_BAREMETAL);
+  C(GSP_FW_HEAP_PARAM_BASE_RM_SIZE_GH100);
+#if GSP610_ABI_TREE == 570
+  C(GSP_FW_HEAP_PARAM_SIZE_PER_GB_FB);
+#else
+  C(GSP_FW_HEAP_PARAM_SIZE_PER_GB);   // 610 renamed SIZE_PER_GB_FB -> SIZE_PER_GB
+#endif
+  C(GSP_FW_HEAP_PARAM_CLIENT_ALLOC_SIZE);
+
+  // ---- message queues / libos / RM startup args ----
+  S(msgqTxHeader);
+  F(msgqTxHeader, version); F(msgqTxHeader, size); F(msgqTxHeader, msgSize); F(msgqTxHeader, msgCount);
+  F(msgqTxHeader, writePtr); F(msgqTxHeader, flags); F(msgqTxHeader, rxHdrOff); F(msgqTxHeader, entryOff);
+  S(MESSAGE_QUEUE_INIT_ARGUMENTS);
+  F(MESSAGE_QUEUE_INIT_ARGUMENTS, sharedMemPhysAddr); F(MESSAGE_QUEUE_INIT_ARGUMENTS, pageTableEntryCount);
+  F(MESSAGE_QUEUE_INIT_ARGUMENTS, cmdQueueOffset); F(MESSAGE_QUEUE_INIT_ARGUMENTS, statQueueOffset);
+#if GSP610_ABI_TREE == 610
+  F(MESSAGE_QUEUE_INIT_ARGUMENTS, queueElementHdrSize);
+  F(MESSAGE_QUEUE_INIT_ARGUMENTS, queueElementSizeMin);
+  F(MESSAGE_QUEUE_INIT_ARGUMENTS, queueElementSizeMax);
+  F(MESSAGE_QUEUE_INIT_ARGUMENTS, queueHeaderAlign);
+  F(MESSAGE_QUEUE_INIT_ARGUMENTS, queueElementAlign);
+#endif
+  S(GSP_SR_INIT_ARGUMENTS);
+  S(GSP_ARGUMENTS_CACHED);
+  F(GSP_ARGUMENTS_CACHED, messageQueueInitArguments); F(GSP_ARGUMENTS_CACHED, srInitArguments);
+  F(GSP_ARGUMENTS_CACHED, gpuInstance); F(GSP_ARGUMENTS_CACHED, bDmemStack); F(GSP_ARGUMENTS_CACHED, profilerArgs);
+#if GSP610_ABI_TREE == 610
+  F(GSP_ARGUMENTS_CACHED, sysmemHeapArgs);
+  F(GSP_ARGUMENTS_CACHED, rmStateMonitorBufferArgs);
+  F(GSP_ARGUMENTS_CACHED, bindataArgs);
+#endif
+  S(LibosMemoryRegionInitArgument);
+  F(LibosMemoryRegionInitArgument, id8); F(LibosMemoryRegionInitArgument, pa);
+  F(LibosMemoryRegionInitArgument, size); F(LibosMemoryRegionInitArgument, kind); F(LibosMemoryRegionInitArgument, loc);
+  C(LIBOS_MEMORY_REGION_CONTIGUOUS); C(LIBOS_MEMORY_REGION_LOC_SYSMEM); C(LIBOS_MEMORY_REGION_RADIX_PAGE_LOG2);
+
+  // ---- riscv bootloader container ----
+  S(RM_RISCV_UCODE_DESC);
+  F(RM_RISCV_UCODE_DESC, version); F(RM_RISCV_UCODE_DESC, bootloaderOffset); F(RM_RISCV_UCODE_DESC, bootloaderSize);
+  F(RM_RISCV_UCODE_DESC, bootloaderParamOffset); F(RM_RISCV_UCODE_DESC, bootloaderParamSize);
+  F(RM_RISCV_UCODE_DESC, riscvElfOffset); F(RM_RISCV_UCODE_DESC, riscvElfSize); F(RM_RISCV_UCODE_DESC, appVersion);
+  F(RM_RISCV_UCODE_DESC, manifestOffset); F(RM_RISCV_UCODE_DESC, manifestSize);
+  F(RM_RISCV_UCODE_DESC, monitorDataOffset); F(RM_RISCV_UCODE_DESC, monitorDataSize);
+  F(RM_RISCV_UCODE_DESC, monitorCodeOffset); F(RM_RISCV_UCODE_DESC, monitorCodeSize);
+  F(RM_RISCV_UCODE_DESC, bIsMonitorEnabled);
+  F(RM_RISCV_UCODE_DESC, swbromCodeOffset); F(RM_RISCV_UCODE_DESC, swbromCodeSize);
+  F(RM_RISCV_UCODE_DESC, swbromDataOffset); F(RM_RISCV_UCODE_DESC, swbromDataSize);
+  F(RM_RISCV_UCODE_DESC, fbReservedSize); F(RM_RISCV_UCODE_DESC, bSignedAsCode);
+
+  // ---- RPC function/event numbers actually sent or handled ----
+  C(NV_VGPU_MSG_FUNCTION_CONTINUATION_RECORD);
+  C(NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO);
+  C(NV_VGPU_MSG_FUNCTION_SET_REGISTRY);
+  C(NV_VGPU_MSG_FUNCTION_UNLOADING_GUEST_DRIVER);
+  C(NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL);
+  C(NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC);
+  C(NV_VGPU_MSG_FUNCTION_SET_PAGE_DIRECTORY);
+  C(NV_VGPU_MSG_EVENT_GSP_INIT_DONE);
+  C(NV_VGPU_MSG_EVENT_GSP_RUN_CPU_SEQUENCER);
+  C(NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED);
+  C(NV_VGPU_MSG_EVENT_OS_ERROR_LOG);
+
+  // ---- RM object allocation payloads ----
+  S(NV0000_ALLOC_PARAMETERS);
+  F(NV0000_ALLOC_PARAMETERS, hClient); F(NV0000_ALLOC_PARAMETERS, processID);
+  F(NV0000_ALLOC_PARAMETERS, processName); F(NV0000_ALLOC_PARAMETERS, pOsPidInfo);
+  S(NV0080_ALLOC_PARAMETERS);
+  F(NV0080_ALLOC_PARAMETERS, deviceId); F(NV0080_ALLOC_PARAMETERS, hClientShare);
+  F(NV0080_ALLOC_PARAMETERS, hTargetClient); F(NV0080_ALLOC_PARAMETERS, hTargetDevice);
+  F(NV0080_ALLOC_PARAMETERS, flags); F(NV0080_ALLOC_PARAMETERS, vaSpaceSize);
+  F(NV0080_ALLOC_PARAMETERS, vaStartInternal); F(NV0080_ALLOC_PARAMETERS, vaLimitInternal);
+  F(NV0080_ALLOC_PARAMETERS, vaMode);
+  S(NV2080_ALLOC_PARAMETERS); F(NV2080_ALLOC_PARAMETERS, subDeviceId);
+  S(NV_VASPACE_ALLOCATION_PARAMETERS);
+  F(NV_VASPACE_ALLOCATION_PARAMETERS, index); F(NV_VASPACE_ALLOCATION_PARAMETERS, flags);
+  F(NV_VASPACE_ALLOCATION_PARAMETERS, vaSize); F(NV_VASPACE_ALLOCATION_PARAMETERS, vaStartInternal);
+  F(NV_VASPACE_ALLOCATION_PARAMETERS, vaLimitInternal); F(NV_VASPACE_ALLOCATION_PARAMETERS, bigPageSize);
+  F(NV_VASPACE_ALLOCATION_PARAMETERS, vaBase);
+  S(NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS);
+  F(NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS, offset); F(NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS, limit);
+  F(NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS, hVASpace);
+  S(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS);
+  F(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS, hObjectError); F(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS, hObjectEccError);
+  F(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS, hVASpace); F(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS, engineType);
+  F(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS, bIsCallingContextVgpuPlugin);
+  S(NV_CTXSHARE_ALLOCATION_PARAMETERS);
+  F(NV_CTXSHARE_ALLOCATION_PARAMETERS, hVASpace); F(NV_CTXSHARE_ALLOCATION_PARAMETERS, flags);
+  F(NV_CTXSHARE_ALLOCATION_PARAMETERS, subctxId);
+  S(NV83DE_ALLOC_PARAMETERS);
+  F(NV83DE_ALLOC_PARAMETERS, hDebuggerClient_Obsolete); F(NV83DE_ALLOC_PARAMETERS, hAppClient);
+  F(NV83DE_ALLOC_PARAMETERS, hClass3dObject);
+  S(NV00DE_ALLOC_PARAMETERS); F(NV00DE_ALLOC_PARAMETERS, polledDataMask);
+  S(NVB0B5_ALLOCATION_PARAMETERS);
+  F(NVB0B5_ALLOCATION_PARAMETERS, version); F(NVB0B5_ALLOCATION_PARAMETERS, engineType);
+  C(NVB0B5_ALLOCATION_PARAMETERS_VERSION_1);
+  S(NV_CHANNEL_ALLOC_PARAMS);
+  F(NV_CHANNEL_ALLOC_PARAMS, hObjectError); F(NV_CHANNEL_ALLOC_PARAMS, hObjectBuffer);
+  F(NV_CHANNEL_ALLOC_PARAMS, gpFifoOffset); F(NV_CHANNEL_ALLOC_PARAMS, gpFifoEntries);
+  F(NV_CHANNEL_ALLOC_PARAMS, flags); F(NV_CHANNEL_ALLOC_PARAMS, hContextShare);
+  F(NV_CHANNEL_ALLOC_PARAMS, hVASpace); F(NV_CHANNEL_ALLOC_PARAMS, hUserdMemory);
+  F(NV_CHANNEL_ALLOC_PARAMS, userdOffset); F(NV_CHANNEL_ALLOC_PARAMS, engineType);
+  F(NV_CHANNEL_ALLOC_PARAMS, cid); F(NV_CHANNEL_ALLOC_PARAMS, subDeviceId);
+  F(NV_CHANNEL_ALLOC_PARAMS, hObjectEccError); F(NV_CHANNEL_ALLOC_PARAMS, instanceMem);
+  F(NV_CHANNEL_ALLOC_PARAMS, userdMem); F(NV_CHANNEL_ALLOC_PARAMS, ramfcMem);
+  F(NV_CHANNEL_ALLOC_PARAMS, mthdbufMem); F(NV_CHANNEL_ALLOC_PARAMS, hPhysChannelGroup);
+  F(NV_CHANNEL_ALLOC_PARAMS, internalFlags); F(NV_CHANNEL_ALLOC_PARAMS, errorNotifierMem);
+  F(NV_CHANNEL_ALLOC_PARAMS, eccErrorNotifierMem); F(NV_CHANNEL_ALLOC_PARAMS, ProcessID);
+  F(NV_CHANNEL_ALLOC_PARAMS, SubProcessID); F(NV_CHANNEL_ALLOC_PARAMS, encryptIv);
+  F(NV_CHANNEL_ALLOC_PARAMS, decryptIv); F(NV_CHANNEL_ALLOC_PARAMS, hmacNonce);
+  F(NV_CHANNEL_ALLOC_PARAMS, tpcConfigID);
+  S(NV_MEMORY_DESC_PARAMS);
+  F(NV_MEMORY_DESC_PARAMS, base); F(NV_MEMORY_DESC_PARAMS, size);
+  F(NV_MEMORY_DESC_PARAMS, addressSpace); F(NV_MEMORY_DESC_PARAMS, cacheAttrib);
+  S(NVOS00_PARAMETERS);
+  F(NVOS00_PARAMETERS, hRoot); F(NVOS00_PARAMETERS, hObjectParent);
+  F(NVOS00_PARAMETERS, hObjectOld); F(NVOS00_PARAMETERS, status);
+  R(NVOS04_FLAGS_CHANNEL_PBDMA_ACQUIRE_TIMEOUT);
+  R(NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE);
+
+  // ---- classes ----
+  C(NV01_ROOT); C(NV01_DEVICE_0); C(NV20_SUBDEVICE_0); C(FERMI_VASPACE_A);
+  C(NV01_MEMORY_VIRTUAL); C(KEPLER_CHANNEL_GROUP_A); C(FERMI_CONTEXT_SHARE_A);
+  C(GT200_DEBUGGER); C(RM_USER_SHARED_DATA);
+  C(AMPERE_CHANNEL_GPFIFO_A); C(AMPERE_COMPUTE_B); C(AMPERE_DMA_COPY_B);
+  C(ADA_COMPUTE_A); C(BLACKWELL_CHANNEL_GPFIFO_A); C(BLACKWELL_COMPUTE_B); C(BLACKWELL_DMA_COPY_B);
+
+  // ---- controls ----
+  C(NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE);
+  S(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS);
+  F(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS, baseIndex);
+  F(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS, numEntries);
+  F(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS, bMore);
+  F(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS, entries);
+  S(NV2080_CTRL_FIFO_DEVICE_ENTRY);
+  F(NV2080_CTRL_FIFO_DEVICE_ENTRY, engineData); F(NV2080_CTRL_FIFO_DEVICE_ENTRY, pbdmaIds);
+  F(NV2080_CTRL_FIFO_DEVICE_ENTRY, pbdmaFaultIds); F(NV2080_CTRL_FIFO_DEVICE_ENTRY, numPbdmas);
+  F(NV2080_CTRL_FIFO_DEVICE_ENTRY, engineName);
+  C(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES);
+  C(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_ENGINE_DATA_TYPES);
+  C(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_ENGINE_MAX_PBDMA);
+  C(NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_ENGINE_MAX_NAME_LEN);
+  C(NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES);
+  S(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, hSubDevice);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, subDeviceId);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, pageSize);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, virtAddrLo);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, virtAddrHi);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, numLevelsToCopy);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, levels);
+  S(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, levels[0].physAddress);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, levels[0].size);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, levels[0].aperture);
+  F(NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS, levels[0].pageShift);
+  printf("S PDE_LEVEL %zu\n", sizeof(((NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS *)0)->levels[0]));
+  C(GMMU_FMT_MAX_LEVELS);
+  C(NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO);
+  S(NV2080_CTRL_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO_PARAMS);
+  F(NV2080_CTRL_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO_PARAMS, engineContextBuffersInfo);
+  S(NV2080_CTRL_INTERNAL_STATIC_GR_CONTEXT_BUFFERS_INFO);
+  F(NV2080_CTRL_INTERNAL_STATIC_GR_CONTEXT_BUFFERS_INFO, engine);
+  S(NV2080_CTRL_INTERNAL_ENGINE_CONTEXT_BUFFER_INFO);
+  F(NV2080_CTRL_INTERNAL_ENGINE_CONTEXT_BUFFER_INFO, size);
+  F(NV2080_CTRL_INTERNAL_ENGINE_CONTEXT_BUFFER_INFO, alignment);
+  C(NV2080_CTRL_INTERNAL_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_COUNT);
+  C(NV2080_CTRL_INTERNAL_GR_MAX_ENGINES);
+  C(NV2080_CTRL_CMD_GPU_PROMOTE_CTX);
+  S(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, engineType); F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, hClient);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, ChID); F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, hChanClient);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, hObject); F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, hVirtMemory);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, virtAddress); F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, size);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, entryCount); F(NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS, promoteEntry);
+  S(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY, gpuPhysAddr);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY, gpuVirtAddr);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY, size);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY, physAttr);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY, bufferId);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY, bInitialize);
+  F(NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY, bNonmapped);
+  C(NV2080_CTRL_GPU_PROMOTE_CONTEXT_MAX_ENTRIES);
+  C(NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO);
+  S(NV2080_CTRL_INTERNAL_STATIC_KGR_GET_INFO_PARAMS);
+  F(NV2080_CTRL_INTERNAL_STATIC_KGR_GET_INFO_PARAMS, engineInfo);
+  S(NV2080_CTRL_INTERNAL_STATIC_GR_INFO);
+  F(NV2080_CTRL_INTERNAL_STATIC_GR_INFO, infoList);
+  S(NV2080_CTRL_INTERNAL_GR_INFO);
+  F(NV2080_CTRL_INTERNAL_GR_INFO, index); F(NV2080_CTRL_INTERNAL_GR_INFO, data);
+  C(NV0080_CTRL_GR_INFO_MAX_SIZE);
+  C(NV0080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS);
+  C(NV0080_CTRL_GR_INFO_INDEX_LITTER_NUM_TPC_PER_GPC);
+  C(NV0080_CTRL_GR_INFO_INDEX_LITTER_NUM_SM_PER_TPC);
+  C(NV0080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM);
+  C(NV0080_CTRL_GR_INFO_INDEX_SM_VERSION);
+  C(NV2080_CTRL_CMD_PERF_BOOST);
+  S(NV2080_CTRL_PERF_BOOST_PARAMS);
+  F(NV2080_CTRL_PERF_BOOST_PARAMS, flags); F(NV2080_CTRL_PERF_BOOST_PARAMS, duration);
+  C(NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES);
+  C(NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_PRIORITY_HIGH);
+  C(NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX);
+  C(NVA06C_CTRL_CMD_SET_TIMESLICE);
+  S(NVA06C_CTRL_TIMESLICE_PARAMS); F(NVA06C_CTRL_TIMESLICE_PARAMS, timesliceUs);
+  C(NVA06C_CTRL_CMD_GPFIFO_SCHEDULE);
+  S(NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS);
+  F(NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS, bEnable); F(NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS, bSkipSubmit);
+  C(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN);
+  S(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS);
+  F(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS, workSubmitToken);
+  C(NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES);
+  S(NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS);
+  F(NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS, hTargetChannel);
+  F(NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS, numSMsToRead);
+  F(NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS, smErrorStateArray);
+  F(NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS, mmuFaultInfo);
+  F(NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS, mmuFault);
+  F(NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS, startingSM);
+  S(NV83DE_SM_ERROR_STATE_REGISTERS);
+  F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwGlobalEsr); F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwWarpEsr);
+  F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwWarpEsrPc); F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwGlobalEsrReportMask);
+  F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwWarpEsrReportMask); F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwEsrAddr);
+  F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwWarpEsrPc64); F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwCgaEsr);
+  F(NV83DE_SM_ERROR_STATE_REGISTERS, hwwCgaEsrReportMask);
+  C(NV83DE_CTRL_DEBUG_MAX_SMS_PER_CALL);
+  C(NV83DE_CTRL_CMD_DEBUG_READ_MMU_FAULT_INFO);
+  S(NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_PARAMS);
+  F(NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_PARAMS, mmuFaultInfoList);
+  F(NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_PARAMS, count);
+  S(NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_ENTRY);
+  F(NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_ENTRY, faultAddress);
+  F(NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_ENTRY, faultType);
+  F(NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_ENTRY, accessType);
+  C(NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_MAX_ENTRIES);
+  C(NV2080_CTRL_CMD_INTERNAL_GPU_GET_GSP_RM_FREE_HEAP);
+  S(NV2080_CTRL_INTERNAL_GPU_GET_GSP_RM_FREE_HEAP_PARAMS);
+  F(NV2080_CTRL_INTERNAL_GPU_GET_GSP_RM_FREE_HEAP_PARAMS, freeHeapSize);
+  C(NV2080_CTRL_CMD_INTERNAL_INIT_USER_SHARED_DATA);
+  S(NV2080_CTRL_INTERNAL_INIT_USER_SHARED_DATA_PARAMS);
+  F(NV2080_CTRL_INTERNAL_INIT_USER_SHARED_DATA_PARAMS, physAddr);
+  C(NV2080_CTRL_CMD_INTERNAL_USER_SHARED_DATA_SET_DATA_POLL);
+  S(NV2080_CTRL_INTERNAL_USER_SHARED_DATA_SET_DATA_POLL_PARAMS);
+  F(NV2080_CTRL_INTERNAL_USER_SHARED_DATA_SET_DATA_POLL_PARAMS, polledDataMask);
+#if GSP610_ABI_TREE == 570
+  F(NV2080_CTRL_INTERNAL_USER_SHARED_DATA_SET_DATA_POLL_PARAMS, pollFrequencyMs);
+#else
+  F(NV2080_CTRL_INTERNAL_USER_SHARED_DATA_SET_DATA_POLL_PARAMS, pollIntervalMs);  // 610 rename
+#endif
+
+  // ---- RUSD shared sensor block ----
+  S(NV00DE_SHARED_DATA);
+  F(NV00DE_SHARED_DATA, bar1MemoryInfo); F(NV00DE_SHARED_DATA, pmaMemoryInfo);
+  F(NV00DE_SHARED_DATA, shadowErrCont); F(NV00DE_SHARED_DATA, grInfo);
+  F(NV00DE_SHARED_DATA, clkPublicDomainInfos);
+#if GSP610_ABI_TREE == 570
+  F(NV00DE_SHARED_DATA, clkThrottleReason);
+#else
+  F(NV00DE_SHARED_DATA, clkThrottleInfo);   // 610: RUSD_CLK_THROTTLE_REASON grew into RUSD_CLK_THROTTLE_INFO
+#endif
+  F(NV00DE_SHARED_DATA, perfDevUtil); F(NV00DE_SHARED_DATA, memEcc);
+  F(NV00DE_SHARED_DATA, perfCurrentPstate); F(NV00DE_SHARED_DATA, powerLimitGpu);
+  F(NV00DE_SHARED_DATA, temperatures); F(NV00DE_SHARED_DATA, memRowRemap);
+  F(NV00DE_SHARED_DATA, avgPowerUsage); F(NV00DE_SHARED_DATA, instPowerUsage);
+  F(NV00DE_SHARED_DATA, pciBusData);
+#if GSP610_ABI_TREE == 610
+  F(NV00DE_SHARED_DATA, powerPolicyStatus);
+  F(NV00DE_SHARED_DATA, fanCoolerStatus);
+  F(NV00DE_SHARED_DATA, procUtil);
+  S(RUSD_CLK_THROTTLE_INFO);
+#endif
+  S(RUSD_TEMPERATURE); F(RUSD_TEMPERATURE, temperature);
+  S(RUSD_AVG_POWER_USAGE); S(RUSD_CLK_PUBLIC_DOMAIN_INFOS); S(RUSD_PERF_DEVICE_UTILIZATION);
+  S(RUSD_POWER_LIMITS); S(RUSD_CLK_THROTTLE_REASON);
+  C(NV00DE_RUSD_POLL_CLOCK); C(NV00DE_RUSD_POLL_PERF); C(NV00DE_RUSD_POLL_MEMORY);
+  C(NV00DE_RUSD_POLL_POWER); C(NV00DE_RUSD_POLL_THERMAL); C(NV00DE_RUSD_POLL_PCI);
+
+  // ---- MMU / fault constants (gb202 numbering; ada probe is separate) ----
+  C(NV_MMU_VER3_PTE_PCF_REGULAR_RW_ATOMIC_CACHED_ACE);
+  C(NV_MMU_VER3_PTE_PCF_REGULAR_RW_ATOMIC_UNCACHED_ACE);
+  C(NV_PFAULT_FAULT_TYPE_PDE); C(NV_PFAULT_FAULT_TYPE_PDE_SIZE); C(NV_PFAULT_FAULT_TYPE_PTE);
+  C(NV_PFAULT_FAULT_TYPE_VA_LIMIT_VIOLATION); C(NV_PFAULT_FAULT_TYPE_UNBOUND_INST_BLOCK);
+  C(NV_PFAULT_FAULT_TYPE_PRIV_VIOLATION); C(NV_PFAULT_FAULT_TYPE_RO_VIOLATION);
+  C(NV_PFAULT_FAULT_TYPE_WO_VIOLATION); C(NV_PFAULT_FAULT_TYPE_PITCH_MASK_VIOLATION);
+  C(NV_PFAULT_FAULT_TYPE_WORK_CREATION); C(NV_PFAULT_FAULT_TYPE_UNSUPPORTED_APERTURE);
+  C(NV_PFAULT_FAULT_TYPE_CC_VIOLATION); C(NV_PFAULT_FAULT_TYPE_UNSUPPORTED_KIND);
+  C(NV_PFAULT_FAULT_TYPE_REGION_VIOLATION); C(NV_PFAULT_FAULT_TYPE_POISONED);
+  C(NV_PFAULT_FAULT_TYPE_ATOMIC_VIOLATION);
+  C(NV_PFAULT_ACCESS_TYPE_READ); C(NV_PFAULT_ACCESS_TYPE_WRITE); C(NV_PFAULT_ACCESS_TYPE_ATOMIC);
+  C(NV_PFAULT_ACCESS_TYPE_PREFETCH); C(NV_PFAULT_ACCESS_TYPE_VIRT_ATOMIC_WEAK);
+  C(NV_PFAULT_ACCESS_TYPE_PHYS_READ); C(NV_PFAULT_ACCESS_TYPE_PHYS_WRITE);
+  C(NV_PFAULT_ACCESS_TYPE_PHYS_ATOMIC); C(NV_PFAULT_ACCESS_TYPE_PHYS_PREFETCH);
+
+  // ---- channel control block / semaphore ----
+  S(AmpereAControlGPFifo);
+  F(AmpereAControlGPFifo, GPPut); F(AmpereAControlGPFifo, GPGet);
+  S(NvGpuSemaphore); F(NvGpuSemaphore, timeStamp);
+  return 0;
+}

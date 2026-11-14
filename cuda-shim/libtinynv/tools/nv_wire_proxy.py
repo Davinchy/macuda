@@ -72,7 +72,7 @@ class Wire:
       elif cmd == MMIO_READ: self.rec.read("mmior", f"bar:{bar}", a0, extra)
       elif cmd == SYSMEM_READ: self.rec.read("memr", f"mem:{bar}", a0, extra)
       elif cmd == MAP_SYSMEM:
-        paddrs = struct.unpack(f"<{len(extra) // 8}Q", extra) if extra else ()
+        paddrs = struct.unpack(f"<{len(extra) // 8}Q", extra) if extra else
         self.rec.op(f"dma mem:{r1} {a0:#x} {len(paddrs)} " + " ".join(f"{p:#x}" for p in paddrs[:4]))
 
   # how many bytes follow a reply header, which depends on what was asked for

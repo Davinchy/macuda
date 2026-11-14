@@ -21,10 +21,16 @@ const char *tinynv_fw_root(void) {
 }
 
 int tinynv_fw_load(const char *chip_dir, const char *name, const char *sha256_hex, tinynv_blob_t *out) {
+  char rel[512];
+  snprintf(rel, sizeof(rel), "nvidia/%s/gsp/%s", chip_dir, name);
+  return tinynv_fw_load_rel(rel, sha256_hex, out);
+}
+
+int tinynv_fw_load_rel(const char *relpath, const char *sha256_hex, tinynv_blob_t *out) {
   char path[1024];
   const char *root = tinynv_fw_root();
   if (!*root) return tinynv_fail("no firmware directory is configured: set TINYNV_FW_DIR, or build with TINYNV_FW_DEFAULT_DIR");
-  snprintf(path, sizeof(path), "%s/nvidia/%s/gsp/%s", root, chip_dir, name);
+  snprintf(path, sizeof(path), "%s/%s", root, relpath);
   FILE *f = fopen(path, "rb");
   if (!f) return tinynv_fail("firmware %s is missing (run tools/fetch_firmware.sh, or set TINYNV_FW_DIR)", path);
 

@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
       }
       // THE ORACLE LAYS OUT SHT_PROGBITS ONLY, AND THIS LOADER NOW DOES NOT, DELIBERATELY. Zero-initialised `.nv.global`
       // (SHT_NOBITS) used to be placed nowhere - here and in the oracle alike - so relocations against it resolved into
-      // another section's bytes (image.c place()). It is now appended as zeroes after every PROGBITS section. So the
+      // another section's bytes (image.c place). It is now appended as zeroes after every PROGBITS section. So the
       // comparison is: the first `len=` bytes are the oracle's image byte for byte (the hash), and what follows is
       // exactly the NOBITS sections at their alignment - a length worked out here from the section table, not read back
       // from the loader - and nothing but zeroes.

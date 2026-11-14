@@ -8,6 +8,7 @@
 #include "fw.h"
 #include "mmu.h"
 #include "nv_structs.h"
+#include "boot610.h"
 
 typedef struct tinynv_gpu tinynv_gpu_t;
 
@@ -36,6 +37,8 @@ typedef struct {
 
   // the message queue shared with GSP-RM, its page table, and the arguments that describe both
   tinynv_bootmem_t queues, rm_args;
+  tinynv_bootmem_t rm_state_monitor; // 610: shared state page, distinct from the LOGRMON log ring
+  tinynv_bootmem_t sysmem_flush;     // 610: resident sysmem page the PFB flush register names
 
   // Sensors. Host memory we allocate and the firmware writes into on a timer; see tinynv_gsp_sensors_init.
   // Zero when sensors were not asked for, which is the default.
@@ -73,6 +76,12 @@ typedef struct {
   // exactly like the answer to the next control, and the parameters would be copied back from the wrong one. Set on a
   // timeout, cleared once the queue has been emptied before a send.
   int rpc_desync;
+  // the parameter bytes the most recent object allocation put on the wire, kept so that a refusal can be set
+  // against what gsp-rm echoes back. The echo is the only copy of gsp-rm's own view of the request, and the two read
+  // together say how far its handler got; neither is any use without the other, and the request is gone by the time
+  // the answer arrives. Failure-path diagnostics, 610 only, never read on a boot that works.
+  uint8_t last_alloc_sent[400];
+  uint32_t last_alloc_sent_len;
 
   // the object tree inside GSP-RM that everything later hangs off
   uint32_t next_handle, priv_root, device, subdevice, vaspace;
@@ -84,6 +93,11 @@ typedef struct {
   // RM's own status from the last control call. rm_control_as reports but does not enforce it, so a caller that
   // actually depends on a control having worked has to look here.
   uint32_t last_ctrl_status;
+  // RM's own status from the last REFUSED allocation, taken from the echoed alloc header on the 610 failure
+  // path. A refused alloc is fatal to the call that made it, so nothing needed this before; the 610 channel sweep does,
+  // because it has to say which status each alternative was refused with, and the refusal text is a sentence long.
+  // Zero on 570, which has no echo to read it from.
+  uint32_t last_alloc_status;
   tinynv_queue_t ce_copy_q;
   uint64_t gr_size, patch_size; // how big the graphics context and its patch buffer must be, per the firmware
   uint64_t reserved_va;   // the range whose page tables gsp-rm was given
@@ -133,6 +147,21 @@ typedef struct {
   size_t gsp_image_size, bootloader_size;
   tinynv_riscv_ucode_desc_t bl_desc;
 
+  // the 610 profile's additional state. All zero on 570; nothing on the 570 path reads it.
+  // The 610 RISC-V bootloader is a raw image plus a SEPARATE 84-byte descriptor asset (boot610), not an NVFW
+  // container; bl_desc above keeps the three offsets the shared WPR-meta fill reads, plus appVersion for the
+  // host-request core-resume step.
+  tinynv_blob_t bl_desc_fw;
+  tinynv_boot610_desc_t bl_desc610;
+  // The SEC2 generic-bootloader ucode the 610 GSP_LOAD_EXEC_GENERIC_BOOTLOADER host request loads (a bundle asset,
+  // staged at software init so a request arriving mid-boot never needs a file).
+  tinynv_blob_t gbl_fw, gbl_desc_fw;
+  uint32_t gbl_start_tag, gbl_code_size;
+  // A split RPC reply being reassembled (610 splits at one page, rpc610). Owned here because the continuation
+  // records can arrive across several drains; freed on delivery, abandonment, timeout and fini.
+  uint8_t *cont_buf;
+  uint32_t cont_len, cont_want;
+
   // where all of that is, in one structure the boot firmware reads
   tinynv_bootmem_t wpr_meta;
   uint64_t wpr_meta_sysmem;
@@ -140,6 +169,11 @@ typedef struct {
 
 // Everything GSP-RM needs to exist in memory before the chain of trust can authorise it. No hardware is touched.
 int tinynv_gsp_init_sw(tinynv_gpu_t *g);
+
+// program the sysmem flush buffer's address into PFB before the falcon chain starts GSP-RM. 610 made the
+// KernelMemorySystem flush-buffer validity assert fatal; the page is allocated at software init, this is the register
+// half. A no-op on 570, whose recorded boot never wrote these registers.
+int tinynv_gsp_program_sysmem_flush(tinynv_gpu_t *g);
 
 // Wait for GSP-RM to come up and say so, then point the two memory windows at it. Rings the doorbell, so this is the
 // first thing in the driver that expects the firmware to be alive.
@@ -177,6 +211,11 @@ int tinynv_gsp_sensors_init(tinynv_gpu_t *g, uint64_t poll_mask, uint32_t freq_m
 // A consistent copy of one field, or zero if the firmware was mid-write every time we looked. `ts` of zero in the
 // result means the card does not report that reading on this platform.
 int tinynv_gsp_sensors_read(tinynv_gpu_t *g, tinynv_rusd_t *out);
+
+// read gsp-rm's own log rings, queue headers and falcon state after a boot stage failed with the firmware
+// already up, which is where a late refusal leaves its only explanation. Read-only. A no-op unless the 610 runtime
+// profile is in use, so the 570 profile issues no operation it did not issue before.
+void tinynv_gsp_boot_stage_diag(tinynv_gpu_t *g);
 
 void tinynv_gsp_fini(tinynv_gpu_t *g);
 
